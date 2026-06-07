@@ -1,0 +1,50 @@
+# Environment & secrets
+.env
+.env.*
+!.env.example
+
+# Docker runtime data
+postgres-data/
+pgadmin-data/
+redis-data/
+
+# Directus uploads (user media)
+uploads/
+
+# Directus extension cache
+extensions/.registry/
+
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Extension build output
+extensions/custom/dist/
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# AI / local tooling
+.claude/
+.cursor/
+
+# Temporary files
+*.tmp
+*.temp
+.cache/
