@@ -1,3 +1,14 @@
+export type Categories = {
+  date_created?: string | null;
+  date_updated?: string | null;
+  description?: string | null;
+  id: string;
+  name?: string | null;
+  status: string;
+  user_created?: string | DirectusUsers | null;
+  user_updated?: string | DirectusUsers | null;
+};
+
 export type DirectusAccess = {
   id: string;
   policy: string | DirectusPolicies;
@@ -405,9 +416,32 @@ export type DirectusWebhooks = {
   was_active_before_deprecation: boolean;
 };
 
+export type ListeningAttempts = {
+  answers_result_json?: unknown | null;
+  correct_count?: number | null;
+  date_created?: string | null;
+  date_updated?: string | null;
+  duration_seconds?: number | null;
+  id: string;
+  max_score?: number | null;
+  percentage?: number | null;
+  score?: number | null;
+  started_at?: string | null;
+  status: string;
+  submitted_at?: string | null;
+  test?: string | ListeningTests | null;
+  total_questions?: number | null;
+  unanswered_count?: number | null;
+  user?: string | DirectusUsers | null;
+  user_created?: string | DirectusUsers | null;
+  user_updated?: string | DirectusUsers | null;
+  wrong_count?: number | null;
+};
+
 export type ListeningTests = {
   accent: string;
   audio_file: any[] | ListeningTestsFiles[];
+  categories?: string | Categories | null;
   date_created?: string | null;
   date_updated?: string | null;
   description?: string | null;
@@ -437,6 +471,7 @@ export type ListeningTestsFiles = {
 };
 
 export type CustomDirectusTypes = {
+  categories: Categories[];
   directus_access: DirectusAccess[];
   directus_activity: DirectusActivity[];
   directus_collections: DirectusCollections[];
@@ -464,6 +499,7 @@ export type CustomDirectusTypes = {
   directus_users: DirectusUsers[];
   directus_versions: DirectusVersions[];
   directus_webhooks: DirectusWebhooks[];
+  listening_attempts: ListeningAttempts[];
   listening_tests: ListeningTests[];
   listening_tests_files: ListeningTestsFiles[];
 };
