@@ -289,5 +289,28 @@ export default defineEndpoint((router, context) => {
 		}
 	});
 
+	router.post('/tests/:id/increment-taken', async (req, res) => {
+		const testId = req.params.id;
+		const { database } = context;
+
+		try {
+			if (isValidUUID(testId)) {
+				await database('listening_tests')
+					.where('id', testId)
+					.increment('tests_taken', 1);
+			} else {
+				// If slug is passed
+				await database('listening_tests')
+					.where('slug', testId)
+					.increment('tests_taken', 1);
+			}
+
+			return res.status(200).json({ success: true, message: "Incremented successfully" });
+		} catch (error) {
+			console.error("Error incrementing tests_taken:", error);
+			return res.status(500).json({ success: false, error: "Internal Server Error" });
+		}
+	});
+
 	router.get('/', (_req, res) => res.send('v1 endpoint is up and running!'));
 });
