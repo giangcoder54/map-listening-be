@@ -1,14 +1,3 @@
-export type Categories = {
-  date_created?: string | null;
-  date_updated?: string | null;
-  description?: string | null;
-  id: string;
-  name?: string | null;
-  status: string;
-  user_created?: string | DirectusUsers | null;
-  user_updated?: string | DirectusUsers | null;
-};
-
 export type DirectusAccess = {
   id: string;
   policy: string | DirectusPolicies;
@@ -367,6 +356,7 @@ export type DirectusUsers = {
   external_identifier?: string | null;
   first_name?: string | null;
   id: string;
+  is_premium?: boolean | null;
   language?: string | null;
   last_access?: string | null;
   last_name?: string | null;
@@ -374,9 +364,11 @@ export type DirectusUsers = {
   location?: string | null;
   password?: string | null;
   policies: any[] | DirectusAccess[];
+  premium_until?: string | null;
   provider: string;
   role?: string | DirectusRoles | null;
   status: string;
+  subscription_type?: string | null;
   tags?: unknown | null;
   text_direction: string;
   tfa_secret?: string | null;
@@ -441,7 +433,6 @@ export type ListeningAttempts = {
 export type ListeningTests = {
   accent: string;
   audio_file: any[] | ListeningTestsFiles[];
-  categories?: string | Categories | null;
   date_created?: string | null;
   date_updated?: string | null;
   description?: string | null;
@@ -449,7 +440,7 @@ export type ListeningTests = {
   id: string;
   instruction_text?: string | null;
   is_free: boolean;
-  level: string;
+  level?: string | null;
   map_image?: string | DirectusFiles | null;
   metadata?: unknown | null;
   prosody_script?: string | null;
@@ -458,8 +449,10 @@ export type ListeningTests = {
   questions_public_json?: unknown | null;
   slug: string;
   status?: string | null;
+  tests_taken?: number | null;
   thumbnail?: string | DirectusFiles | null;
   title: string;
+  topic?: string | null;
   transcript?: string | null;
   type?: string | null;
 };
@@ -470,8 +463,34 @@ export type ListeningTestsFiles = {
   listening_tests_id?: string | ListeningTests | null;
 };
 
+export type MasterWallet = {
+  auth_key?: string | null;
+  bank_account?: string | null;
+  bank_account_name?: string | null;
+  bank_id?: string | null;
+  bank_name?: string | null;
+  date_created?: string | null;
+  date_updated?: string | null;
+  id: string;
+};
+
+export type PurchaseHistories = {
+  amount?: number | null;
+  currency?: string | null;
+  date_created?: string | null;
+  date_transfer?: string | null;
+  date_updated?: string | null;
+  id: string;
+  payment_method?: string | null;
+  sort?: number | null;
+  status: string;
+  transfer_code?: string | null;
+  user?: string | DirectusUsers | null;
+  user_created?: string | DirectusUsers | null;
+  user_updated?: string | DirectusUsers | null;
+};
+
 export type CustomDirectusTypes = {
-  categories: Categories[];
   directus_access: DirectusAccess[];
   directus_activity: DirectusActivity[];
   directus_collections: DirectusCollections[];
@@ -502,4 +521,6 @@ export type CustomDirectusTypes = {
   listening_attempts: ListeningAttempts[];
   listening_tests: ListeningTests[];
   listening_tests_files: ListeningTestsFiles[];
+  master_wallet: MasterWallet;
+  purchase_histories: PurchaseHistories[];
 };

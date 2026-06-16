@@ -1,4 +1,6 @@
 import { defineEndpoint } from '@directus/extensions-sdk';
+import { handleCheckout } from './checkout';
+
 
 const isValidUUID = (val: unknown): val is string =>
 	typeof val === 'string' &&
@@ -311,6 +313,43 @@ export default defineEndpoint((router, context) => {
 			return res.status(500).json({ success: false, error: "Internal Server Error" });
 		}
 	});
+
+	router.get('/pricing', async (req, res) => {
+		const { ItemsService } = context.services;
+		const schema = (req as any).schema;
+
+		try {
+			const plansService = new ItemsService('plans', {
+				schema,
+				accountability: { admin: true },
+			});
+			const planPricesService = new ItemsService('plan_prices', {
+				schema,
+				accountability: { admin: true },
+			});
+
+			const plans = await plansService.readByQuery({
+				filter: { status: { _eq: 'published' } },
+			});
+
+			const prices = await planPricesService.readByQuery({
+				filter: { status: { _eq: 'published' } },
+			});
+
+			return res.status(200).json({
+				success: true,
+				plans,
+				prices,
+			});
+		} catch (error: any) {
+			return res.status(500).json({
+				success: false,
+				message: error.message || 'Failed to fetch pricing data',
+			});
+		}
+	});
+
+	handleCheckout(router, context);
 
 	router.get('/', (_req, res) => res.send('v1 endpoint is up and running!'));
 });

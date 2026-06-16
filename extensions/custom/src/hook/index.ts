@@ -1,7 +1,13 @@
 import { defineHook } from '@directus/extensions-sdk';
+import { registerCronjob } from './cronjob_check_transactions/cronjob_check_transactions';
 
-export default defineHook(({ filter }, { services }) => {
+export default defineHook((registerEvents, context) => {
+	const { filter } = registerEvents;
+	const { services } = context;
 	const { ItemsService } = services;
+
+	// Register cronjob check transactions
+	registerCronjob(registerEvents, context);
 
 	filter('items.create', async (payload: any, meta, context) => {
 		if (meta.collection === 'listening_tests' && payload.title && !payload.slug) {
