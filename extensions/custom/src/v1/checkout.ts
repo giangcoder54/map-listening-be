@@ -3,6 +3,7 @@ import axios from 'axios';
 import { customAlphabet } from 'nanoid';
 import Decimal from 'decimal.js';
 import TelegramBot from 'node-telegram-bot-api';
+import { calculateEndDate, activatePremiumForUser } from '../utils';
 
 const alphabet = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
 
@@ -45,7 +46,7 @@ export function getProductPriceByBillingCycle(product: any, billingCycle: string
 export function handleCheckout(router: Router, context: any) {
   router.post('/checkout', async (req: any, res: any) => {
     console.log('Vao day 12345')
-    const { services, getSchema, logger } = context;
+    const { services, getSchema, logger, database } = context;
     const { ItemsService } = services;
     const schema = await getSchema();
 
@@ -167,6 +168,10 @@ export function handleCheckout(router: Router, context: any) {
         });
 
         const purchaseHistory = await purchaseHistoryService.createOne(purchaseHistoryData);
+
+        const cycle = billing_cycle || (totalPrice > 500000 ? 12 : 1);
+        const endDate = calculateEndDate(new Date(), cycle);
+        await activatePremiumForUser(userId, endDate, productData.type || 'pro', userService, database, logger);
 
         return res.status(200).json({
           success: true,

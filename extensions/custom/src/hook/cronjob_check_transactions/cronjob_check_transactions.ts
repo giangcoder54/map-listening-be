@@ -2,6 +2,7 @@ import type { ItemsService } from '@directus/api/dist/services/items'
 import type { DirectusUsers, MasterWallet, PurchaseHistories } from '../../types'
 import { defineHook } from '@directus/extensions-sdk'
 import axios from 'axios'
+import { calculateEndDate, activatePremiumForUser } from '../../utils'
 
 // Bank configuration
 interface BankConfig {
@@ -352,45 +353,7 @@ async function processPurchaseMatches(
         // Đồng bộ VIP sang bảng users
         const customerId = typeof matchingPurchase.user === 'object' ? matchingPurchase.user?.id : matchingPurchase.user
         if (customerId) {
-          await usersService.updateOne(customerId, {
-            is_premium: true,
-            premium_until: endDate,
-            subscription_type: matchingPurchase.type || 'pro',
-          })
-          logger.info(`[Cron][Purchase Matches] Activated VIP for user ${customerId} until ${endDate}`)
-
-          // Cập nhật policies cho user trong bảng directus_access
-          if (database) {
-            try {
-              // Xoá các policy cũ (customer, Free Access) của user này
-              await database('directus_access')
-                .where({ user: customerId })
-                .whereIn('policy', [
-                  '63d26c02-9e8d-4ff6-b89e-87d8a5504da2', // customer policy
-                  'bb4a6f63-4b7c-4816-b44f-56aa5dd23033'  // Free Access policy
-                ])
-                .delete()
-
-              // Thêm policy Premium Access
-              const existingPremium = await database('directus_access')
-                .where({
-                  user: customerId,
-                  policy: '8881ead6-d324-4a2a-82b1-3867c1314422' // Premium Access policy
-                })
-                .first()
-
-              if (!existingPremium) {
-                await database('directus_access').insert({
-                  user: customerId,
-                  policy: '8881ead6-d324-4a2a-82b1-3867c1314422'
-                })
-                logger.info(`[Cron][Purchase Matches] Assigned Premium Access policy to user ${customerId}`)
-              }
-            }
-            catch (policyErr: any) {
-              logger.error(`[Cron][Purchase Matches] Failed to update access policy for user ${customerId}: ${String(policyErr)}`)
-            }
-          }
+          await activatePremiumForUser(customerId, endDate, matchingPurchase.type || 'pro', usersService, database, logger)
         }
       }
     }
@@ -400,9 +363,3 @@ async function processPurchaseMatches(
   }
 }
 
-function calculateEndDate(startDate: Date, billingCycle: string | number): string {
-  const months = typeof billingCycle === 'string' ? Number.parseInt(billingCycle) : billingCycle
-  const endDate = new Date(startDate)
-  endDate.setMonth(endDate.getMonth() + months)
-  return endDate.toISOString()
-}
