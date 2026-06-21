@@ -14,11 +14,27 @@ export async function activatePremiumForUser(
   logger: any
 ) {
   try {
-    await usersService.updateOne(customerId, {
+    let roleUpdateParams: any = {
       is_premium: true,
       premium_until: endDate,
       subscription_type: subscriptionType || 'pro',
-    });
+    };
+
+    if (database) {
+      try {
+        const premiumRole = await database('directus_roles')
+          .where({ name: 'Premium User' })
+          .first();
+
+        if (premiumRole && premiumRole.id) {
+          roleUpdateParams.role = premiumRole.id;
+        }
+      } catch (err: any) {
+        logger.error(`[Premium] Failed to query Premium User role: ${String(err)}`);
+      }
+    }
+
+    await usersService.updateOne(customerId, roleUpdateParams);
     logger.info(`[Premium] Activated VIP for user ${customerId} until ${endDate}`);
 
     if (database) {
