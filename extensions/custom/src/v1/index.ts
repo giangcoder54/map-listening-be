@@ -49,19 +49,19 @@ function gradeAttempt(answerKeyArray: Record<string, unknown>[], userAnswers: Re
 	const answersResultJson = answerKeyArray.map((q, index) => {
 		let no = String(q.key ?? q.id ?? q.question_id ?? q.no ?? q.question_key ?? index + 1);
 		if (/^q\d+$/i.test(no)) no = no.substring(1);
-		
+
 		const correctAnswer = q.correct_answer ?? q.answer ?? q.correct ?? q.value;
 		const questionScore = typeof q.score === 'number' ? q.score : 1;
 		maxScore += questionScore;
 
 		const userAnswer = userAnswers[no];
 		const answered = userAnswer !== undefined && userAnswer !== null && String(userAnswer).trim() !== '';
-		
-		const validAnswers = Array.isArray(q.acceptable_answers) 
-			? [correctAnswer, ...q.acceptable_answers] 
+
+		const validAnswers = Array.isArray(q.acceptable_answers)
+			? [correctAnswer, ...q.acceptable_answers]
 			: [correctAnswer];
-		
-		const isCorrect = answered && validAnswers.some(ans => 
+
+		const isCorrect = answered && validAnswers.some(ans =>
 			ans != null && normalizeAnswer(userAnswer) === normalizeAnswer(ans)
 		);
 
@@ -243,7 +243,7 @@ export default defineEndpoint((router, context) => {
 
 			const attemptsService = new ItemsService('listening_attempts', {
 				schema,
-				accountability: userId ? (req as any).accountability : adminAccountability,
+				accountability: adminAccountability,
 			});
 
 			const attemptId = await attemptsService.createOne({
