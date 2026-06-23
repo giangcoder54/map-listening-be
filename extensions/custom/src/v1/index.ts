@@ -281,6 +281,7 @@ export default defineEndpoint((router, context) => {
 					max_score: graded.maxScore,
 					percentage: graded.percentage,
 					answers_result_json: graded.answersResultJson,
+					transcript: test.transcript ?? null,
 				},
 			});
 		} catch (error: any) {
