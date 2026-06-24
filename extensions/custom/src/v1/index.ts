@@ -352,5 +352,93 @@ export default defineEndpoint((router, context) => {
 
 	handleCheckout(router, context);
 
+	router.post('/register', async (req, res) => {
+		try {
+			const { email, password, first_name, last_name, verification_url } = req.body;
+
+			if (!email || !password) {
+				return res.status(400).json({
+					success: false,
+					error: 'Email and password are required',
+				});
+			}
+
+			const { UsersService } = context.services;
+			const schema = (req as any).schema;
+
+			const userService = new UsersService({
+				schema,
+				accountability: { admin: true },
+			});
+
+			// Check if the email exists before attempting to register
+			const existingUsers = await userService.readByQuery({
+				filter: { email: { _eq: email } },
+				limit: 1,
+			});
+
+			if (existingUsers && existingUsers.length > 0) {
+				return res.status(409).json({
+					success: false,
+					error: 'Email already exists',
+				});
+			}
+
+			// Register the user
+			// Register the user
+			// Using createOne instead of registerUser to match standard Directus service methods
+			const targetRole = context.env?.AUTH_GOOGLE_DEFAULT_ROLE_ID || process.env.AUTH_GOOGLE_DEFAULT_ROLE_ID || 'a963ea32-f5a9-4c7c-a27e-e8983a972d00';
+			console.log(`[Register Endpoint] Attempting to create user ${email} with role ${targetRole}`);
+
+			try {
+				const newUserId = await userService.createOne({
+					email,
+					password,
+					first_name,
+					last_name,
+					role: targetRole,
+				});
+				console.log(`[Register Endpoint] Successfully created user ${email} with ID ${newUserId}`);
+			} catch (creationError) {
+				console.error(`[Register Endpoint] Error creating user:`, creationError);
+				throw creationError;
+			}
+
+			return res.status(200).json({
+				success: true,
+				message: 'User registered successfully',
+			});
+		} catch (error: any) {
+			context.logger.error(`Registration error: ${error}`);
+
+			// Handle different types of errors
+			if (
+				error.message?.includes('Email address') &&
+				error.message?.includes("hasn't been invited")
+			) {
+				return res.status(403).json({
+					success: false,
+					error: 'Registration requires an invitation',
+				});
+			}
+
+			if (
+				error.message?.includes('URL') &&
+				error.message?.includes("can't be used to verify")
+			) {
+				return res.status(400).json({
+					success: false,
+					error: 'Invalid verification URL',
+				});
+			}
+
+			return res.status(500).json({
+				success: false,
+				error: 'Registration failed',
+				details: error.message || 'Unknown error',
+			});
+		}
+	});
+
 	router.get('/', (_req, res) => res.send('v1 endpoint is up and running!'));
 });

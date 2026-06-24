@@ -81,7 +81,7 @@ export default defineHook((registerEvents, context) => {
 
 			payload.slug = uniqueSlug;
 		}
-		
+
 		return payload;
 	});
 });
