@@ -440,5 +440,94 @@ export default defineEndpoint((router, context) => {
 		}
 	});
 
+	router.get('/dashboard', async (req, res) => {
+		const { ItemsService } = context.services;
+		const userId = (req as any).accountability?.user ?? null;
+
+		if (!userId) {
+			return res.status(401).json({ success: false, message: 'Unauthorized' });
+		}
+
+		try {
+			const schema = (req as any).schema;
+			const adminAccountability = { admin: true, role: null, user: null } as any;
+
+			const attemptsService = new ItemsService('listening_attempts', {
+				schema,
+				accountability: adminAccountability,
+			});
+
+			const attempts = await attemptsService.readByQuery({
+				filter: { user: { _eq: userId } },
+				fields: ['id', 'score', 'max_score', 'percentage', 'duration_seconds', 'submitted_at', 'test.title', 'test.type'],
+				sort: ['-submitted_at'],
+				limit: -1, // Get all to calculate stats
+			});
+
+			const testsCompleted = attempts.length;
+			let totalDurationSeconds = 0;
+			let totalPercentage = 0;
+
+			for (const attempt of attempts) {
+				totalDurationSeconds += attempt.duration_seconds || 0;
+				totalPercentage += attempt.percentage || 0;
+			}
+
+			const accuracyRate = testsCompleted > 0 ? (totalPercentage / testsCompleted) : 0;
+			const practiceDurationHours = testsCompleted > 0 ? (totalDurationSeconds / 3600).toFixed(1) : "0";
+			
+			// Simple mapping for IELTS Band Score based on accuracy rate (0-100)
+			// Generally: 39-40 = 9.0, 37-38 = 8.5, 35-36 = 8.0, 32-34 = 7.5, 30-31 = 7.0, 26-29 = 6.5, 23-25 = 6.0
+			// A rough formula based on percentage:
+			let averageBandScore = 0;
+			if (testsCompleted > 0) {
+				const avgCorrect = (accuracyRate / 100) * 40; 
+				if (avgCorrect >= 39) averageBandScore = 9.0;
+				else if (avgCorrect >= 37) averageBandScore = 8.5;
+				else if (avgCorrect >= 35) averageBandScore = 8.0;
+				else if (avgCorrect >= 32) averageBandScore = 7.5;
+				else if (avgCorrect >= 30) averageBandScore = 7.0;
+				else if (avgCorrect >= 26) averageBandScore = 6.5;
+				else if (avgCorrect >= 23) averageBandScore = 6.0;
+				else if (avgCorrect >= 18) averageBandScore = 5.5;
+				else if (avgCorrect >= 16) averageBandScore = 5.0;
+				else if (avgCorrect >= 13) averageBandScore = 4.5;
+				else if (avgCorrect >= 10) averageBandScore = 4.0;
+				else averageBandScore = Math.floor(avgCorrect / 4) * 0.5 + 2.5; // roughly for below 4.0
+				
+				averageBandScore = Math.min(Math.max(averageBandScore, 0), 9.0);
+			}
+
+			const recentPractices = attempts.slice(0, 5).map((a: any) => ({
+				id: a.id,
+				test_title: a.test?.title || 'Unknown Test',
+				test_type: a.test?.type || 'Practice',
+				score: a.score,
+				max_score: a.max_score,
+				percentage: a.percentage,
+				submitted_at: a.submitted_at,
+				status: (a.percentage >= 50) ? 'Passed' : 'Failed' // Just a dummy status based on score
+			}));
+
+			return res.status(200).json({
+				success: true,
+				data: {
+					tests_completed: testsCompleted,
+					average_band_score: averageBandScore,
+					accuracy_rate: Math.round(accuracyRate),
+					practice_duration: practiceDurationHours,
+					recent_practices: recentPractices
+				}
+			});
+
+		} catch (error: any) {
+			console.error("Dashboard error:", error);
+			return res.status(500).json({
+				success: false,
+				message: error.message || 'An error occurred fetching dashboard data',
+			});
+		}
+	});
+
 	router.get('/', (_req, res) => res.send('v1 endpoint is up and running!'));
 });
