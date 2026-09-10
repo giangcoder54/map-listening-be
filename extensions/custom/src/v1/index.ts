@@ -1,5 +1,6 @@
 import { defineEndpoint } from '@directus/extensions-sdk';
 import { handleCheckout } from './checkout';
+import { handleYoutubeCrawl } from './youtube';
 
 
 const isValidUUID = (val: unknown): val is string =>
@@ -351,6 +352,7 @@ export default defineEndpoint((router, context) => {
 	});
 
 	handleCheckout(router, context);
+	handleYoutubeCrawl(router, context);
 
 	router.post('/register', async (req, res) => {
 		try {
@@ -475,13 +477,13 @@ export default defineEndpoint((router, context) => {
 
 			const accuracyRate = testsCompleted > 0 ? (totalPercentage / testsCompleted) : 0;
 			const practiceDurationHours = testsCompleted > 0 ? (totalDurationSeconds / 3600).toFixed(1) : "0";
-			
+
 			// Simple mapping for IELTS Band Score based on accuracy rate (0-100)
 			// Generally: 39-40 = 9.0, 37-38 = 8.5, 35-36 = 8.0, 32-34 = 7.5, 30-31 = 7.0, 26-29 = 6.5, 23-25 = 6.0
 			// A rough formula based on percentage:
 			let averageBandScore = 0;
 			if (testsCompleted > 0) {
-				const avgCorrect = (accuracyRate / 100) * 40; 
+				const avgCorrect = (accuracyRate / 100) * 40;
 				if (avgCorrect >= 39) averageBandScore = 9.0;
 				else if (avgCorrect >= 37) averageBandScore = 8.5;
 				else if (avgCorrect >= 35) averageBandScore = 8.0;
@@ -494,7 +496,7 @@ export default defineEndpoint((router, context) => {
 				else if (avgCorrect >= 13) averageBandScore = 4.5;
 				else if (avgCorrect >= 10) averageBandScore = 4.0;
 				else averageBandScore = Math.floor(avgCorrect / 4) * 0.5 + 2.5; // roughly for below 4.0
-				
+
 				averageBandScore = Math.min(Math.max(averageBandScore, 0), 9.0);
 			}
 
@@ -526,6 +528,29 @@ export default defineEndpoint((router, context) => {
 				success: false,
 				message: error.message || 'An error occurred fetching dashboard data',
 			});
+		}
+	});
+
+	router.get('/listening-lab/stats', async (req, res) => {
+		const { database } = context;
+		try {
+			// Query to count distinct user_id per target_id
+			const stats = await database('listening_attempts')
+				.join('listening_clips', 'listening_attempts.clip_id', 'listening_clips.id')
+				.select('listening_clips.target_id')
+				.countDistinct('listening_attempts.user_id as learners')
+				.groupBy('listening_clips.target_id');
+
+			const result: Record<string, number> = {};
+			for (const row of stats) {
+				if (row.target_id) {
+					result[row.target_id] = Number(row.learners);
+				}
+			}
+			return res.status(200).json({ success: true, data: result });
+		} catch (error: any) {
+			console.error("Listening Lab stats error:", error);
+			return res.status(500).json({ success: false, error: error.message || 'Server error' });
 		}
 	});
 
