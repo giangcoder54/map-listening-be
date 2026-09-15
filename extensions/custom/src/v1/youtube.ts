@@ -62,14 +62,14 @@ function parseUploadDate(yyyymmdd: string): Date | undefined {
 
 async function getVideoDetails(videoId: string) {
   try {
-    const res = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
-      headers: { "User-Agent": WEB_USER_AGENT }
-    });
-    const html = await res.text();
-    const match = html.match(/ytInitialPlayerResponse\s*=\s*(\{.*?\});/);
-    if (!match) return null;
-    
-    const data = JSON.parse(match[1]);
+    const data = await innertubePost(
+      INNERTUBE_PLAYER_URL,
+      {
+        context: innertubeContext("ANDROID"),
+        videoId,
+      },
+      "ANDROID"
+    );
     const details = data?.videoDetails;
     if (!details?.videoId) return null;
 
@@ -176,21 +176,28 @@ export function handleYoutubeCrawl(router: Router, context: any) {
   router.post('/youtube/crawl', async (req, res) => {
     try {
       const { url } = req.body;
+      context.logger.info(`[youtube/crawl] Received URL: ${url}`);
+      
       if (!url) {
         return res.status(400).json({ success: false, message: 'Missing "url" in payload.' });
       }
 
       const videoId = extractVideoId(url);
+      context.logger.info(`[youtube/crawl] Extracted videoId: ${videoId}`);
+      
       if (!videoId) {
         return res.status(400).json({ success: false, message: 'Invalid YouTube URL.' });
       }
 
       const videoMeta = await getVideoDetails(videoId);
+      context.logger.info(`[youtube/crawl] Video meta result: ${videoMeta ? 'success' : 'null'}`);
+      
       if (!videoMeta) {
         return res.status(404).json({ success: false, message: 'Video not found or unavailable.' });
       }
 
       const transcript = await fetchTranscript(videoId, 'en');
+      context.logger.info(`[youtube/crawl] Transcript result: ${transcript ? transcript.length + ' segments' : 'null'}`);
 
       return res.status(200).json({
         success: true,

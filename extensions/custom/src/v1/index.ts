@@ -531,6 +531,73 @@ export default defineEndpoint((router, context) => {
 		}
 	});
 
+	router.get('/listening-lab/progress/clips', async (req, res) => {
+		const userId = (req as any).accountability?.user ?? null;
+		if (!userId) {
+			return res.status(200).json({ success: true, data: [] });
+		}
+		
+		const { database } = context;
+		try {
+			const completedClips = await database('listening_attempts')
+				.select('clip_id')
+				.where('user_id', userId)
+				.andWhere('is_correct', true)
+				.distinct();
+				
+			const result = completedClips.map((row: any) => row.clip_id).filter(Boolean);
+			return res.status(200).json({ success: true, data: result });
+		} catch (error: any) {
+			console.error("Listening Lab progress error:", error);
+			return res.status(500).json({ success: false, error: error.message || 'Server error' });
+		}
+	});
+
+	router.get('/listening-lab/progress/targets', async (req, res) => {
+		const userId = (req as any).accountability?.user ?? null;
+		if (!userId) {
+			return res.status(200).json({ success: true, data: {} });
+		}
+
+		const { database } = context;
+		try {
+			// Tổng số clips per target
+			const totalRows = await database('listening_clips')
+				.select('target_id')
+				.count('id as total')
+				.groupBy('target_id');
+
+			// Số clips đã hoàn thành per target (distinct clip_id có is_correct = true)
+			const completedRows = await database('listening_attempts')
+				.join('listening_clips', 'listening_attempts.clip_id', 'listening_clips.id')
+				.select('listening_clips.target_id')
+				.countDistinct('listening_attempts.clip_id as completed')
+				.where('listening_attempts.user_id', userId)
+				.andWhere('listening_attempts.is_correct', true)
+				.groupBy('listening_clips.target_id');
+
+			const completedMap: Record<string, number> = {};
+			for (const row of completedRows) {
+				if (row.target_id) completedMap[row.target_id] = Number(row.completed);
+			}
+
+			const result: Record<string, { completed: number; total: number }> = {};
+			for (const row of totalRows) {
+				if (row.target_id) {
+					result[row.target_id] = {
+						completed: completedMap[row.target_id] || 0,
+						total: Number(row.total),
+					};
+				}
+			}
+
+			return res.status(200).json({ success: true, data: result });
+		} catch (error: any) {
+			console.error("Listening Lab progress/targets error:", error);
+			return res.status(500).json({ success: false, error: error.message || 'Server error' });
+		}
+	});
+
 	router.get('/listening-lab/stats', async (req, res) => {
 		const { database } = context;
 		try {
