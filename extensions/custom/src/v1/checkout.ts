@@ -280,15 +280,15 @@ export function handleCheckout(router: Router, context: any) {
         if (bot) {
           try {
             const groupChatId = process.env.TELEGRAM_GROUP_ID || '-5020831863';
-            const message = `🛒 ĐƠN HÀNG MỚI (CÓ ĐĂNG NHẬP) - THANH TOÁN THỦ CÔNG\n\n`
-              + `Khách hàng: ${email}\n`
-              + `Sản phẩm: ${productData.name || productData.title}\n`
-              + `Giá gốc: ${formatPrice(priceOriginal, targetCurrency)}\n`
-              + `Giá thanh toán: ${formatPrice(pricePaid, targetCurrency)}\n`
-              + `Chu kỳ: ${billing_cycle} tháng\n`
-              + `Mã đơn: ${purchaseHistoryData.transfer_code}\n`
-              + `Thời gian: ${new Date().toLocaleString('vi-VN')}\n`
-              + `Link xử lý: ${process.env.PUBLIC_URL}/admin/content/purchase_histories/${purchaseHistory}`;
+            const message = `🛒 NEW ORDER (LOGGED IN) - MANUAL PAYMENT\n\n`
+              + `Customer: ${email}\n`
+              + `Product: ${productData.name || productData.title}\n`
+              + `Original Price: ${formatPrice(priceOriginal, targetCurrency)}\n`
+              + `Paid Price: ${formatPrice(pricePaid, targetCurrency)}\n`
+              + `Billing Cycle: ${billing_cycle} months\n`
+              + `Order Code: ${purchaseHistoryData.transfer_code}\n`
+              + `Time: ${new Date().toLocaleString('en-US')}\n`
+              + `Admin Link: ${process.env.PUBLIC_URL}/admin/content/purchase_histories/${purchaseHistory}`;
 
             await bot.sendMessage(groupChatId, message);
           }

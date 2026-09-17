@@ -47,6 +47,31 @@ export default defineHook((registerEvents, context) => {
 		}
 	});
 
+	action('listening_attempts.items.create', async (meta, hookContext) => {
+		try {
+			const { payload } = meta;
+			
+			// Handle both single and bulk creates
+			const payloads = Array.isArray(payload) ? payload : [payload];
+			
+			for (const p of payloads) {
+				const clipId = p?.clip_id;
+				if (clipId) {
+					const { database } = context;
+					const clip = await database('listening_clips').select('target_id').where('id', clipId).first();
+					
+					if (clip && clip.target_id) {
+						await database('listening_targets')
+							.where('id', clip.target_id)
+							.increment('learners_count', 1);
+					}
+				}
+			}
+		} catch (error) {
+			context.logger?.error(`[listening_attempts hook] Error incrementing learners_count: ${error}`);
+		}
+	});
+
 	filter('items.create', async (payload: any, meta, hookContext) => {
 		if (meta.collection === 'listening_tests' && payload.title && !payload.slug) {
 			const slug = payload.title
