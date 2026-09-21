@@ -1,14 +1,18 @@
 import { defineHook } from '@directus/extensions-sdk';
 import { registerCronjob } from './cronjob_check_transactions/cronjob_check_transactions';
 import { calculateEndDate, activatePremiumForUser } from '../utils';
+import { registerSepayRawBody } from './sepayRawBody';
 
 export default defineHook((registerEvents, context) => {
 	const { filter, action } = registerEvents;
 	const { services } = context;
 	const { ItemsService } = services;
 
+	// Giữ raw body cho webhook SePay (bắt buộc để xác thực HMAC-SHA256)
+	registerSepayRawBody(registerEvents, context);
+
 	// Register cronjob check transactions
-	registerCronjob(registerEvents, context);
+	// registerCronjob(registerEvents, context);
 
 	action('purchase_histories.items.update', async (meta, hookContext) => {
 		if (meta.payload && meta.payload.status === 'published' && meta.keys && meta.keys.length > 0) {
@@ -47,30 +51,8 @@ export default defineHook((registerEvents, context) => {
 		}
 	});
 
-	action('listening_attempts.items.create', async (meta, hookContext) => {
-		try {
-			const { payload } = meta;
-			
-			// Handle both single and bulk creates
-			const payloads = Array.isArray(payload) ? payload : [payload];
-			
-			for (const p of payloads) {
-				const clipId = p?.clip_id;
-				if (clipId) {
-					const { database } = context;
-					const clip = await database('listening_clips').select('target_id').where('id', clipId).first();
-					
-					if (clip && clip.target_id) {
-						await database('listening_targets')
-							.where('id', clip.target_id)
-							.increment('learners_count', 1);
-					}
-				}
-			}
-		} catch (error) {
-			context.logger?.error(`[listening_attempts hook] Error incrementing learners_count: ${error}`);
-		}
-	});
+	// learners_count của listening_targets được cập nhật trong endpoint POST /v1/listening-lab/attempts
+	// (chỉ +1 cho lần Check đầu tiên của mỗi người), không cộng theo từng attempt nữa.
 
 	filter('items.create', async (payload: any, meta, hookContext) => {
 		if (meta.collection === 'listening_tests' && payload.title && !payload.slug) {
