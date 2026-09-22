@@ -683,6 +683,19 @@ export default defineEndpoint((router, context) => {
 			return res.status(400).json({ success: false, message: 'Invalid clip_id' });
 		}
 
+		// Chấm bài bắt buộc đăng nhập.
+		//
+		// Chặn ngay tại đây chứ không chỉ dựa vào tầng quota: khối quota bên dưới
+		// cố tình fail-open (lỗi quota thì vẫn cho làm bài), nên nếu chỉ dựa vào nó
+		// thì một sự cố ở bảng quota sẽ mở lại cửa cho khách.
+		if (!userId) {
+			return res.status(401).json({
+				success: false,
+				code: 'LOGIN_REQUIRED',
+				message: 'Vui lòng đăng nhập để chấm bài.',
+			});
+		}
+
 		try {
 			await ensureLearnersTable(database, logger);
 
