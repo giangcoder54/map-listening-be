@@ -4,7 +4,12 @@
  * Luật đã chốt:
  *   - Premium còn hạn            -> không giới hạn.
  *   - User Free đã đăng nhập     -> FREE_MONTHLY_QUOTA lượt/tháng (mặc định 15).
- *   - Khách chưa đăng nhập       -> GUEST_MONTHLY_QUOTA lượt/tháng (mặc định 5).
+ *   - Khách chưa đăng nhập       -> KHÔNG được chấm bài, phải đăng nhập.
+ *
+ * Vì sao khách không còn hạn mức dùng thử: danh tính của khách là `anonymous_id`
+ * do chính client sinh ra và gửi lên, nên xoá cookie (hoặc gửi một UUID mới) là
+ * reset được hạn mức. Không có cách nào vá chỗ đó khi định danh nằm ở phía
+ * client, nên hạn mức khách bị bỏ hẳn thay vì giả vờ rằng nó có tác dụng.
  *   - 1 lượt = lần bấm "Check" ĐẦU TIÊN ở mỗi clip trong tháng. Bấm Check lại
  *     ở đúng clip đó (gõ sai chính tả, thử lại) KHÔNG trừ thêm lượt.
  *   - "Show answer" (reveal) KHÔNG trừ lượt.
@@ -18,7 +23,11 @@
 const QUOTA_TABLE = 'listening_quota_clips';
 
 export const FREE_MONTHLY_QUOTA = Number(process.env.FREE_MONTHLY_QUOTA || 15);
-export const GUEST_MONTHLY_QUOTA = Number(process.env.GUEST_MONTHLY_QUOTA || 5);
+/**
+ * Hạn mức của khách, nay luôn là 0: chấm bài bắt buộc đăng nhập.
+ * Giữ biến lại (và vẫn đọc env) để bật lại chế độ dùng thử chỉ cần đổi một dòng.
+ */
+export const GUEST_MONTHLY_QUOTA = Number(process.env.GUEST_MONTHLY_QUOTA || 0);
 
 /** Lệch giờ để chốt mốc sang tháng. Mặc định +7 = giờ Việt Nam. */
 const TZ_OFFSET_HOURS = Number(process.env.QUOTA_TZ_OFFSET_HOURS || 7);
@@ -175,14 +184,18 @@ export async function consumeQuotaForClip(args: QuotaArgs & { clipId: string }):
 		return buildState({ allowed: true, unlimited: true, charged: false, limit: null, used: 0, period, isGuest: false });
 	}
 
-	const key = subjectKey(userId, anonymousId);
-	const isGuest = !userId;
-	const limit = userId ? FREE_MONTHLY_QUOTA : GUEST_MONTHLY_QUOTA;
+	// Khách chưa đăng nhập: không chấm bài, không ghi lượt. `requires: 'signup'`
+	// (do buildState đặt khi isGuest) là thứ frontend dùng để mời đăng nhập.
+	if (!userId) {
+		return buildState({ allowed: false, unlimited: false, charged: false, limit: 0, used: 0, period, isGuest: true });
+	}
 
-	// Không định danh được chủ thể (request không kèm anonymous_id) -> coi như hết lượt.
-	// Fail-closed có chủ đích: frontend luôn tự sinh và gửi cookie gl_anon_id, nên
-	// người dùng thật gần như không bao giờ rơi vào nhánh này; bỏ trống trường đó
-	// chủ yếu là cách lách đơn giản nhất khi gọi thẳng API.
+	const key = subjectKey(userId, anonymousId);
+	const isGuest = false;
+	const limit = FREE_MONTHLY_QUOTA;
+
+	// Không định danh được chủ thể -> coi như hết lượt. Với user đã đăng nhập thì
+	// nhánh này không xảy ra (subjectKey luôn trả về `user:<id>`), giữ lại để phòng.
 	if (!key) {
 		return buildState({ allowed: false, unlimited: false, charged: false, limit, used: limit, period, isGuest });
 	}
@@ -229,12 +242,15 @@ export async function getQuotaStatus(args: QuotaArgs): Promise<QuotaState> {
 		return buildState({ allowed: true, unlimited: true, charged: false, limit: null, used: 0, period, isGuest: false });
 	}
 
-	const key = subjectKey(userId, anonymousId);
-	const isGuest = !userId;
-	const limit = userId ? FREE_MONTHLY_QUOTA : GUEST_MONTHLY_QUOTA;
+	// Giống consumeQuotaForClip: khách không có hạn mức nào để hiển thị.
+	if (!userId) {
+		return buildState({ allowed: false, unlimited: false, charged: false, limit: 0, used: 0, period, isGuest: true });
+	}
 
-	// Giống consumeQuotaForClip: không có định danh thì báo hết lượt cho khớp với
-	// thứ sẽ xảy ra khi bấm Check, tránh hiện "còn 5 lượt" rồi chặn ngay lượt đầu.
+	const key = subjectKey(userId, anonymousId);
+	const isGuest = false;
+	const limit = FREE_MONTHLY_QUOTA;
+
 	if (!key) {
 		return buildState({ allowed: false, unlimited: false, charged: false, limit, used: limit, period, isGuest });
 	}
