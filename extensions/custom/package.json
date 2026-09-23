@@ -48,6 +48,7 @@
 	"dependencies": {
 		"decimal.js": "^10.6.0",
 		"nanoid": "^5.1.11",
-		"node-telegram-bot-api": "^1.1.0"
+		"node-telegram-bot-api": "^1.1.0",
+		"undici": "^6.21.0"
 	}
 }

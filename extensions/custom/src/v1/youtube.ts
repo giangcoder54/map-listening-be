@@ -1,4 +1,5 @@
 import type { Router } from 'express';
+import { ProxyAgent } from 'undici';
 
 const INNERTUBE_API_KEY = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
 const INNERTUBE_PLAYER_URL = `https://www.youtube.com/youtubei/v1/player?key=${INNERTUBE_API_KEY}&prettyPrint=false`;
@@ -6,10 +7,37 @@ const INNERTUBE_PLAYER_URL = `https://www.youtube.com/youtubei/v1/player?key=${I
 const WEB_USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36";
 
+// ---- Proxy residential (đọc từ .env: YOUTUBE_PROXY_URL) --------------------
+// Định dạng: http://user:pass@host:port  (ví dụ http://agYgKD:CPJlyfM9@snvt3.tunproxy.com:17386)
+// YouTube chặn IP datacenter của server; đi qua proxy IP dân cư để vượt qua.
+const YOUTUBE_PROXY_URL = process.env.YOUTUBE_PROXY_URL?.trim();
+let proxyDispatcher: ProxyAgent | undefined;
+if (YOUTUBE_PROXY_URL) {
+  try {
+    proxyDispatcher = new ProxyAgent(YOUTUBE_PROXY_URL);
+  } catch (e: any) {
+    // Không throw ở tầng module để tránh sập extension; sẽ log khi có request.
+    proxyDispatcher = undefined;
+  }
+}
+
+function maskProxy(url?: string): string {
+  if (!url) return "(none)";
+  return url.replace(/\/\/([^:]+):([^@]+)@/, "//$1:***@");
+}
+
+// fetch có gắn proxy dispatcher (nếu có cấu hình). Node fetch chấp nhận option `dispatcher`.
+function proxiedFetch(url: string, init: RequestInit = {}): Promise<Response> {
+  const opts: any = { ...init };
+  if (proxyDispatcher) opts.dispatcher = proxyDispatcher;
+  return fetch(url, opts);
+}
+// ---------------------------------------------------------------------------
+
 type ClientType = "ANDROID" | "IOS" | "WEB";
 
 // Mỗi client gồm: context gửi lên InnerTube + headers tương ứng.
-// Thứ tự thử: ANDROID -> IOS -> WEB. Từ IP datacenter, client này fail thì thử client khác.
+// Thứ tự thử: ANDROID -> IOS -> WEB.
 const CLIENTS: Record<ClientType, { context: any; headers: Record<string, string> }> = {
   ANDROID: {
     context: {
@@ -51,11 +79,16 @@ async function fetchPlayer(videoId: string, logger: any): Promise<{ data: any; c
   const order: ClientType[] = ["ANDROID", "IOS", "WEB"];
   let lastReason = "unknown";
 
+  logger.info(`[youtube] proxy=${maskProxy(YOUTUBE_PROXY_URL)} enabled=${!!proxyDispatcher}`);
+  if (YOUTUBE_PROXY_URL && !proxyDispatcher) {
+    logger.error(`[youtube] YOUTUBE_PROXY_URL đã đặt nhưng không khởi tạo được ProxyAgent. Kiểm tra định dạng URL.`);
+  }
+
   for (const clientType of order) {
     const client = CLIENTS[clientType];
     const started = Date.now();
     try {
-      const res = await fetch(INNERTUBE_PLAYER_URL, {
+      const res = await proxiedFetch(INNERTUBE_PLAYER_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json", ...client.headers },
         body: JSON.stringify({ context: client.context, videoId }),
@@ -64,7 +97,6 @@ async function fetchPlayer(videoId: string, logger: any): Promise<{ data: any; c
       const rawText = await res.text();
 
       if (!res.ok) {
-        // HTTP không 2xx: thường 403/429 (bị chặn), hoặc 400 (payload/key sai). In body để biết lý do.
         lastReason = `HTTP ${res.status} ${res.statusText}`;
         logger.warn(`[youtube] player client=${clientType} ${lastReason} (${Date.now() - started}ms) body=${rawText.slice(0, 500)}`);
         continue;
@@ -88,8 +120,6 @@ async function fetchPlayer(videoId: string, logger: any): Promise<{ data: any; c
         "";
       const hasDetails = !!data?.videoDetails?.videoId;
 
-      // Dòng log quan trọng nhất: cho biết YouTube thực sự trả gì.
-      // status=LOGIN_REQUIRED + reason="Sign in to confirm you're not a bot" => bị chặn theo IP (datacenter).
       logger.info(
         `[youtube] player client=${clientType} playabilityStatus=${status} reason="${reason}" hasVideoDetails=${hasDetails} (${Date.now() - started}ms)`
       );
@@ -100,7 +130,6 @@ async function fetchPlayer(videoId: string, logger: any): Promise<{ data: any; c
 
       lastReason = `${status}${reason ? ` - ${reason}` : ""}`;
     } catch (e: any) {
-      // Lỗi mạng (không phải HTTP): DNS, egress bị chặn, timeout, TLS...
       const code = e?.cause?.code || e?.code || "";
       lastReason = `fetch error: ${e?.message}${code ? ` (${code})` : ""}`;
       logger.error(`[youtube] player client=${clientType} ${lastReason}`);
@@ -174,6 +203,7 @@ function parseTranscriptXml(xml: string) {
 
 /**
  * Lấy transcript từ chính response player đã fetch được (dùng lại data, không gọi thêm 1 lần).
+ * Request tải phụ đề cũng đi qua proxy.
  */
 async function fetchTranscriptFromPlayer(data: any, logger: any, lang = "en") {
   const tracks: any[] = data?.captions?.playerCaptionsTracklistRenderer?.captionTracks ?? [];
@@ -191,7 +221,7 @@ async function fetchTranscriptFromPlayer(data: any, logger: any, lang = "en") {
   }
 
   try {
-    const res = await fetch(track.baseUrl, { headers: { "User-Agent": WEB_USER_AGENT } });
+    const res = await proxiedFetch(track.baseUrl, { headers: { "User-Agent": WEB_USER_AGENT } });
     if (!res.ok) {
       logger.warn(`[youtube] transcript fetch HTTP ${res.status} ${res.statusText}`);
       return null;
@@ -238,7 +268,6 @@ export function handleYoutubeCrawl(router: Router, context: any) {
         return res.status(404).json({
           success: false,
           message: 'Video not found or unavailable.',
-          // Trả reason ra để nhìn ngay trên frontend/response khi debug (có thể gỡ sau).
           reason,
         });
       }
