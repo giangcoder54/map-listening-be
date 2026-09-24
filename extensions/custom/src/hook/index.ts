@@ -61,6 +61,11 @@ export default defineHook((registerEvents, context) => {
 			accountability: { admin: true },
 		});
 
+		// Viết hoa chữ cái đầu tiên của text
+		if (typeof payload.text === 'string' && payload.text.length > 0) {
+			payload.text = payload.text.charAt(0).toUpperCase() + payload.text.slice(1);
+		}
+
 		// Tạo short_id ngẫu nhiên 8 ký tự
 		if (!payload.short_id) {
 			const { nanoid } = await import('nanoid');
@@ -135,6 +140,14 @@ export default defineHook((registerEvents, context) => {
 			payload.name = `Challenge ${count + 1}`;
 		}
 
+		return payload;
+	});
+
+	// Viết hoa chữ cái đầu tiên của text khi cập nhật listening_target
+	filter('listening_targets.items.update', async (payload: any) => {
+		if (typeof payload.text === 'string' && payload.text.length > 0) {
+			payload.text = payload.text.charAt(0).toUpperCase() + payload.text.slice(1);
+		}
 		return payload;
 	});
 
