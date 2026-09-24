@@ -54,8 +54,93 @@ export default defineHook((registerEvents, context) => {
 	// learners_count của listening_targets được cập nhật trong endpoint POST /v1/listening-lab/attempts
 	// (chỉ +1 cho lần Check đầu tiên của mỗi người), không cộng theo từng attempt nữa.
 
-	filter('items.create', async (payload: any, meta, hookContext) => {
-		if (meta.collection === 'listening_tests' && payload.title && !payload.slug) {
+	// Tự động tạo short_id, slug, và name khi tạo mới listening_target
+	filter('listening_targets.items.create', async (payload: any, _meta, hookContext) => {
+		const itemsService = new ItemsService('listening_targets', {
+			schema: hookContext.schema,
+			accountability: { admin: true },
+		});
+
+		// Tạo short_id ngẫu nhiên 8 ký tự
+		if (!payload.short_id) {
+			const { nanoid } = await import('nanoid');
+			payload.short_id = nanoid(8);
+		}
+
+		// Tạo slug từ text (từ cần nghe)
+		if (payload.text && !payload.slug) {
+			const baseSlug = payload.text
+				.toLowerCase()
+				.normalize('NFD')
+				.replace(/[\u0300-\u036f]/g, '')
+				.replace(/đ/g, 'd')
+				.replace(/[^a-z0-9]+/g, '-')
+				.replace(/^-+|-+$/g, '');
+
+			let uniqueSlug = baseSlug || 'target';
+			let counter = 1;
+
+			while (true) {
+				const existing = await itemsService.readByQuery({
+					filter: { slug: { _eq: uniqueSlug } },
+					limit: 1,
+				});
+
+				if (existing && existing.length > 0) {
+					uniqueSlug = `${baseSlug}-${counter}`;
+					counter++;
+				} else {
+					break;
+				}
+			}
+
+			payload.slug = uniqueSlug;
+		}
+
+		// Tự động đặt name theo thứ tự "Challenge N" trong cùng type
+		if (!payload.name) {
+			// Lấy type đầu tiên từ payload (M2M qua junction table)
+			let typeId: string | null = null;
+			if (Array.isArray(payload.types) && payload.types.length > 0) {
+				const firstType = payload.types[0];
+				if (typeof firstType === 'string') {
+					typeId = firstType;
+				} else if (firstType?.listening_types_id) {
+					typeId = typeof firstType.listening_types_id === 'string'
+						? firstType.listening_types_id
+						: firstType.listening_types_id?.id ?? null;
+				}
+			}
+
+			let count = 0;
+			if (typeId) {
+				// Đếm số targets đã có trong cùng type qua junction table
+				const junctionService = new ItemsService('listening_targets_listening_types', {
+					schema: hookContext.schema,
+					accountability: { admin: true },
+				});
+				const result = await junctionService.readByQuery({
+					filter: { listening_types_id: { _eq: typeId } },
+					aggregate: { count: ['id'] },
+				});
+				count = Number(result?.[0]?.count?.id ?? 0);
+			} else {
+				// Fallback: không có type thì đếm tổng
+				const result = await itemsService.readByQuery({
+					aggregate: { count: ['id'] },
+				});
+				count = Number(result?.[0]?.count?.id ?? 0);
+			}
+
+			payload.name = `Challenge ${count + 1}`;
+		}
+
+		return payload;
+	});
+
+	// Tự động tạo slug từ title khi tạo mới listening_test
+	filter('listening_tests.items.create', async (payload: any, _meta, hookContext) => {
+		if (payload.title && !payload.slug) {
 			const slug = payload.title
 				.toLowerCase()
 				.normalize('NFD')
@@ -88,7 +173,6 @@ export default defineHook((registerEvents, context) => {
 
 			payload.slug = uniqueSlug;
 		}
-
 		return payload;
 	});
 });
