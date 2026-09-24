@@ -846,7 +846,7 @@ export default defineEndpoint((router, context) => {
 					WHERE tt.listening_targets_id IN (SELECT target_id FROM mine)
 					GROUP BY tt.listening_targets_id
 				)
-				SELECT t.id AS target_id, t.text, t.difficulty, t.learners_count,
+				SELECT t.id AS target_id, t.short_id, t.text, t.difficulty, t.learners_count,
 					COALESCE(totals.total_clips, 0) AS total_clips,
 					mine.completed_clips, mine.checks, mine.correct_checks, mine.reveals,
 					mine.first_practiced_at, mine.last_practiced_at,
@@ -880,6 +880,7 @@ export default defineEndpoint((router, context) => {
 
 				return {
 					target_id: row.target_id,
+					short_id: row.short_id,
 					text: row.text,
 					difficulty: row.difficulty,
 					types,
@@ -912,7 +913,65 @@ export default defineEndpoint((router, context) => {
 				last_practiced_at: challenges[0]?.last_practiced_at ?? null,
 			};
 
-			return res.status(200).json({ success: true, data: { summary, challenges } });
+			// ── Hoạt động theo ngày: dùng cho heatmap VÀ đường xu hướng độ chính xác ──
+			// Gom nhóm ngay trong DB (1 truy vấn), thay cho endpoint /my-activity riêng
+			// trước đây -> trang profile chỉ cần gọi 1 API. Chỉ tính lần "check" thật
+			// (bỏ [REVEALED]) để độ chính xác không bị loãng.
+			const activityRes = await database.raw(
+				`
+				SELECT
+					to_char(DATE(date_created AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Ho_Chi_Minh'), 'YYYY-MM-DD') AS day,
+					COUNT(*)::int AS checks,
+					COUNT(*) FILTER (WHERE is_correct IS TRUE)::int AS correct
+				FROM listening_attempts
+				WHERE user_id = ?
+					AND answer IS DISTINCT FROM '[REVEALED]'
+					AND date_created >= NOW() - INTERVAL '365 days'
+				GROUP BY 1
+				ORDER BY 1 ASC
+				`,
+				[userId],
+			);
+			const activity = (activityRes.rows || []).map((r: any) => ({
+				day: r.day,
+				checks: Number(r.checks) || 0,
+				correct: Number(r.correct) || 0,
+			}));
+
+			// ── Độ chính xác theo từng DẠNG bài: cho người học thấy mình yếu ở đâu ──
+			// (nối âm / từ đơn / âm giống nhau...). attempt -> clip -> target -> types.
+			const byTypeRes = await database.raw(
+				`
+				SELECT lt.id AS type_id, lt.name, lt.slug,
+					COUNT(*)::int AS checks,
+					COUNT(*) FILTER (WHERE a.is_correct IS TRUE)::int AS correct
+				FROM listening_attempts a
+				JOIN listening_clips c ON c.id = a.clip_id
+				JOIN listening_targets_listening_types tt ON tt.listening_targets_id = c.target_id
+				JOIN listening_types lt ON lt.id = tt.listening_types_id
+				WHERE a.user_id = ?
+					AND a.answer IS DISTINCT FROM '[REVEALED]'
+					AND c.target_id IS NOT NULL
+				GROUP BY lt.id, lt.name, lt.slug
+				HAVING COUNT(*) > 0
+				ORDER BY checks DESC
+				`,
+				[userId],
+			);
+			const by_type = (byTypeRes.rows || []).map((r: any) => {
+				const checks = Number(r.checks) || 0;
+				const correct = Number(r.correct) || 0;
+				return {
+					type_id: r.type_id,
+					name: r.name,
+					slug: r.slug,
+					checks,
+					correct,
+					accuracy: checks > 0 ? Math.round((correct / checks) * 100) : 0,
+				};
+			});
+
+			return res.status(200).json({ success: true, data: { summary, challenges, activity, by_type } });
 		} catch (error: any) {
 			console.error('Listening Lab my-progress error:', error);
 			return res.status(500).json({ success: false, error: error.message || 'Server error' });
@@ -999,6 +1058,44 @@ export default defineEndpoint((router, context) => {
 			return res.status(200).json({ success: true, data: result });
 		} catch (error: any) {
 			console.error("Listening Lab stats error:", error);
+			return res.status(500).json({ success: false, error: error.message || 'Server error' });
+		}
+	});
+
+	// =====================================================================
+	// GET /listening-lab/my-activity -> daily practice counts for the last 365 days
+	// Response: { success: true, data: { [dateStr: "YYYY-MM-DD"]: count } }
+	// Used by the GitHub-style activity heatmap on the profile page.
+	// "activity" = 1 listening_attempt row (check or reveal) by this user on that day.
+	// =====================================================================
+	router.get('/listening-lab/my-activity', async (req, res) => {
+		const userId = (req as any).accountability?.user ?? null;
+		if (!userId) {
+			return res.status(401).json({ success: false, message: 'Unauthorized' });
+		}
+
+		const { database } = context;
+		try {
+			const rows = await database('listening_attempts')
+				.select(database.raw(`DATE(date_created AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Ho_Chi_Minh') AS day`))
+				.count('id as count')
+				.where('user_id', userId)
+				.andWhere('date_created', '>=', database.raw(`NOW() - INTERVAL '365 days'`))
+				.groupByRaw(`DATE(date_created AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Ho_Chi_Minh')`)
+				.orderBy('day', 'asc');
+
+			const data: Record<string, number> = {};
+			for (const row of rows) {
+				// row.day is a JS Date or string depending on pg driver; normalize to YYYY-MM-DD
+				const d = row.day instanceof Date
+					? row.day.toISOString().slice(0, 10)
+					: String(row.day).slice(0, 10);
+				data[d] = Number(row.count) || 0;
+			}
+
+			return res.status(200).json({ success: true, data });
+		} catch (error: any) {
+			console.error('Listening Lab my-activity error:', error);
 			return res.status(500).json({ success: false, error: error.message || 'Server error' });
 		}
 	});
