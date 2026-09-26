@@ -3,7 +3,7 @@ import { handleCheckout } from './checkout';
 import { handleSepayWebhook } from './sepay';
 import { handleYoutubeCrawl } from './youtube';
 import { ensurePaymentSchema } from '../lib/paymentSchema';
-import { consumeQuotaForClip, getQuotaStatus, publicQuota } from '../lib/quota';
+import { canAccessTarget } from '../lib/premium';
 
 
 const isValidUUID = (val: unknown): val is string =>
@@ -665,6 +665,8 @@ export default defineEndpoint((router, context) => {
 	//   anonymous_id?: string   // id ẩn danh trong cookie, dùng để đếm cả khách
 	// }
 	// - User đăng nhập: lưu lịch sử vào listening_attempts (dùng cho tiến độ / % hoàn thành)
+	// - Khách: làm được bài free nhưng không lưu tiến độ
+	// - Bài không free: chỉ Premium (403 PREMIUM_REQUIRED)
 	// - Lần "check" đầu tiên của mỗi người (user hoặc khách) ở challenge -> learners_count + 1
 	// =====================================================================
 	router.post('/listening-lab/attempts', async (req, res) => {
@@ -683,52 +685,30 @@ export default defineEndpoint((router, context) => {
 			return res.status(400).json({ success: false, message: 'Invalid clip_id' });
 		}
 
-		// Chấm bài bắt buộc đăng nhập.
-		//
-		// Chặn ngay tại đây chứ không chỉ dựa vào tầng quota: khối quota bên dưới
-		// cố tình fail-open (lỗi quota thì vẫn cho làm bài), nên nếu chỉ dựa vào nó
-		// thì một sự cố ở bảng quota sẽ mở lại cửa cho khách.
-		if (!userId) {
-			return res.status(401).json({
-				success: false,
-				code: 'LOGIN_REQUIRED',
-				message: 'Vui lòng đăng nhập để chấm bài.',
-			});
-		}
-
 		try {
 			await ensureLearnersTable(database, logger);
 
-			const clip = await database('listening_clips').select('id', 'target_id').where('id', clipId).first();
+			const clip = await database('listening_clips')
+				.select('listening_clips.id', 'listening_clips.target_id', 'listening_targets.is_free')
+				.leftJoin('listening_targets', 'listening_targets.id', 'listening_clips.target_id')
+				.where('listening_clips.id', clipId)
+				.first();
 			if (!clip) {
 				return res.status(404).json({ success: false, message: 'Clip not found' });
 			}
 
-			// Quota gói Free: CHỈ áp cho 'check'. "Show answer" (reveal) không trừ lượt.
-			// 1 lượt = lần Check đầu tiên ở mỗi clip trong tháng; thử lại cùng clip miễn phí.
-			// Lỗi ở tầng quota thì cho qua (fail-open) và ghi log: chặn nhầm người đang
-			// học thật tệ hơn nhiều so với lọt vài lượt miễn phí.
-			let quotaState: any = null;
-			try {
-				quotaState = type === 'check'
-					? await consumeQuotaForClip({ database, logger, userId, anonymousId, clipId: clip.id })
-					: await getQuotaStatus({ database, logger, userId, anonymousId });
-			} catch (quotaError: any) {
-				logger?.error?.(`[quota] Bỏ qua kiểm tra lượt do lỗi: ${String(quotaError)}`);
-			}
-
-			// Hết lượt -> dừng hẳn: không ghi listening_attempts, không cộng learners_count.
-			if (quotaState && !quotaState.allowed) {
-				return res.status(402).json({
+			// Bài Premium: chặn ở đây chứ không chỉ ở giao diện, không thì ai cũng ghi
+			// được tiến độ / cộng learners_count cho bài mình chưa mở khoá.
+			if (!(await canAccessTarget(database, clip, userId, logger))) {
+				return res.status(403).json({
 					success: false,
-					code: 'QUOTA_EXCEEDED',
-					message: quotaState.requires === 'signup'
-						? 'Bạn đã dùng hết lượt luyện tập thử. Đăng ký tài khoản miễn phí để có thêm lượt.'
-						: 'Bạn đã dùng hết lượt luyện tập miễn phí của tháng này.',
-					data: { quota: publicQuota(quotaState) },
+					code: 'PREMIUM_REQUIRED',
+					message: 'Bài này dành cho gói Premium.',
 				});
 			}
 
+			// Khách được làm bài free nhưng không lưu tiến độ: listening_attempts chỉ
+			// ghi cho user đăng nhập (xem bên dưới), khách chỉ được đếm vào learners_count.
 			let attemptId: string | number | null = null;
 			if (userId) {
 				const attemptsService = new ItemsService('listening_attempts', {
@@ -767,7 +747,6 @@ export default defineEndpoint((router, context) => {
 					target_id: clip.target_id ?? null,
 					counted,
 					learners_count: target ? Number(target.learners_count) : null,
-					quota: quotaState ? publicQuota(quotaState) : null,
 				},
 			});
 		} catch (error: any) {
@@ -777,20 +756,62 @@ export default defineEndpoint((router, context) => {
 	});
 
 	// =====================================================================
-	// GET /listening-lab/quota -> số lượt luyện tập còn lại trong tháng
-	// Chỉ đọc, không trừ lượt. Khách truyền ?anonymous_id=<cookie gl_anon_id>
+	// GET /listening-lab/challenges/:key/clips -> các clip của một challenge
+	// :key = short_id hoặc UUID của listening_targets.
+	// - Bài free hoặc user Premium: trả đầy đủ (start/end/transcript để làm bài)
+	// - Bài khoá: locked = true, clip bị bỏ start_time / end_time / transcript và
+	//   target bị bỏ đáp án. Vẫn trả tên video, loại bài, ảnh bìa để trang
+	//   hiển thị bản xem trước và giữ SEO.
+	// Quyền public / Free Access trên listening_clips cũng không đọc được 3 cột
+	// này, nên không thể lấy đáp án bài khoá bằng cách gọi thẳng Directus.
 	// =====================================================================
-	router.get('/listening-lab/quota', async (req, res) => {
+	router.get('/listening-lab/challenges/:key/clips', async (req, res) => {
 		const { database, logger } = context;
+		const { ItemsService } = context.services;
 		const userId = (req as any).accountability?.user ?? null;
-		const rawAnon = (req.query as any)?.anonymous_id;
-		const anonymousId = typeof rawAnon === 'string' && ANON_ID_REGEX.test(rawAnon) ? rawAnon : null;
+		const key = String(req.params.key || '');
+
+		if (!key || key.length > 64) {
+			return res.status(400).json({ success: false, message: 'Invalid challenge key' });
+		}
 
 		try {
-			const state = await getQuotaStatus({ database, logger, userId, anonymousId });
-			return res.json({ success: true, data: publicQuota(state) });
+			// Không dùng _or trên id/short_id: Postgres ép short_id -> uuid và văng 22P02.
+			const targetFilter = isValidUUID(key) ? { id: { _eq: key } } : { short_id: { _eq: key } };
+			const clipsService = new ItemsService('listening_clips', {
+				schema: (req as any).schema,
+				accountability: { admin: true, role: null, user: null } as any,
+			});
+			const clips: any[] = await clipsService.readByQuery({
+				filter: { target_id: targetFilter } as any,
+				fields: [
+					'*',
+					'source_video_id.*',
+					'target_id.*',
+					'target_id.types.listening_types_id.id',
+					'target_id.types.listening_types_id.name',
+					'target_id.types.listening_types_id.slug',
+				],
+				limit: -1,
+			});
+
+			if (clips.length === 0) {
+				return res.status(404).json({ success: false, message: 'Challenge not found' });
+			}
+
+			const target = clips[0].target_id;
+			if (await canAccessTarget(database, target, userId, logger)) {
+				return res.json({ success: true, data: { locked: false, clips } });
+			}
+
+			const preview = clips.map((clip) => {
+				const { start_time, end_time, transcript, ...rest } = clip;
+				const { text, explanation, translations, ...targetRest } = clip.target_id || {};
+				return { ...rest, target_id: targetRest };
+			});
+			return res.json({ success: true, data: { locked: true, clips: preview } });
 		} catch (error: any) {
-			logger?.error?.(`[quota] Đọc quota thất bại: ${String(error)}`);
+			logger?.error?.(`[listening-lab] Load challenge clips failed: ${String(error)}`);
 			return res.status(500).json({ success: false, message: error.message || 'Server error' });
 		}
 	});
