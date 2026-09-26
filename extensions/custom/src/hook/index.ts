@@ -102,7 +102,7 @@ export default defineHook((registerEvents, context) => {
 			payload.slug = uniqueSlug;
 		}
 
-		// Tự động đặt name theo thứ tự "Challenge N" trong cùng type
+		// Tự động đặt name theo thứ tự "Lesson N" trong cùng type
 		if (!payload.name) {
 			// Lấy type đầu tiên từ payload (M2M qua junction table)
 			let typeId: string | null = null;
@@ -137,7 +137,7 @@ export default defineHook((registerEvents, context) => {
 				count = Number(result?.[0]?.count?.id ?? 0);
 			}
 
-			payload.name = `Challenge ${count + 1}`;
+			payload.name = `Lesson ${count + 1}`;
 		}
 
 		return payload;
