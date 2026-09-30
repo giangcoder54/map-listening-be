@@ -5,14 +5,12 @@ export interface Schema {
   languages: Language[];
   listening_attempts: ListeningAttempt[];
   listening_clips: ListeningClip[];
-  listening_quota_clips: ListeningQuotaClip[];
-  listening_target_learners: ListeningTargetLearner[];
-  listening_targets: ListeningTarget[];
-  listening_targets_listening_types: ListeningTargetListeningType[];
-  listening_targets_translations: ListeningTargetTranslation[];
+  listening_groups: ListeningGroup[];
+  listening_skills: ListeningSkill[];
+  listening_lessons: ListeningLesson[];
+  listening_progress: ListeningProgress[];
   listening_tests: ListeningTest[];
   listening_tests_files: ListeningTestFile[];
-  listening_types: ListeningType[];
   master_wallet: MasterWallet;
   plan_prices: PlanPrice[];
   plans: Plan[];
@@ -28,7 +26,7 @@ export interface Comment {
   date_updated: "datetime" | null;
   user_created: string | null;
   user_updated: string | null;
-  target_id: string | ListeningTarget | null;
+  lesson_id: string | ListeningLesson | null;
   parent_id: string | Comment | null;
   content: string | null;
   upvotes: number | null;
@@ -46,6 +44,9 @@ export interface ListeningAttempt {
   clip_id: string | ListeningClip | null;
   answer: string | null;
   is_correct: boolean | null;
+  lesson_id: string | ListeningLesson | null;
+  step: "type" | "voice" | "challenge" | "more" | null;
+  mode: string | null;
   attempt_number: number | null;
   listen_count: number | null;
   date_created: "datetime" | null;
@@ -60,55 +61,57 @@ export interface ListeningClip {
   start_time: number | null;
   end_time: number | null;
   transcript: string | null;
-  target_id: string | ListeningTarget | null;
+  sort: number | null;
+  lesson_id: string | ListeningLesson | null;
+  step: "type" | "voice" | "challenge" | null;
+  challenge_mode: "sentence" | "speed" | null;
+  answer: string | null;
 }
 
-export interface ListeningQuotaClip {
+export interface ListeningGroup {
   id: string;
-  subject_key: string;
-  period: string;
-  clip_id: string;
-  date_created: "datetime" | null;
+  status: "published" | "draft" | "archived";
+  sort: number | null;
+  name: string;
+  slug: string;
+  answer_mode: "one_answer" | "per_clip";
+  is_premium: boolean;
 }
 
-export interface ListeningTargetLearner {
+export interface ListeningSkill {
   id: string;
-  target_id: string;
-  user_id: string | null;
-  anonymous_id: string | null;
-  learner_key: string;
-  date_created: "datetime";
+  status: "published" | "draft" | "archived";
+  sort: number | null;
+  group_id: string | ListeningGroup;
+  category: string | null;
+  name: string;
+  slug: string;
+  is_premium: boolean;
 }
 
-export interface ListeningTarget {
+export interface ListeningLesson {
   id: string;
-  status: "published" | "draft" | "archived" | null;
+  status: "published" | "draft" | "archived";
+  sort: number | null;
+  skill_id: string | ListeningSkill;
+  short_id: string;
+  slug: string | null;
+  text: string;
+  difficulty: "easy" | "medium" | "hard";
+  is_premium: boolean;
+  learners_count: number;
   date_created: "datetime" | null;
   date_updated: "datetime" | null;
-  name: string | null;
-  text: string | null;
-  learners_count: number | null;
-  difficulty: "easy" | "medium" | "hard" | null;
-  explanation: string | null;
-  slug: string | null;
-  short_id: string | null;
-  listening_clips: string[] | ListeningClip[];
-  types: string[] | ListeningTargetListeningType[];
-  translations: string[] | ListeningTargetTranslation[];
 }
 
-export interface ListeningTargetListeningType {
-  id: number;
-  listening_targets_id: string | ListeningTarget | null;
-  listening_types_id: string | ListeningType | null;
-}
-
-export interface ListeningTargetTranslation {
+export interface ListeningProgress {
   id: string;
-  listening_targets_id: string | ListeningTarget | null;
-  languages_code: string | Language | null;
-  explanation: string | null;
-  tips: string | null;
+  user_id: string | DirectusUser<Schema>;
+  lesson_id: string | ListeningLesson;
+  status: "in_progress" | "completed";
+  step_results: unknown | null;
+  score: number | null;
+  completed_at: "datetime" | null;
 }
 
 export interface ListeningTest {
@@ -142,18 +145,6 @@ export interface ListeningTestFile {
   id: number;
   listening_tests_id: string | ListeningTest | null;
   directus_files_id: string | DirectusFile<Schema> | null;
-}
-
-export interface ListeningType {
-  id: string;
-  status: "published" | "draft" | "archived";
-  sort: number | null;
-  user_created: string | DirectusUser<Schema> | null;
-  date_created: "datetime" | null;
-  user_updated: string | DirectusUser<Schema> | null;
-  date_updated: "datetime" | null;
-  name: string | null;
-  slug: string | null;
 }
 
 export interface MasterWallet {
