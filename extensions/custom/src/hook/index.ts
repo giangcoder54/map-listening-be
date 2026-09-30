@@ -51,102 +51,25 @@ export default defineHook((registerEvents, context) => {
 		}
 	});
 
-	// learners_count của listening_targets được cập nhật trong endpoint POST /v1/listening-lab/attempts
-	// (chỉ +1 cho lần Check đầu tiên của mỗi người), không cộng theo từng attempt nữa.
-
-	// Tự động tạo short_id, slug, và name khi tạo mới listening_target
-	filter('listening_targets.items.create', async (payload: any, _meta, hookContext) => {
-		const itemsService = new ItemsService('listening_targets', {
-			schema: hookContext.schema,
-			accountability: { admin: true },
-		});
-
-		// Viết hoa chữ cái đầu tiên của text
-		if (typeof payload.text === 'string' && payload.text.length > 0) {
-			payload.text = payload.text.charAt(0).toUpperCase() + payload.text.slice(1);
-		}
-
-		// Tạo short_id ngẫu nhiên 8 ký tự
+	// New lesson: short_id (URL), a unique slug from its text, and last place in its skill
+	filter('listening_lessons.items.create', async (payload: any, _meta, hookContext) => {
+		const db = hookContext.database;
 		if (!payload.short_id) {
 			const { nanoid } = await import('nanoid');
 			payload.short_id = nanoid(8);
 		}
-
-		// Tạo slug từ text (từ cần nghe)
-		if (payload.text && !payload.slug) {
-			const baseSlug = payload.text
-				.toLowerCase()
-				.normalize('NFD')
-				.replace(/[\u0300-\u036f]/g, '')
-				.replace(/đ/g, 'd')
-				.replace(/[^a-z0-9]+/g, '-')
-				.replace(/^-+|-+$/g, '');
-
-			let uniqueSlug = baseSlug || 'target';
-			let counter = 1;
-
-			while (true) {
-				const existing = await itemsService.readByQuery({
-					filter: { slug: { _eq: uniqueSlug } },
-					limit: 1,
-				});
-
-				if (existing && existing.length > 0) {
-					uniqueSlug = `${baseSlug}-${counter}`;
-					counter++;
-				} else {
-					break;
-				}
-			}
-
-			payload.slug = uniqueSlug;
+		if (typeof payload.text === 'string' && payload.text.trim() && !payload.slug) {
+			const base = payload.text.trim().toLowerCase()
+				.normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/đ/g, 'd')
+				.replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'lesson';
+			let slug = base;
+			for (let n = 1; await db('listening_lessons').where('slug', slug).first('id'); n++) slug = `${base}-${n}`;
+			payload.slug = slug;
 		}
-
-		// Tự động đặt name theo thứ tự "Lesson N" trong cùng type
-		if (!payload.name) {
-			// Lấy type đầu tiên từ payload (M2M qua junction table)
-			let typeId: string | null = null;
-			if (Array.isArray(payload.types) && payload.types.length > 0) {
-				const firstType = payload.types[0];
-				if (typeof firstType === 'string') {
-					typeId = firstType;
-				} else if (firstType?.listening_types_id) {
-					typeId = typeof firstType.listening_types_id === 'string'
-						? firstType.listening_types_id
-						: firstType.listening_types_id?.id ?? null;
-				}
-			}
-
-			let count = 0;
-			if (typeId) {
-				// Đếm số targets đã có trong cùng type qua junction table
-				const junctionService = new ItemsService('listening_targets_listening_types', {
-					schema: hookContext.schema,
-					accountability: { admin: true },
-				});
-				const result = await junctionService.readByQuery({
-					filter: { listening_types_id: { _eq: typeId } },
-					aggregate: { count: ['id'] },
-				});
-				count = Number(result?.[0]?.count?.id ?? 0);
-			} else {
-				// Fallback: không có type thì đếm tổng
-				const result = await itemsService.readByQuery({
-					aggregate: { count: ['id'] },
-				});
-				count = Number(result?.[0]?.count?.id ?? 0);
-			}
-
-			payload.name = `Lesson ${count + 1}`;
-		}
-
-		return payload;
-	});
-
-	// Viết hoa chữ cái đầu tiên của text khi cập nhật listening_target
-	filter('listening_targets.items.update', async (payload: any) => {
-		if (typeof payload.text === 'string' && payload.text.length > 0) {
-			payload.text = payload.text.charAt(0).toUpperCase() + payload.text.slice(1);
+		const skillId = typeof payload.skill_id === 'object' ? payload.skill_id?.id : payload.skill_id;
+		if (payload.sort == null && skillId) {
+			const row = await db('listening_lessons').where('skill_id', skillId).max('sort as max').first();
+			payload.sort = (Number(row?.max) || 0) + 1;
 		}
 		return payload;
 	});
