@@ -3,7 +3,7 @@ import Decimal from 'decimal.js';
 import { newPaymentCode } from './paymentCode';
 import { getReceivingAccount } from '../lib/sepayBankAccount';
 import { addVat, breakdownFromPreTax } from '../lib/vat';
-import { calculateEndDate, activatePremiumForUser } from '../utils';
+import { calculateEndDate, activatePremiumForUser, purchaseCycle } from '../utils';
 
 export function handleCheckout(router: Router, context: any) {
   router.post('/checkout', async (req: any, res: any) => {
@@ -34,6 +34,12 @@ export function handleCheckout(router: Router, context: any) {
 
       const userId = accountability.user;
       const targetCurrency = 'vnd';
+
+      // Lifetime Premium already covers everything: no order to pay
+      const buyer = await database('directus_users').select('subscription_type').where('id', userId).first();
+      if (buyer?.subscription_type === 'lifetime') {
+        return res.status(409).json({ success: false, error: 'You already have lifetime Premium.' });
+      }
 
       const plansService = new ItemsService('plans', {
         schema,
@@ -151,7 +157,7 @@ export function handleCheckout(router: Router, context: any) {
 
         const purchaseHistory = await purchaseHistoryService.createOne(purchaseHistoryData);
 
-        const cycle = Number(billing_cycle) || (totalPrice > 500000 ? 12 : 1);
+        const cycle = purchaseCycle(billing_cycle, totalPrice);
         const endDate = calculateEndDate(new Date(), cycle);
         const usersService = new ItemsService('directus_users', {
           schema,

@@ -22,7 +22,7 @@ catch {
   bot = null
 }
 
-function notifyAdmin(message: string) {
+export function notifyAdmin(message: string) {
   if (!bot)
     return
   const groupChatId = process.env.TELEGRAM_GROUP_ID || '-5020831863'

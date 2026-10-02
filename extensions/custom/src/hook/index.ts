@@ -1,7 +1,10 @@
 import { defineHook } from '@directus/extensions-sdk';
 import { registerCronjob } from './cronjob_check_transactions/cronjob_check_transactions';
-import { calculateEndDate, activatePremiumForUser } from '../utils';
+import { calculateEndDate, activatePremiumForUser, purchaseCycle } from '../utils';
 import { registerSepayRawBody } from './sepayRawBody';
+import { downgradeExpiredPremium } from '../lib/premium';
+import { registerLessonStep1Check } from './lessonStep1Check';
+import { registerLessonTextCase } from './lessonTextCase';
 
 export default defineHook((registerEvents, context) => {
 	const { filter, action } = registerEvents;
@@ -10,6 +13,9 @@ export default defineHook((registerEvents, context) => {
 
 	// Giữ raw body cho webhook SePay (bắt buộc để xác thực HMAC-SHA256)
 	registerSepayRawBody(registerEvents, context);
+
+	// Mỗi giờ: Premium hết hạn -> role Free User
+	registerEvents.schedule('15 * * * *', async () => { await downgradeExpiredPremium(context.database, context.logger); });
 
 	// Register cronjob check transactions
 	// registerCronjob(registerEvents, context);
@@ -32,7 +38,7 @@ export default defineHook((registerEvents, context) => {
 						const customerId = typeof purchase.user === 'object' ? purchase.user?.id : purchase.user;
 						if (customerId) {
 							const amount = purchase.amount || 0;
-							const cycle = purchase.billing_cycle || (amount > 500000 ? 12 : 1);
+							const cycle = purchaseCycle(purchase.billing_cycle, amount);
 							const endDate = calculateEndDate(new Date(), cycle);
 							await activatePremiumForUser(
 								customerId,
@@ -50,6 +56,10 @@ export default defineHook((registerEvents, context) => {
 			}
 		}
 	});
+
+	// A published lesson must keep a Step 1 clip, else the site hides it
+	registerLessonStep1Check(registerEvents);
+	registerLessonTextCase(registerEvents);
 
 	// New lesson: short_id (URL), a unique slug from its text, and last place in its skill
 	filter('listening_lessons.items.create', async (payload: any, _meta, hookContext) => {
@@ -70,44 +80,6 @@ export default defineHook((registerEvents, context) => {
 		if (payload.sort == null && skillId) {
 			const row = await db('listening_lessons').where('skill_id', skillId).max('sort as max').first();
 			payload.sort = (Number(row?.max) || 0) + 1;
-		}
-		return payload;
-	});
-
-	// Tự động tạo slug từ title khi tạo mới listening_test
-	filter('listening_tests.items.create', async (payload: any, _meta, hookContext) => {
-		if (payload.title && !payload.slug) {
-			const slug = payload.title
-				.toLowerCase()
-				.normalize('NFD')
-				.replace(/[\u0300-\u036f]/g, '')
-				.replace(/đ/g, 'd')
-				.replace(/[^a-z0-9]+/g, '-')
-				.replace(/^-+|-+$/g, '');
-
-			let uniqueSlug = slug || 'test';
-			let counter = 1;
-
-			const itemsService = new ItemsService('listening_tests', {
-				schema: hookContext.schema,
-				accountability: hookContext.accountability,
-			});
-
-			while (true) {
-				const existing = await itemsService.readByQuery({
-					filter: { slug: { _eq: uniqueSlug } },
-					limit: 1,
-				});
-
-				if (existing && existing.length > 0) {
-					uniqueSlug = `${slug}-${counter}`;
-					counter++;
-				} else {
-					break;
-				}
-			}
-
-			payload.slug = uniqueSlug;
 		}
 		return payload;
 	});
