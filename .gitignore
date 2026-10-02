@@ -48,3 +48,6 @@ Desktop.ini
 *.tmp
 *.temp
 .cache/
+
+# Local DB backups (restore points, may hold user data)
+database/backups/

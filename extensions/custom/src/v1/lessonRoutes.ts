@@ -5,7 +5,6 @@
  *   GET  /listening-lab/groups/:slug           one group and its skills
  *   GET  /listening-lab/skills/:slug           one skill and its lessons, in order
  *   GET  /listening-lab/lessons/:key           a lesson to play: steps + clips (:key = short_id or id)
- *   GET  /listening-lab/lessons/:key/practice  step 4: a few other lessons of the skill, with their clip
  *   GET  /listening-lab/lessons/:key/next      what to do after this lesson
  *   POST /listening-lab/lessons/:key/progress  result card reached: save status / score
  *   POST /listening-lab/attempts               one Check / Show answer on a clip
@@ -17,7 +16,7 @@
  * learner has finished the lesson.
  */
 import { isPremiumUser } from '../lib/premium';
-import { CLIP_STEPS, MORE_COUNT, UUID_RE, answerOf, loadLessonGraph, type LessonGraph, type LessonRow, type StepKey } from '../lib/lessons';
+import { CLIP_STEPS, UUID_RE, answerOf, loadLessonGraph, type LessonGraph, type LessonRow, type StepKey } from '../lib/lessons';
 
 const ANON_ID_RE = /^[A-Za-z0-9-]{16,64}$/;
 const badKey = (key: string) => !key || key.length > 64;
@@ -29,11 +28,42 @@ async function readClips(database: any, lessonIds: string[]) {
 		.leftJoin('source_videos as sv', 'sv.id', 'c.source_video_id')
 		.select(
 			'c.id', 'c.lesson_id', 'c.step', 'c.sort', 'c.challenge_mode', 'c.answer', 'c.transcript', 'c.start_time', 'c.end_time',
+			'c.practice_lesson_id', 'c.explanation_en', 'c.explanation_vi', 'c.playback_rate',
 			'sv.id as video_id', 'sv.youtube_video_id', 'sv.title as video_title', 'sv.channel_name', 'sv.thumbnail_url',
 		)
 		.whereIn('c.lesson_id', lessonIds)
 		.whereNotNull('c.step')
 		.orderBy([{ column: 'c.sort', order: 'asc', nulls: 'last' }, { column: 'c.id' }]);
+}
+
+/**
+ * Step-4 clips that point to another lesson take that lesson's step-1 clip (video, times,
+ * transcript) and its text as the answer. Locked or clip-less lessons are left out.
+ * The clip keeps its own id and lesson, so answering it never counts for that lesson.
+ */
+async function withPracticeLessons(database: any, g: LessonGraph, rows: any[]) {
+	const ids = [...new Set(rows.filter((r) => r.step === 'more' && r.practice_lesson_id).map((r) => r.practice_lesson_id as string))];
+	if (!ids.length) return rows;
+	const firstClip = new Map<string, any>();
+	const [clipRows, trs] = await Promise.all([readClips(database, ids), lessonTranslations(database, ids)]);
+	for (const row of clipRows) {
+		if (row.step === 'type' && !firstClip.has(row.lesson_id)) firstClip.set(row.lesson_id, row);
+	}
+	return rows.flatMap((r) => {
+		if (r.step !== 'more' || !r.practice_lesson_id) return [r];
+		const other = g.lessonById.get(r.practice_lesson_id);
+		const src = firstClip.get(r.practice_lesson_id);
+		if (!other || !src || g.isLocked(other)) return [];
+		return [{
+			...src,
+			id: r.id, lesson_id: r.lesson_id, step: r.step, sort: r.sort, challenge_mode: null,
+			answer: r.answer || src.answer || other.text,
+			// Its own explanation, else the one of the lesson it comes from
+			explanation_en: r.explanation_en, explanation_vi: r.explanation_vi,
+			playback_rate: r.playback_rate ?? src.playback_rate,
+			practice_translations: trs.get(r.practice_lesson_id) || [],
+		}];
+	});
 }
 
 function clipOut(row: any, lessonText: string, mode: ReturnType<LessonGraph['groupOf']>['answer_mode'], open: boolean) {
@@ -44,7 +74,7 @@ function clipOut(row: any, lessonText: string, mode: ReturnType<LessonGraph['gro
 		channel_name: row.channel_name,
 		thumbnail_url: row.thumbnail_url,
 	};
-	const base = { id: row.id, lesson_id: row.lesson_id, step: row.step as StepKey, sort: row.sort, mode: row.challenge_mode || null, video };
+	const base = { id: row.id, lesson_id: row.lesson_id, step: row.step as StepKey, sort: row.sort, mode: row.challenge_mode || null, rate: Number(row.playback_rate) || null, video };
 	if (!open) return { ...base, answer: null, transcript: null, start_time: null, end_time: null };
 	return {
 		...base,
@@ -52,7 +82,21 @@ function clipOut(row: any, lessonText: string, mode: ReturnType<LessonGraph['gro
 		transcript: row.transcript,
 		start_time: row.start_time,
 		end_time: row.end_time,
+		translations: clipTranslations(row),
 	};
+}
+
+/**
+ * Explanation of a clip, shaped like the lesson's translations. Empty: the page shows the
+ * lesson's (steps 1-3) or nothing (step 4, whose clips are other phrases).
+ */
+function clipTranslations(row: any): { languages_code: string; explanation: string | null; tips?: string | null }[] {
+	const own = [
+		{ languages_code: 'en', explanation: row.explanation_en },
+		{ languages_code: 'vi', explanation: row.explanation_vi },
+	].filter((tr) => tr.explanation && String(tr.explanation).trim());
+	if (own.length) return own;
+	return row.practice_translations || [];
 }
 
 async function lessonTranslations(database: any, lessonIds: string[]) {
@@ -68,17 +112,8 @@ async function lessonTranslations(database: any, lessonIds: string[]) {
 	return map;
 }
 
-/** Other lessons of the same skill for step 4: open & not done, open & done, locked. */
 /** Lessons listed on a skill card of the group page */
 const PREVIEW_COUNT = 5;
-
-function practicePool(g: LessonGraph, lesson: LessonRow) {
-	const rank = (l: LessonRow) => (g.isLocked(l) ? 10 : 0) + (g.done.has(l.id) ? 1 : 0);
-	return (g.lessonsBySkill.get(lesson.skill_id) || [])
-		.filter((l) => l.id !== lesson.id)
-		.sort((a, b) => rank(a) - rank(b))
-		.slice(0, MORE_COUNT);
-}
 
 export function registerLessonRoutes(router: any, context: any) {
 	const { database, logger } = context;
@@ -179,7 +214,8 @@ export function registerLessonRoutes(router: any, context: any) {
 			const skill = g.skillOf(lesson);
 			const group = g.groupOf(lesson);
 			const open = !g.isLocked(lesson);
-			const [rows, trs] = await Promise.all([readClips(database, [lesson.id]), lessonTranslations(database, [lesson.id])]);
+			const [own, trs] = await Promise.all([readClips(database, [lesson.id]), lessonTranslations(database, [lesson.id])]);
+			const rows = await withPracticeLessons(database, g, own);
 			const clips = rows.map((r: any) => clipOut(r, lesson.text, group.answer_mode, open));
 
 			const steps: { key: StepKey; mode?: string; count?: number }[] = [];
@@ -188,8 +224,6 @@ export function registerLessonRoutes(router: any, context: any) {
 				if (!own.length) continue;
 				steps.push(key === 'challenge' ? { key, mode: own[0].mode || 'speed' } : { key });
 			}
-			const others = practicePool(g, lesson).length;
-			if (others > 0) steps.push({ key: 'more', count: others });
 
 			return res.json({
 				success: true,
@@ -212,36 +246,10 @@ export function registerLessonRoutes(router: any, context: any) {
 		}
 	});
 
-	router.get('/listening-lab/lessons/:key/practice', async (req: any, res: any) => {
-		const key = String(req.params.key || '');
-		if (badKey(key)) return res.status(400).json({ success: false, message: 'Invalid lesson key' });
-		try {
-			const g = await loadLessonGraph(req, context);
-			const lesson = g.findLesson(key);
-			if (!lesson) return res.status(404).json({ success: false, message: 'Lesson not found' });
-
-			const picked = practicePool(g, lesson);
-			const openIds = picked.filter((l) => !g.isLocked(l)).map((l) => l.id);
-			const [rows, trs] = await Promise.all([readClips(database, openIds), lessonTranslations(database, openIds)]);
-			const firstClip = new Map<string, any>();
-			for (const row of rows) if (row.step === 'type' && !firstClip.has(row.lesson_id)) firstClip.set(row.lesson_id, row);
-
-			const items = picked.map((l) => {
-				const row = firstClip.get(l.id);
-				const mode = g.groupOf(l).answer_mode;
-				return {
-					lesson: { ...g.lessonCard(l), answer_text: row ? l.text : null, translations: trs.get(l.id) || [] },
-					clip: row ? clipOut(row, l.text, mode, true) : null,
-				};
-			});
-			return res.json({ success: true, data: { items } });
-		} catch (error) {
-			return fail(res, 'Load practice', error);
-		}
-	});
-
-	// After a lesson: the next lesson of the skill (open ones first); once the skill is done,
-	// the next skill of the group, then any other group. The current lesson counts as done.
+	// The next lesson of the skill (open ones first); once the skill is done, the next skill
+	// of the group, then any other group. ?finished=1 (the result card, before its progress
+	// save lands) counts the current lesson as done; while the lesson is still being worked
+	// on it only counts if it was finished before.
 	router.get('/listening-lab/lessons/:key/next', async (req: any, res: any) => {
 		const key = String(req.params.key || '');
 		if (badKey(key)) return res.status(400).json({ success: false, message: 'Invalid lesson key' });
@@ -251,24 +259,27 @@ export function registerLessonRoutes(router: any, context: any) {
 			if (!lesson) return res.status(404).json({ success: false, message: 'Lesson not found' });
 
 			const done = new Set(g.done);
-			done.add(lesson.id);
+			if (req.query?.finished === '1') done.add(lesson.id);
 			const skill = g.skillOf(lesson);
 			const skillLessons = g.lessonsBySkill.get(skill.id) || [];
-			const todo = (list: LessonRow[]) => list.filter((l) => !done.has(l.id));
+			// Never suggest the lesson on screen
+			const todo = (list: LessonRow[]) => list.filter((l) => !done.has(l.id) && l.id !== lesson.id);
+			const lessonDone = done.has(lesson.id);
 
 			let mode: 'continue' | 'skill_completed' | 'all_completed' = 'continue';
 			let nextSkill = skill;
 			let pool = todo(skillLessons);
 			if (!pool.length) {
-				mode = 'skill_completed';
+				// "completed" only once this lesson is done too, not while it is being worked on
 				const sameGroup = g.skills.filter((s) => s.group_id === skill.group_id && s.id !== skill.id);
 				const rest = g.skills.filter((s) => s.group_id !== skill.group_id);
 				const found = [...sameGroup, ...rest].find((s) => todo(g.lessonsBySkill.get(s.id) || []).length > 0);
 				if (found) {
+					if (lessonDone) mode = 'skill_completed';
 					nextSkill = found;
 					pool = todo(g.lessonsBySkill.get(found.id) || []);
 				} else {
-					mode = 'all_completed';
+					if (lessonDone) mode = 'all_completed';
 					pool = skillLessons.filter((l) => l.id !== lesson.id);
 				}
 			}

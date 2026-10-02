@@ -2,7 +2,7 @@ import type { ItemsService } from '@directus/api/dist/services/items'
 import type { DirectusUsers, MasterWallet, PurchaseHistories } from '../../types'
 import { defineHook } from '@directus/extensions-sdk'
 import axios from 'axios'
-import { calculateEndDate, activatePremiumForUser } from '../../utils'
+import { calculateEndDate, activatePremiumForUser, purchaseCycle } from '../../utils'
 
 // Bank configuration
 interface BankConfig {
@@ -340,7 +340,7 @@ async function processPurchaseMatches(
           continue
         }
 
-        const cycle = (matchingPurchase as any).billing_cycle || (expectedAmount > 500000 ? 12 : 1)
+        const cycle = purchaseCycle((matchingPurchase as any).billing_cycle, expectedAmount)
         const endDate = calculateEndDate(new Date(), cycle)
 
         // Cập nhật status của đơn hàng

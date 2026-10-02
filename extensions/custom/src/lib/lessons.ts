@@ -17,8 +17,7 @@ import { isPremiumUser } from './premium';
 
 export type AnswerMode = 'one_answer' | 'per_clip';
 export type StepKey = 'type' | 'voice' | 'challenge' | 'more';
-export const CLIP_STEPS: StepKey[] = ['type', 'voice', 'challenge'];
-export const MORE_COUNT = 3;
+export const CLIP_STEPS: StepKey[] = ['type', 'voice', 'challenge', 'more'];
 
 type Translation = { languages_code: string; [k: string]: any };
 
@@ -50,6 +49,7 @@ export type LessonRow = {
 	is_premium: boolean;
 	sort: number | null;
 	learners_count: number | null;
+	date_created: string | null;
 };
 
 const bySort = (a: { sort: number | null; name?: string }, b: { sort: number | null; name?: string }) =>
@@ -59,7 +59,8 @@ export const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f
 
 /**
  * The answer of a clip: its own `answer`; else the whole transcript for a "whole sentence"
- * challenge; else the [bracketed] part (per-clip groups); else the lesson text.
+ * challenge; else the [bracketed] part (per-clip groups, and step 4 "more practice", whose
+ * clips are other phrases: "let him go" in a "tell him" lesson); else the lesson text.
  */
 export function answerOf(
 	clip: { answer?: string | null; transcript?: string | null; step?: string | null; challenge_mode?: string | null },
@@ -71,7 +72,7 @@ export function answerOf(
 		const sentence = String(clip.transcript || '').replace(/[[\]]/g, '').replace(/\s+/g, ' ').trim();
 		if (sentence) return sentence;
 	}
-	if (mode === 'per_clip') {
+	if (mode === 'per_clip' || clip.step === 'more') {
 		const m = String(clip.transcript || '').match(/\[([^\]]+)\]/);
 		if (m?.[1]) return m[1].trim();
 	}
@@ -90,7 +91,7 @@ export async function loadLessonGraph(req: any, context: any) {
 	const [groupRows, skillRows, lessonRows, groupTr, skillTr, clipRows] = await Promise.all([
 		database('listening_groups').select('id', 'name', 'slug', 'sort', 'answer_mode', 'is_premium').where('status', 'published'),
 		database('listening_skills').select('id', 'group_id', 'name', 'slug', 'sort', 'category', 'is_premium').where('status', 'published'),
-		database('listening_lessons').select('id', 'skill_id', 'short_id', 'text', 'difficulty', 'is_premium', 'sort', 'learners_count').where('status', 'published'),
+		database('listening_lessons').select('id', 'skill_id', 'short_id', 'text', 'difficulty', 'is_premium', 'sort', 'learners_count', 'date_created').where('status', 'published'),
 		database('listening_groups_translations').select('listening_groups_id as owner', 'languages_code', 'description'),
 		database('listening_skills_translations').select('listening_skills_id as owner', 'languages_code', 'description', 'example'),
 		database.raw(`
@@ -174,6 +175,7 @@ export async function loadLessonGraph(req: any, context: any) {
 			in_progress: started.has(l.id),
 			total_clips: clipStats.get(l.id)?.total || 0,
 			learners_count: Number(l.learners_count) || 0,
+			date_created: l.date_created,
 			thumbnail: clipStats.get(l.id)?.thumbnail || '',
 			skill_id: l.skill_id,
 		};

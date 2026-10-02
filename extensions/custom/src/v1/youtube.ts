@@ -75,7 +75,7 @@ const CLIENTS: Record<ClientType, { context: any; headers: Record<string, string
  * Gọi InnerTube player endpoint, thử lần lượt các client cho tới khi lấy được videoDetails.
  * Log chi tiết mọi bước để debug được trên server (docker logs map-listening-api).
  */
-async function fetchPlayer(videoId: string, logger: any): Promise<{ data: any; clientType: ClientType | null; reason: string }> {
+export async function fetchPlayer(videoId: string, logger: any): Promise<{ data: any; clientType: ClientType | null; reason: string }> {
   const order: ClientType[] = ["ANDROID", "IOS", "WEB"];
   let lastReason = "unknown";
 
@@ -140,7 +140,7 @@ async function fetchPlayer(videoId: string, logger: any): Promise<{ data: any; c
   return { data: null, clientType: null, reason: lastReason };
 }
 
-function getVideoMeta(data: any, videoId: string) {
+export function getVideoMeta(data: any, videoId: string) {
   const details = data?.videoDetails;
   if (!details?.videoId) return null;
   return {
@@ -205,7 +205,7 @@ function parseTranscriptXml(xml: string) {
  * Lấy transcript từ chính response player đã fetch được (dùng lại data, không gọi thêm 1 lần).
  * Request tải phụ đề cũng đi qua proxy.
  */
-async function fetchTranscriptFromPlayer(data: any, logger: any, lang = "en") {
+export async function fetchTranscriptFromPlayer(data: any, logger: any, lang = "en") {
   const tracks: any[] = data?.captions?.playerCaptionsTracklistRenderer?.captionTracks ?? [];
   logger.info(
     `[youtube] caption tracks=${tracks.length} langs=[${tracks.map((t) => `${t.languageCode}${t.kind === "asr" ? "(asr)" : ""}`).join(", ")}]`
@@ -236,7 +236,7 @@ async function fetchTranscriptFromPlayer(data: any, logger: any, lang = "en") {
   }
 }
 
-function extractVideoId(url: string) {
+export function extractVideoId(url: string) {
   const regex =
     /(?:youtube\.com\/(?:[^\/]+\/.+\/|(?:v|e(?:mbed)?)\/|.*[?&]v=)|youtu\.be\/)([^"&?\/\s]{11})/i;
   const match = url.match(regex);
@@ -246,6 +246,10 @@ function extractVideoId(url: string) {
 export function handleYoutubeCrawl(router: Router, context: any) {
   router.post('/youtube/crawl', async (req, res) => {
     const logger = context.logger;
+    // Used by the admin lesson editor only
+    if (!(req as any).accountability?.admin) {
+      return res.status(403).json({ success: false, message: 'Admin only.' });
+    }
     try {
       const { url } = req.body;
       logger.info(`[youtube/crawl] Received URL: ${url}`);

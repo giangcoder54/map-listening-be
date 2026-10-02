@@ -17,6 +17,9 @@ import { Buffer } from 'node:buffer';
  * Không đụng tới bất kỳ route nào khác của Directus.
  */
 export const SEPAY_WEBHOOK_PATH = '/v1/sepay-webhook';
+// Polar ký kiểu Standard Webhooks, cũng trên đúng bytes của body — cùng lý do như trên.
+export const POLAR_WEBHOOK_PATH = '/v1/polar-webhook';
+const RAW_BODY_PATHS = [SEPAY_WEBHOOK_PATH, POLAR_WEBHOOK_PATH];
 
 function captureRawBody(req: any, _res: any, next: any) {
 	// Đã có ai đọc trước rồi thì thôi, tránh treo vì đọc luồng đã cạn.
@@ -49,8 +52,8 @@ export function registerSepayRawBody(registerEvents: any, context: any) {
 		// Gắn một lần duy nhất, ở sự kiện sớm nhất bắt được.
 		if (!app || app.__sepayRawBodyAttached) return;
 		app.__sepayRawBodyAttached = true;
-		app.use(SEPAY_WEBHOOK_PATH, captureRawBody);
-		logger?.info?.(`[SePay] Đã gắn middleware giữ raw body cho ${SEPAY_WEBHOOK_PATH}`);
+		for (const path of RAW_BODY_PATHS) app.use(path, captureRawBody);
+		logger?.info?.(`[Webhooks] Đã gắn middleware giữ raw body cho ${RAW_BODY_PATHS.join(', ')}`);
 	};
 
 	// Đăng ký ở cả hai mốc: mốc nào chạy trước thì gắn, mốc sau tự bỏ qua nhờ cờ.
