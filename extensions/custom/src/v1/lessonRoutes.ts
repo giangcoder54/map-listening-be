@@ -7,6 +7,7 @@
  *   GET  /listening-lab/lessons/:key           a lesson to play: steps + clips (:key = short_id or id)
  *   GET  /listening-lab/lessons/:key/next      what to do after this lesson
  *   POST /listening-lab/lessons/:key/progress  result card reached: save status / score
+ *   GET  /listening-lab/lessons/:key/attempts  this learner's answers per clip (to resume)
  *   POST /listening-lab/attempts               one Check / Show answer on a clip
  *   GET  /listening-lab/progress/clips         clip ids this learner answered right
  *   GET  /listening-lab/my-progress            profile page
@@ -336,6 +337,35 @@ export function registerLessonRoutes(router: any, context: any) {
 			return res.json({ success: true, data: { saved: true, status: row?.status } });
 		} catch (error) {
 			return fail(res, 'Save progress', error);
+		}
+	});
+
+	// What this learner did in the lesson, so the page resumes where they left it:
+	// { status: 'in_progress' | 'completed' | null, clips: [{ clip_id, tries, correct, revealed }] }
+	router.get('/listening-lab/lessons/:key/attempts', async (req: any, res: any) => {
+		const userId = req.accountability?.user ?? null;
+		const key = String(req.params.key || '');
+		if (badKey(key)) return res.status(400).json({ success: false, message: 'Invalid lesson key' });
+		if (!userId) return res.json({ success: true, data: { status: null, clips: [] } });
+		try {
+			const lesson = await database('listening_lessons').select('id').where(UUID_RE.test(key) ? { id: key } : { short_id: key }).first();
+			if (!lesson) return res.status(404).json({ success: false, message: 'Lesson not found' });
+			const [progress, clips] = await Promise.all([
+				database('listening_progress').select('status').where({ user_id: userId, lesson_id: lesson.id }).first(),
+				database('listening_attempts')
+					.select(
+						'clip_id',
+						database.raw(`COUNT(*) FILTER (WHERE answer <> '[REVEALED]')::int AS tries`),
+						database.raw('BOOL_OR(is_correct) AS correct'),
+						database.raw(`BOOL_OR(answer = '[REVEALED]') AS revealed`),
+					)
+					.where({ user_id: userId, lesson_id: lesson.id })
+					.whereNotNull('clip_id')
+					.groupBy('clip_id'),
+			]);
+			return res.json({ success: true, data: { status: progress?.status || null, clips } });
+		} catch (error) {
+			return fail(res, 'Load lesson attempts', error);
 		}
 	});
 

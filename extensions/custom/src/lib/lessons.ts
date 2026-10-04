@@ -98,6 +98,7 @@ export async function loadLessonGraph(req: any, context: any) {
 			SELECT c.lesson_id,
 				COUNT(*)::int AS total_clips,
 				COUNT(*) FILTER (WHERE c.step = 'type')::int AS type_clips,
+				ARRAY_AGG(DISTINCT c.step) AS steps,
 				(ARRAY_AGG(sv.thumbnail_url ORDER BY (c.step = 'type') DESC, c.sort NULLS LAST, c.id))[1] AS thumbnail
 			FROM listening_clips c
 			LEFT JOIN source_videos sv ON sv.id = c.source_video_id
@@ -129,9 +130,10 @@ export async function loadLessonGraph(req: any, context: any) {
 	const skillById = new Map(skills.map((s) => [s.id, s]));
 	const lessons: LessonRow[] = lessonRows.filter((l: any) => skillById.has(l.skill_id));
 
-	const clipStats = new Map<string, { total: number; type: number; thumbnail: string }>();
+	const clipStats = new Map<string, { total: number; type: number; thumbnail: string; steps: StepKey[] }>();
 	for (const row of clipRows?.rows || []) {
-		clipStats.set(row.lesson_id, { total: Number(row.total_clips) || 0, type: Number(row.type_clips) || 0, thumbnail: row.thumbnail || '' });
+		const steps = CLIP_STEPS.filter((s) => (row.steps || []).includes(s));
+		clipStats.set(row.lesson_id, { total: Number(row.total_clips) || 0, type: Number(row.type_clips) || 0, thumbnail: row.thumbnail || '', steps });
 	}
 	// A lesson without a step-1 clip cannot be played: it is not listed anywhere
 	const playable = lessons.filter((l) => (clipStats.get(l.id)?.type || 0) > 0);
@@ -149,6 +151,20 @@ export async function loadLessonGraph(req: any, context: any) {
 	if (userId) {
 		const rows = await database('listening_progress').select('lesson_id', 'status').where('user_id', userId);
 		for (const r of rows) (r.status === 'completed' ? done : started).add(r.lesson_id);
+	}
+	// Lessons being worked on: the furthest step answered in, shown as "Step 3 of 4"
+	const stepReached = new Map<string, number>();
+	if (userId && started.size) {
+		const rows = await database('listening_attempts')
+			.select('lesson_id', database.raw('ARRAY_AGG(DISTINCT step) AS steps'))
+			.where('user_id', userId)
+			.whereIn('lesson_id', [...started])
+			.groupBy('lesson_id');
+		for (const r of rows) {
+			const own = clipStats.get(r.lesson_id)?.steps || [];
+			const reached = Math.max(-1, ...(r.steps || []).map((s: StepKey) => own.indexOf(s)));
+			if (reached >= 0) stepReached.set(r.lesson_id, reached + 1);
+		}
 	}
 
 	const premium = userId ? await isPremiumUser(database, userId, logger) : false;
@@ -173,6 +189,10 @@ export async function loadLessonGraph(req: any, context: any) {
 			locked: isLocked(l),
 			done: done.has(l.id),
 			in_progress: started.has(l.id),
+			/** In progress: the step reached, e.g. { step: 3, steps: 4 } */
+			progress_step: started.has(l.id) && stepReached.has(l.id)
+				? { step: stepReached.get(l.id)!, steps: clipStats.get(l.id)?.steps.length || 0 }
+				: null,
 			total_clips: clipStats.get(l.id)?.total || 0,
 			learners_count: Number(l.learners_count) || 0,
 			date_created: l.date_created,
