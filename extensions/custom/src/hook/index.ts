@@ -5,6 +5,8 @@ import { registerSepayRawBody } from './sepayRawBody';
 import { downgradeExpiredPremium } from '../lib/premium';
 import { registerLessonStep1Check } from './lessonStep1Check';
 import { registerLessonTextCase } from './lessonTextCase';
+import { recordConversion, voidConversion } from '../lib/referrals';
+import { refreshGrowthConfig } from '../lib/growthConfig';
 
 export default defineHook((registerEvents, context) => {
 	const { filter, action } = registerEvents;
@@ -16,6 +18,12 @@ export default defineHook((registerEvents, context) => {
 
 	// Mỗi giờ: Premium hết hạn -> role Free User
 	registerEvents.schedule('15 * * * *', async () => { await downgradeExpiredPremium(context.database, context.logger); });
+
+	// Referral / affiliate numbers edited in Directus (growth_settings): no restart needed
+	refreshGrowthConfig(context.database, context.logger);
+	registerEvents.schedule('* * * * *', () => refreshGrowthConfig(context.database, context.logger));
+	action('growth_settings.items.create', () => refreshGrowthConfig(context.database, context.logger));
+	action('growth_settings.items.update', () => refreshGrowthConfig(context.database, context.logger));
 
 	// Register cronjob check transactions
 	// registerCronjob(registerEvents, context);
@@ -48,12 +56,19 @@ export default defineHook((registerEvents, context) => {
 								context.database,
 								context.logger
 							);
+							// Referred buyer: reward the inviter / commission for the affiliate
+							await recordConversion(id, context, hookContext.schema).catch((error: any) =>
+								context.logger?.error(`[referral] Conversion of order ${id} failed: ${String(error)}`));
 						}
 					}
 				}
 			} catch (error: any) {
 				context.logger?.error(`[Manual Update] Error processing premium activation: ${String(error)}`);
 			}
+		}
+		// Order refunded by hand (bank transfer): its commission no longer counts
+		if (meta.payload && meta.payload.status === 'refunded' && meta.keys?.length) {
+			await voidConversion(context.database, meta.keys.map(String)).catch(() => {});
 		}
 	});
 

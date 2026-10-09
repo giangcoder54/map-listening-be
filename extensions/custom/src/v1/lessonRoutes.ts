@@ -18,6 +18,7 @@
  */
 import { isPremiumUser } from '../lib/premium';
 import { CLIP_STEPS, UUID_RE, answerOf, loadLessonGraph, type LessonGraph, type LessonRow, type StepKey } from '../lib/lessons';
+import { scheduleReview } from './engagementRoutes';
 
 const ANON_ID_RE = /^[A-Za-z0-9-]{16,64}$/;
 const badKey = (key: string) => !key || key.length > 64;
@@ -387,7 +388,7 @@ export function registerLessonRoutes(router: any, context: any) {
 				.join('listening_lessons as l', 'l.id', 'c.lesson_id')
 				.join('listening_skills as s', 's.id', 'l.skill_id')
 				.join('listening_groups as g', 'g.id', 's.group_id')
-				.select('c.id', 'c.step', 'l.id as lesson_id', database.raw('(l.is_premium OR s.is_premium OR g.is_premium) AS premium_content'))
+				.select('c.id', 'c.step', 'c.source_video_id', 'c.practice_lesson_id', 'l.id as lesson_id', database.raw('(l.is_premium OR s.is_premium OR g.is_premium) AS premium_content'))
 				.where('c.id', body.clip_id)
 				.first();
 			if (!clip) return res.status(404).json({ success: false, message: 'Clip not found' });
@@ -415,6 +416,11 @@ export function registerLessonRoutes(router: any, context: any) {
 					INSERT INTO listening_progress (user_id, lesson_id, status) VALUES (?, ?, 'in_progress')
 					ON CONFLICT (user_id, lesson_id) DO UPDATE SET date_updated = now()
 				`, [userId, clip.lesson_id]);
+				// Missed (wrong or "show answer"): back in the review queue for tomorrow. Step-4 clips
+				// borrowed from another lesson have no video of their own: not reviewable.
+				if ((type === 'reveal' || body.is_correct !== true) && clip.source_video_id && !clip.practice_lesson_id) {
+					await scheduleReview(database, userId, clip.id, clip.lesson_id).catch((e: any) => logger?.warn?.(`[review] ${String(e)}`));
+				}
 			}
 
 			let counted = false;

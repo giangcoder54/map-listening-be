@@ -1,5 +1,7 @@
 import type { Router } from 'express'
 import { notifyAdmin } from '../lib/sepay'
+import { resolveCode } from '../lib/promotions'
+import { voidConversion } from '../lib/referrals'
 import {
   polarCycleForProduct,
   polarProductForCycle,
@@ -101,6 +103,9 @@ async function settlePolarOrder(order: any, context: any): Promise<string> {
     {
       status: 'published',
       amount: order.total_amount,
+      // Tax Polar collected for the buyer's country: no commission on it
+      vat_amount: Number(order.tax_amount) || 0,
+      price_subtotal: order.net_amount ?? null,
       date_transfer: new Date().toISOString(),
     },
   )
@@ -125,6 +130,9 @@ async function recordPolarRefund(order: any, context: any) {
       { filter: { transfer_code: { _in: keys }, payment_method: { _eq: 'polar' } } },
       { status: 'refunded' },
     )
+    // Its affiliate commission (if not paid out yet) no longer counts
+    const rows = await context.database('purchase_histories').whereIn('transfer_code', keys).where('payment_method', 'polar').select('id')
+    await voidConversion(context.database, rows.map((r: any) => r.id))
   }
 
   // Thu hồi Premium vẫn để admin làm tay: một user có thể còn đơn khác đang hiệu lực.
@@ -141,7 +149,7 @@ export function handlePolar(router: Router, context: any) {
     if (!userId)
       return res.status(401).json({ success: false, error: 'Unauthorized' })
 
-    const { plan_id, billing_cycle } = req.body || {}
+    const { plan_id, billing_cycle, promotion_code } = req.body || {}
     const cycle = Number(billing_cycle)
     const productId = Number.isFinite(cycle) ? polarProductForCycle(cycle) : null
     if (!productId)
@@ -166,6 +174,26 @@ export function handlePolar(router: Router, context: any) {
         .whereIn('code', [String(plan_id || 'premium'), 'premium'])
         .first('id', 'code')
 
+      // Code box (coupon or a friend's invite code, see resolveCode): on a card it needs
+      // its twin discount on Polar, else it only works with bank transfer
+      let discountId: string | undefined
+      let promotionId: string | null = null
+      let discountSource: string | null = null
+      let referrerId: string | null = null
+      let discountCode: string | null = null
+      if (typeof promotion_code === 'string' && promotion_code.trim()) {
+        const check = await resolveCode(database, promotion_code, userId)
+        if (!check.ok)
+          return res.status(400).json({ success: false, code: 'PROMOTION_INVALID', error: 'This code is not valid.' })
+        if (!check.polarDiscountId)
+          return res.status(400).json({ success: false, code: 'PROMOTION_BANK_ONLY', error: 'This code only works with bank transfer.' })
+        discountId = check.polarDiscountId
+        promotionId = check.promo?.id || null
+        discountSource = check.kind
+        referrerId = check.referrerId
+        discountCode = promotion_code.trim().toLowerCase()
+      }
+
       const site = polarSiteUrl()
       const checkout = await polarRequest('/v1/checkouts/', {
         method: 'POST',
@@ -176,6 +204,7 @@ export function handlePolar(router: Router, context: any) {
           success_url: `${site}/checkout/success?checkout_id={CHECKOUT_ID}`,
           return_url: `${site}/pricing`,
           metadata: { user_id: userId, plan_code: plan?.code || 'premium', billing_cycle: String(cycle) },
+          ...(discountId ? { discount_id: discountId } : {}),
         },
       })
 
@@ -191,6 +220,10 @@ export function handlePolar(router: Router, context: any) {
         payment_method: 'polar',
         transfer_code: checkout.id,
         expire_time: checkout.expires_at || null,
+        promotion_id: promotionId,
+        discount_source: discountSource,
+        referrer_id: referrerId,
+        discount_code: discountCode,
         type: plan?.code || 'premium',
         auto_renew: cycle !== LIFETIME,
       })

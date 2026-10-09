@@ -7,6 +7,12 @@ import { handleVideoTranscripts } from './videoTranscripts';
 import { ensurePaymentSchema } from '../lib/paymentSchema';
 import { registerLessonRoutes } from './lessonRoutes';
 import { ensurePhraseRequestsTable, handlePhraseRequest } from '../lib/phraseRequests';
+import { registerGrowthRoutes } from './growthRoutes';
+import { registerEngagementRoutes } from './engagementRoutes';
+import { registerPlacementRoutes } from './placementRoutes';
+import { registerBlogRoutes } from './blogRoutes';
+import { registerOpsRoutes } from './opsRoutes';
+import { registerAdminGrowthRoutes } from './adminGrowthRoutes';
 
 
 export default defineEndpoint((router, context) => {
@@ -236,6 +242,15 @@ export default defineEndpoint((router, context) => {
 
 	// Listening Lab: groups > skills > lessons (see ./lessonRoutes.ts)
 	registerLessonRoutes(router, context);
+
+	// Growth: referral / affiliate / coupons, XP + review, placement test,
+	// blog, ops (health, error reports, contact) and their admin. See docs/growth-roadmap.md (web repo).
+	registerGrowthRoutes(router, context);
+	registerEngagementRoutes(router, context);
+	registerPlacementRoutes(router, context);
+	registerBlogRoutes(router, context);
+	registerOpsRoutes(router, context);
+	registerAdminGrowthRoutes(router, context);
 
 	// =====================================================================
 	// POST /phrase-requests -> gợi ý cụm từ muốn có bài luyện (phải đăng nhập, không lưu ai gửi)
