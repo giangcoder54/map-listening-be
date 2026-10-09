@@ -1,9 +1,9 @@
 import { Router } from 'express';
-import Decimal from 'decimal.js';
 import { newPaymentCode } from './paymentCode';
 import { getReceivingAccount } from '../lib/sepayBankAccount';
 import { addVat, breakdownFromPreTax } from '../lib/vat';
 import { calculateEndDate, activatePremiumForUser, purchaseCycle } from '../utils';
+import { applyCode, applyPromotion, publicCode, resolveCode, type ResolvedCode } from '../lib/promotions';
 
 export function handleCheckout(router: Router, context: any) {
   router.post('/checkout', async (req: any, res: any) => {
@@ -98,31 +98,39 @@ export function handleCheckout(router: Router, context: any) {
       let priceOriginal = totalPrice;
       let pricePaid = totalPrice;
       let promotionData: any = null;
+      let resolved: Extract<ResolvedCode, { ok: true }> | null = null;
 
-      // Áp khuyến mãi nếu có — KHÔNG bắt buộc, hoàn toàn bỏ qua nếu FE không gửi
-      // `promotion`. Chưa có UI nhập mã khuyến mãi ở /pricing thì nhánh này chỉ nằm
-      // sẵn, không ảnh hưởng gì tới luồng hiện tại.
-      if (promotion_id) {
+      // Ô mã ở checkout (không bắt buộc): coupon HOẶC mã mời của bạn bè (lib/promotions.ts
+      // resolveCode). Client cũ gửi `promotion` (id). Mã sai/hết hạn -> 400 để khách biết.
+      const promoCode = typeof req.body.promotion_code === 'string' ? req.body.promotion_code.trim() : '';
+      if (promoCode) {
+        const check = await resolveCode(database, promoCode, userId);
+        if (!check.ok) {
+          // Same answer whatever the reason (expired, used up, own code...)
+          return res.status(400).json({ success: false, code: 'PROMOTION_INVALID', error: 'This code is not valid.' });
+        }
+        resolved = check;
+        promotionData = check.promo;
+      } else if (promotion_id) {
         try {
           const promotionsService = new ItemsService('promotions', {
             schema,
             accountability: { admin: true },
           });
           const promo = await promotionsService.readOne(promotion_id, { fields: ['*'] });
-          if (promo && promo.status === 'published') {
-            promotionData = promo;
-            if (promo.type === 'Percent') {
-              pricePaid = new Decimal(totalPrice)
-                .mul(new Decimal(1).minus(new Decimal(promo.value).div(100)))
-                .toNumber();
-            } else if (promo.type === 'Fixed') {
-              pricePaid = Decimal.max(new Decimal(0), new Decimal(totalPrice).minus(new Decimal(promo.value))).toNumber();
-            }
-          }
+          if (promo && promo.status === 'published') promotionData = promo;
         } catch (e: any) {
           logger.warn(`Promotion not found or invalid: ${promotion_id}`);
         }
       }
+
+      if (resolved) pricePaid = applyCode(totalPrice, resolved);
+      else if (promotionData) pricePaid = applyPromotion(totalPrice, promotionData);
+      const discountSource: 'promotion' | 'referral' | null = resolved ? resolved.kind : promotionData ? 'promotion' : null;
+      // Chủ của mã (bạn bè mời, hoặc affiliate của coupon): thành người giới thiệu khi đơn được trả
+      const referrerId = resolved?.referrerId || promotionData?.affiliate_user_id || null;
+      // Mã khách đã gõ (có thể là mã cũ của người mời), để đối chiếu về sau
+      const discountCode = resolved ? promoCode.toLowerCase() : promotionData?.code?.toLowerCase() || null;
 
       // Cộng VAT sau khuyến mãi, trước khi tạo đơn và sinh QR — price_original và
       // price_paid cùng đơn vị (đã gồm thuế) nên phần trăm/tiền giảm hiển thị không
@@ -143,7 +151,12 @@ export function handleCheckout(router: Router, context: any) {
           plan_id: dbPlan.id,
           billing_cycle: Number(billing_cycle),
           promotion_id: promotionData?.id || null,
-          amount: Math.round(totalPrice),
+          discount_source: discountSource,
+          referrer_id: referrerId,
+          discount_code: discountCode,
+          // Đơn 0đ: amount = số tiền thật trả (0), để không bị tính là đơn trả tiền
+          // (hoa hồng affiliate, "đơn đầu tiên" của mã giảm giá...)
+          amount: 0,
           price_original: Math.round(priceOriginal),
           price_paid: 0,
           price_subtotal: 0,
@@ -210,6 +223,9 @@ export function handleCheckout(router: Router, context: any) {
         plan_id: dbPlan.id,
         billing_cycle: Number(billing_cycle),
         promotion_id: promotionData?.id || null,
+        discount_source: discountSource,
+        referrer_id: referrerId,
+        discount_code: discountCode,
         amount: Math.round(pricePaid),
         price_original: Math.round(priceOriginal),
         price_subtotal: Math.round(paidBreakdown.subtotal),
@@ -235,6 +251,8 @@ export function handleCheckout(router: Router, context: any) {
         product_id: targetPlanId,
         billing_cycle,
         promotion_applied: promotionData ? promotionData.title : null,
+        discount: resolved ? publicCode(resolved) : null,
+        price_original: priceOriginal,
         price_paid: pricePaid,
         price_subtotal: paidBreakdown.subtotal,
         vat_rate: paidBreakdown.vatRate,
