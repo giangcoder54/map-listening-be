@@ -5,6 +5,7 @@ import { registerSepayRawBody } from './sepayRawBody';
 import { downgradeExpiredPremium } from '../lib/premium';
 import { registerLessonStep1Check } from './lessonStep1Check';
 import { registerLessonTextCase } from './lessonTextCase';
+import { registerEditorScope } from './editorScope';
 import { recordConversion, voidConversion } from '../lib/referrals';
 import { refreshGrowthConfig } from '../lib/growthConfig';
 
@@ -75,10 +76,20 @@ export default defineHook((registerEvents, context) => {
 	// A published lesson must keep a Step 1 clip, else the site hides it
 	registerLessonStep1Check(registerEvents);
 	registerLessonTextCase(registerEvents);
+	// Content editors: own lessons only, never the premium status (see the migration too)
+	registerEditorScope(registerEvents);
 
-	// New lesson: short_id (URL), a unique slug from its text, and last place in its skill
+	// The author of a lesson never changes (editors' numbers on /admin/lessons count on it)
+	filter('listening_lessons.items.update', (payload: any) => {
+		if (payload && typeof payload === 'object') delete payload.user_created;
+		return payload;
+	});
+
+	// New lesson: short_id (URL), a unique slug from its text, last place in its skill, and
+	// who made it (the signed-in account, whatever the request says)
 	filter('listening_lessons.items.create', async (payload: any, _meta, hookContext) => {
 		const db = hookContext.database;
+		payload.user_created = hookContext.accountability?.user ?? null;
 		if (!payload.short_id) {
 			const { nanoid } = await import('nanoid');
 			payload.short_id = nanoid(8);
