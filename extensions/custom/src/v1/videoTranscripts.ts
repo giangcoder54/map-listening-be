@@ -12,12 +12,13 @@
  */
 import type { Router } from 'express';
 import { extractVideoId, fetchPlayer, fetchTranscriptFromPlayer, getVideoMeta } from './youtube';
+import { isStaff } from '../lib/staff';
 
 type Line = { text: string; start: number; end: number };
 
 const adminOnly = (req: any, res: any) => {
-	if (req.accountability?.admin) return false;
-	res.status(403).json({ success: false, message: 'Admin only.' });
+	if (isStaff(req.accountability)) return false;
+	res.status(403).json({ success: false, message: 'Admins and editors only.' });
 	return true;
 };
 

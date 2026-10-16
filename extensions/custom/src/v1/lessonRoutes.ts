@@ -6,7 +6,7 @@
  *   GET  /listening-lab/skills/:slug           one skill and its lessons, in order
  *   GET  /listening-lab/lessons/:key           a lesson to play: steps + clips (:key = short_id or id)
  *   GET  /listening-lab/lessons/:key/next      what to do after this lesson
- *   POST /listening-lab/lessons/:key/progress  result card reached: save status / score
+ *   POST /listening-lab/lessons/:key/progress  result card reached: save status / score, XP won
  *   GET  /listening-lab/lessons/:key/attempts  this learner's answers per clip (to resume)
  *   POST /listening-lab/attempts               one Check / Show answer on a clip
  *   GET  /listening-lab/progress/clips         clip ids this learner answered right
@@ -18,7 +18,7 @@
  */
 import { isPremiumUser } from '../lib/premium';
 import { CLIP_STEPS, UUID_RE, answerOf, loadLessonGraph, type LessonGraph, type LessonRow, type StepKey } from '../lib/lessons';
-import { scheduleReview } from './engagementRoutes';
+import { TZ, XP, scheduleReview } from './engagementRoutes';
 
 const ANON_ID_RE = /^[A-Za-z0-9-]{16,64}$/;
 const badKey = (key: string) => !key || key.length > 64;
@@ -31,7 +31,14 @@ async function readClips(database: any, lessonIds: string[]) {
 		.select(
 			'c.id', 'c.lesson_id', 'c.step', 'c.sort', 'c.challenge_mode', 'c.answer', 'c.transcript', 'c.start_time', 'c.end_time',
 			'c.practice_lesson_id', 'c.explanation_en', 'c.explanation_vi', 'c.playback_rate',
+			'c.explanation_image', 'c.explanation_video', 'c.answer_format', 'c.choices',
 			'sv.id as video_id', 'sv.youtube_video_id', 'sv.title as video_title', 'sv.channel_name', 'sv.thumbnail_url',
+			'c.cues',
+			// Clips saved before cues: the lines of the video's transcript (ms) said in the segment
+			database.raw(`CASE WHEN c.cues IS NULL AND jsonb_typeof(sv.transcript) = 'array' AND c.start_time IS NOT NULL AND c.end_time IS NOT NULL
+				THEN jsonb_path_query_array(sv.transcript, ?::jsonpath,
+					jsonb_build_object('s', c.start_time::numeric * 1000 + 50, 'e', c.end_time::numeric * 1000 - 50)) END AS source_lines`,
+			['$[*] ? (@.end > $s && @.start < $e)']),
 		)
 		.whereIn('c.lesson_id', lessonIds)
 		.whereNotNull('c.step')
@@ -47,7 +54,7 @@ async function withPracticeLessons(database: any, g: LessonGraph, rows: any[]) {
 	const ids = [...new Set(rows.filter((r) => r.step === 'more' && r.practice_lesson_id).map((r) => r.practice_lesson_id as string))];
 	if (!ids.length) return rows;
 	const firstClip = new Map<string, any>();
-	const [clipRows, trs] = await Promise.all([readClips(database, ids), lessonTranslations(database, ids)]);
+	const [clipRows, trs, media] = await Promise.all([readClips(database, ids), lessonTranslations(database, ids), lessonMedia(database, ids)]);
 	for (const row of clipRows) {
 		if (row.step === 'type' && !firstClip.has(row.lesson_id)) firstClip.set(row.lesson_id, row);
 	}
@@ -64,11 +71,19 @@ async function withPracticeLessons(database: any, g: LessonGraph, rows: any[]) {
 			explanation_en: r.explanation_en, explanation_vi: r.explanation_vi,
 			playback_rate: r.playback_rate ?? src.playback_rate,
 			practice_translations: trs.get(r.practice_lesson_id) || [],
+			// Its own image / video, else those of the lesson it comes from
+			explanation_image: r.explanation_image, explanation_video: r.explanation_video,
+			practice_media: mediaOf(src) || media.get(r.practice_lesson_id) || null,
+			answer_format: r.answer_format, choices: r.choices,
 		}];
 	});
 }
 
-function clipOut(row: any, lessonText: string, mode: ReturnType<LessonGraph['groupOf']>['answer_mode'], open: boolean) {
+/**
+ * @param pool phrases the wrong choices are picked from when the admin set none (other
+ *             lessons of the skill, other answers of the lesson)
+ */
+function clipOut(row: any, lessonText: string, mode: ReturnType<LessonGraph['groupOf']>['answer_mode'], open: boolean, pool: string[] = []) {
 	const video = {
 		id: row.video_id,
 		youtube_video_id: row.youtube_video_id,
@@ -77,15 +92,127 @@ function clipOut(row: any, lessonText: string, mode: ReturnType<LessonGraph['gro
 		thumbnail_url: row.thumbnail_url,
 	};
 	const base = { id: row.id, lesson_id: row.lesson_id, step: row.step as StepKey, sort: row.sort, mode: row.challenge_mode || null, rate: Number(row.playback_rate) || null, video };
-	if (!open) return { ...base, answer: null, transcript: null, start_time: null, end_time: null };
+	if (!open) return { ...base, answer: null, transcript: null, start_time: null, end_time: null, cues: null, lines: null, format: 'type', choices: null, media: null };
+	const cues = cuesOf(row.cues);
+	const answer = answerOf(row, lessonText, mode);
+	const choices = row.answer_format === 'choice' && answer ? choicesOf(row, answer, pool) : null;
 	return {
 		...base,
-		answer: answerOf(row, lessonText, mode),
+		answer,
+		// 'choice': pick the answer among `choices` instead of typing it
+		format: choices ? 'choice' : 'type',
+		choices,
+		// Image / video of its explanation; null = the lesson's (steps 1-3)
+		media: mediaOf(row) || row.practice_media || null,
 		transcript: row.transcript,
 		start_time: row.start_time,
 		end_time: row.end_time,
+		// Subtitle lines; else (older clips) the video's lines, which the page lays the transcript on
+		cues,
+		lines: cues ? null : sourceLines(row.source_lines),
 		translations: clipTranslations(row),
 	};
+}
+
+const normPhrase = (s: string) => s.toLowerCase().replace(/[^a-z0-9' ]+/g, ' ').replace(/\s+/g, ' ').trim();
+
+/** Same order on every load of a clip (resuming must not reshuffle its choices) */
+function seededShuffle<T>(list: T[], seed: string): T[] {
+	let h = 2166136261;
+	for (let i = 0; i < seed.length; i++) h = Math.imul(h ^ seed.charCodeAt(i), 16777619);
+	const next = () => {
+		h = Math.imul(h ^ (h >>> 15), 2246822507);
+		h = Math.imul(h ^ (h >>> 13), 3266489909);
+		return ((h ^= h >>> 16) >>> 0) / 4294967296;
+	};
+	const out = [...list];
+	for (let i = out.length - 1; i > 0; i--) {
+		const j = Math.floor(next() * (i + 1));
+		[out[i], out[j]] = [out[j]!, out[i]!];
+	}
+	return out;
+}
+
+/**
+ * Choices of a "pick the answer" clip: the answer and the wrong ones set by the admin, else 3
+ * phrases of the pool. Null when there is nothing to put next to the answer.
+ */
+function choicesOf(row: any, answer: string, pool: string[]): string[] | null {
+	const list = typeof row.choices === 'string' ? safeJson(row.choices) : row.choices;
+	const key = normPhrase(answer);
+	const seen = new Set([key]);
+	const pick = (items: unknown[], max: number) => {
+		const out: string[] = [];
+		for (const item of items) {
+			const text = String(item ?? '').replace(/\s+/g, ' ').trim();
+			const k = normPhrase(text);
+			if (!text || !k || seen.has(k)) continue;
+			seen.add(k);
+			out.push(text);
+			if (out.length >= max) break;
+		}
+		return out;
+	};
+	let wrong = Array.isArray(list) ? pick(list, 5) : [];
+	if (!wrong.length) wrong = pick(seededShuffle(pool, String(row.id)), 3);
+	if (!wrong.length) return null;
+	return seededShuffle([answer, ...wrong], `${row.id}:choices`);
+}
+
+/** YouTube video id and start (s) of a link: watch?v=, youtu.be/, embed/, shorts/; ?t=1m30s / &start=90 */
+function youtubeOf(url: unknown): { id: string; start: number } | null {
+	const text = String(url ?? '').trim();
+	const id = text.match(/(?:youtube\.com\/(?:watch\?(?:.*&)?v=|embed\/|shorts\/|live\/)|youtu\.be\/)([\w-]{11})/i)?.[1]
+		|| (/^[\w-]{11}$/.test(text) ? text : null);
+	if (!id) return null;
+	const t = text.match(/[?&#](?:t|start)=([0-9hms]+)/i)?.[1] || '';
+	let start = 0;
+	if (/^\d+$/.test(t)) start = Number(t);
+	else for (const [, n, unit] of t.matchAll(/(\d+)([hms])/g)) start += Number(n) * ({ h: 3600, m: 60, s: 1 } as any)[unit!];
+	return { id, start };
+}
+
+/** Image (file id) and YouTube video of an explanation; null when it has neither */
+function mediaOf(row: any): { image: string | null; video: { id: string; start: number } | null } | null {
+	// An uploaded file (its id) or an https:// link
+	const raw = String(row?.explanation_image ?? '').trim();
+	const image = UUID_RE.test(raw) || /^https:\/\/\S+$/i.test(raw) ? raw : null;
+	const video = youtubeOf(row?.explanation_video);
+	return image || video ? { image, video } : null;
+}
+
+async function lessonMedia(database: any, lessonIds: string[]) {
+	const map = new Map<string, ReturnType<typeof mediaOf>>();
+	if (!lessonIds.length) return map;
+	const rows = await database('listening_lessons').select('id', 'explanation_image', 'explanation_video').whereIn('id', lessonIds);
+	for (const r of rows) {
+		const m = mediaOf(r);
+		if (m) map.set(r.id, m);
+	}
+	return map;
+}
+
+/** Saved subtitle lines [{ start (s), text }]; null when there are fewer than two */
+function cuesOf(value: unknown): { start: number; text: string }[] | null {
+	const list = typeof value === 'string' ? safeJson(value) : value;
+	if (!Array.isArray(list)) return null;
+	const cues = list
+		.map((c: any) => ({ start: Number(c?.start), text: String(c?.text ?? '').trim() }))
+		.filter((c) => Number.isFinite(c.start) && c.text);
+	return cues.length > 1 ? cues : null;
+}
+
+/** Lines of the video's transcript in the segment, in seconds */
+function sourceLines(value: unknown): { start: number; text: string }[] | null {
+	const list = typeof value === 'string' ? safeJson(value) : value;
+	if (!Array.isArray(list) || list.length < 2) return null;
+	return list
+		.map((l: any) => ({ start: Math.round(Number(l?.start) / 100) / 10, text: String(l?.text ?? '').trim() }))
+		.filter((l) => Number.isFinite(l.start) && l.text);
+}
+
+function safeJson(text: string) {
+	try { return JSON.parse(text); } catch { return null; }
 }
 
 /**
@@ -216,15 +343,19 @@ export function registerLessonRoutes(router: any, context: any) {
 			const skill = g.skillOf(lesson);
 			const group = g.groupOf(lesson);
 			const open = !g.isLocked(lesson);
-			const [own, trs] = await Promise.all([readClips(database, [lesson.id]), lessonTranslations(database, [lesson.id])]);
+			const [own, trs, media] = await Promise.all([readClips(database, [lesson.id]), lessonTranslations(database, [lesson.id]), lessonMedia(database, [lesson.id])]);
 			const rows = await withPracticeLessons(database, g, own);
-			const clips = rows.map((r: any) => clipOut(r, lesson.text, group.answer_mode, open));
+			// Wrong choices: the other answers of the lesson (per-clip groups), then the other lessons of the skill
+			const others = (g.lessonsBySkill.get(skill.id) || []).filter((l) => l.id !== lesson.id).map((l) => l.text);
+			const answers = group.answer_mode === 'per_clip' ? rows.map((r: any) => answerOf(r, lesson.text, group.answer_mode)) : [];
+			const pool = [...answers, ...others].filter(Boolean) as string[];
+			const clips = rows.map((r: any) => clipOut(r, lesson.text, group.answer_mode, open, r.step === 'more' ? others : pool));
 
 			const steps: { key: StepKey; mode?: string; count?: number }[] = [];
 			for (const key of CLIP_STEPS) {
 				const own = clips.filter((c: any) => c.step === key);
 				if (!own.length) continue;
-				steps.push(key === 'challenge' ? { key, mode: own[0].mode || 'speed' } : { key });
+				steps.push(key === 'challenge' ? { key, mode: own[0]!.mode || 'speed' } : { key });
 			}
 
 			return res.json({
@@ -236,6 +367,7 @@ export function registerLessonRoutes(router: any, context: any) {
 						...g.lessonCard(lesson),
 						text: open ? lesson.text : null,
 						translations: open ? trs.get(lesson.id) || [] : [],
+						media: open ? media.get(lesson.id) || null : null,
 					},
 					skill: { id: skill.id, name: skill.name, slug: skill.slug, category: skill.category },
 					group: { id: group.id, name: group.name, slug: group.slug, answer_mode: group.answer_mode },
@@ -322,6 +454,9 @@ export function registerLessonRoutes(router: any, context: any) {
 			const completed = body.completed === true;
 			const score = Number.isFinite(body.score) ? Math.max(0, Math.min(100, Math.round(body.score))) : null;
 			const stepResults = body.step_results && typeof body.step_results === 'object' ? JSON.stringify(body.step_results).slice(0, 4000) : null;
+			// When the learner opened the lesson: clips right since then count as XP won here
+			const startedMs = Date.parse(String(body.started_at || ''));
+			const startedAt = Number.isFinite(startedMs) ? new Date(Math.min(Date.now(), Math.max(startedMs, Date.now() - 6 * 3600_000))) : new Date();
 
 			const row = (await database.raw(`
 				INSERT INTO listening_progress (user_id, lesson_id, status, step_results, score, completed_at, date_updated)
@@ -332,10 +467,25 @@ export function registerLessonRoutes(router: any, context: any) {
 					score = COALESCE(EXCLUDED.score, listening_progress.score),
 					completed_at = COALESCE(listening_progress.completed_at, EXCLUDED.completed_at),
 					date_updated = now()
-				RETURNING status
+				RETURNING status, completed_at = now() AS first_completion
 			`, [userId, lesson.id, completed ? 'completed' : 'in_progress', stepResults, score, completed])).rows?.[0];
 
-			return res.json({ success: true, data: { saved: true, status: row?.status } });
+			// XP won in this go (same rules as engagementRoutes' xpQuery): a clip of the lesson
+			// answered right for the first time today, since the lesson was opened; the lesson
+			// bonus the first time it is finished.
+			const clipsWon = Number((await database.raw(`
+				SELECT COUNT(*)::int AS n FROM (
+					SELECT clip_id, MIN(date_created) AS first_right
+					FROM listening_attempts
+					WHERE user_id = ? AND lesson_id = ? AND is_correct AND source IS DISTINCT FROM 'review'
+						AND date_created >= date_trunc('day', now() AT TIME ZONE '${TZ}') AT TIME ZONE '${TZ}'
+					GROUP BY clip_id
+				) x WHERE first_right >= ?
+			`, [userId, lesson.id, startedAt])).rows?.[0]?.n) || 0;
+			const xp = { clips: clipsWon * XP.clip, lesson: row?.first_completion ? XP.lesson : 0, total: 0 };
+			xp.total = xp.clips + xp.lesson;
+
+			return res.json({ success: true, data: { saved: true, status: row?.status, xp } });
 		} catch (error) {
 			return fail(res, 'Save progress', error);
 		}

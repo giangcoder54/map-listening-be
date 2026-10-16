@@ -13,6 +13,10 @@ import { registerPlacementRoutes } from './placementRoutes';
 import { registerBlogRoutes } from './blogRoutes';
 import { registerOpsRoutes } from './opsRoutes';
 import { registerAdminGrowthRoutes } from './adminGrowthRoutes';
+import { registerAdminDashboardRoutes } from './adminDashboardRoutes';
+import { registerFeedbackRoutes } from './feedbackRoutes';
+import { registerAdminLessonRoutes } from './adminLessonRoutes';
+import { staffRole } from '../lib/staff';
 
 
 export default defineEndpoint((router, context) => {
@@ -57,8 +61,11 @@ export default defineEndpoint((router, context) => {
 	handleCheckout(router, context);
 	handleSepayWebhook(router, context);
 	handlePolar(router, context);
-	// Admin pages of the site: is the signed-in user a Directus admin?
-	router.get('/admin/me', (req: any, res: any) => res.json({ success: true, data: { admin: !!req.accountability?.admin } }));
+	// Admin pages of the site: is the signed-in user an admin, a content editor (lib/staff.ts) or neither?
+	router.get('/admin/me', (req: any, res: any) => {
+		const role = staffRole(req.accountability);
+		res.json({ success: true, data: { admin: role === 'admin', role } });
+	});
 
 	handleYoutubeCrawl(router, context);
 	handleVideoTranscripts(router, context);
@@ -251,6 +258,9 @@ export default defineEndpoint((router, context) => {
 	registerBlogRoutes(router, context);
 	registerOpsRoutes(router, context);
 	registerAdminGrowthRoutes(router, context);
+	registerAdminDashboardRoutes(router, context);
+	registerFeedbackRoutes(router, context);
+	registerAdminLessonRoutes(router, context);
 
 	// =====================================================================
 	// POST /phrase-requests -> gợi ý cụm từ muốn có bài luyện (phải đăng nhập, không lưu ai gửi)

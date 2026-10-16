@@ -1,5 +1,6 @@
 import type { Router } from 'express';
 import { ProxyAgent } from 'undici';
+import { isStaff } from '../lib/staff';
 
 const INNERTUBE_API_KEY = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
 const INNERTUBE_PLAYER_URL = `https://www.youtube.com/youtubei/v1/player?key=${INNERTUBE_API_KEY}&prettyPrint=false`;
@@ -246,9 +247,9 @@ export function extractVideoId(url: string) {
 export function handleYoutubeCrawl(router: Router, context: any) {
   router.post('/youtube/crawl', async (req, res) => {
     const logger = context.logger;
-    // Used by the admin lesson editor only
-    if (!(req as any).accountability?.admin) {
-      return res.status(403).json({ success: false, message: 'Admin only.' });
+    // Used by the admin lesson editor only (admins and content editors)
+    if (!isStaff((req as any).accountability)) {
+      return res.status(403).json({ success: false, message: 'Admins and editors only.' });
     }
     try {
       const { url } = req.body;

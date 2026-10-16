@@ -49,8 +49,15 @@ export async function activatePremiumForUser(
         const premiumRole = await database('directus_roles')
           .whereRaw("trim(name) = 'Premium User'")
           .first();
+        // Only learners move to Premium User: an admin or a content editor keeps their role
+        // (is_premium above is what unlocks the lessons)
+        const current = await database('directus_users as u')
+          .leftJoin('directus_roles as r', 'r.id', 'u.role')
+          .where('u.id', customerId)
+          .first('r.name as role_name');
+        const learner = !current?.role_name || ['Free User', 'Premium User'].includes(String(current.role_name).trim());
 
-        if (premiumRole && premiumRole.id) {
+        if (premiumRole && premiumRole.id && learner) {
           roleUpdateParams.role = premiumRole.id;
         }
       } catch (err: any) {
