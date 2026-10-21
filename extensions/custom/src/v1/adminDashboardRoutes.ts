@@ -7,6 +7,8 @@
  *                             every lesson used in the period, most used / hardest first
  *                             (the page paginates them)
  *   PUT /admin/goals       { month, targets: { <metric>: number | null } }  null = no goal
+ *   POST   /admin/releases      { day: YYYY-MM-DD, title }  a change shipped, marked on the charts
+ *   DELETE /admin/releases/:id
  *   GET /admin/my-progress ?month=  the caller's lessons vs the team goal; admins and
  *                          content editors (admins also get every author's numbers)
  *
@@ -15,6 +17,17 @@
  *   WAU / MAU       active learners in the 7 / 30 days up to that day
  *   lesson start    first time a learner (account or anonymous) opens a lesson
  *   accuracy        share of first tries (attempt_number = 1) that were right
+ *
+ * North Star: weekly learners = accounts that reached the result card of at least one lesson
+ * that week (listening_progress completed, updated that week, or a `result` event).
+ *
+ * Team and test accounts (directus_users.is_internal, 2026-10-21_analytics.sql) are left out
+ * of every number.
+ *
+ * Visitor journey, steps and coming back (2026-10-21_analytics.sql): `journey` and the event
+ * columns of `steps` come from learning_events (guests included, only since it was deployed:
+ * `events_since`); the answer columns of `steps` and `retention` also use listening_attempts,
+ * so they have the past too.
  *
  * Sign-up dates: accounts made before 2026-10-09 got a date estimated from their first
  * activity (database/migrations/2026-10-15_admin_dashboard.sql). `estimated_signups` counts
@@ -27,6 +40,8 @@ const PERIODS = [7, 30, 90];
 export const GOAL_METRICS = ['lessons_published', 'new_users', 'paid_orders', 'revenue_vnd', 'learning_dau'] as const;
 type GoalMetric = (typeof GOAL_METRICS)[number];
 const MONTH_RE = /^\d{4}-(0[1-9]|1[0-2])$/;
+/** SQL: the row's user (column `col`, may be NULL for a guest) is not a team or test account */
+const real = (col: string) => `NOT EXISTS (SELECT 1 FROM directus_users iu WHERE iu.id = ${col} AND iu.is_internal)`;
 
 /** 'YYYY-MM-DD' of `date` in Vietnam */
 const vnDay = (date: Date) => new Intl.DateTimeFormat('en-CA', { timeZone: TZ }).format(date);
@@ -63,14 +78,14 @@ export function registerAdminDashboardRoutes(router: any, context: any) {
 			FROM generate_series(?::date, ?::date, interval '1 day') AS d
 		)
 		SELECT to_char(day, 'YYYY-MM-DD') AS day,
-			(SELECT count(*) FROM directus_users WHERE status = 'active' AND gl_created_at >= t0 AND gl_created_at < t1)::int AS new_users,
-			(SELECT count(*) FROM directus_users WHERE status = 'active' AND gl_created_at < t1)::int AS total_users,
-			(SELECT count(DISTINCT user_id) FROM listening_attempts WHERE date_created >= t0 AND date_created < t1)::int AS dau,
-			(SELECT count(DISTINCT user_id) FROM listening_attempts WHERE date_created >= t1 - interval '7 days' AND date_created < t1)::int AS wau,
-			(SELECT count(DISTINCT user_id) FROM listening_attempts WHERE date_created >= t1 - interval '30 days' AND date_created < t1)::int AS mau,
-			(SELECT count(*) FROM listening_attempts WHERE date_created >= t0 AND date_created < t1)::int AS attempts,
-			(SELECT count(*) FROM listening_lesson_learners WHERE date_created >= t0 AND date_created < t1)::int AS lesson_starts,
-			(SELECT count(*) FROM listening_progress WHERE status = 'completed' AND completed_at >= t0 AND completed_at < t1)::int AS completions,
+			(SELECT count(*) FROM directus_users WHERE status = 'active' AND NOT is_internal AND gl_created_at >= t0 AND gl_created_at < t1)::int AS new_users,
+			(SELECT count(*) FROM directus_users WHERE status = 'active' AND NOT is_internal AND gl_created_at < t1)::int AS total_users,
+			(SELECT count(DISTINCT user_id) FROM listening_attempts WHERE date_created >= t0 AND date_created < t1 AND ${real('user_id')})::int AS dau,
+			(SELECT count(DISTINCT user_id) FROM listening_attempts WHERE date_created >= t1 - interval '7 days' AND date_created < t1 AND ${real('user_id')})::int AS wau,
+			(SELECT count(DISTINCT user_id) FROM listening_attempts WHERE date_created >= t1 - interval '30 days' AND date_created < t1 AND ${real('user_id')})::int AS mau,
+			(SELECT count(*) FROM listening_attempts WHERE date_created >= t0 AND date_created < t1 AND ${real('user_id')})::int AS attempts,
+			(SELECT count(*) FROM listening_lesson_learners WHERE date_created >= t0 AND date_created < t1 AND ${real('user_id')})::int AS lesson_starts,
+			(SELECT count(*) FROM listening_progress WHERE status = 'completed' AND completed_at >= t0 AND completed_at < t1 AND ${real('user_id')})::int AS completions,
 			(SELECT count(*) FROM listening_lessons WHERE status = 'published' AND published_at >= t0 AND published_at < t1)::int AS lessons_published
 		FROM days ORDER BY day
 	`, [from, to])).rows;
@@ -80,7 +95,7 @@ export function registerAdminDashboardRoutes(router: any, context: any) {
 		const rows = (await database.raw(`
 			SELECT lower(currency) AS currency, count(*)::int AS orders, sum(amount)::bigint AS amount
 			FROM purchase_histories
-			WHERE status = 'published' AND amount > 0
+			WHERE status = 'published' AND amount > 0 AND ${real('"user"')}
 				AND coalesce(date_transfer, date_created) >= (?::date::timestamp AT TIME ZONE '${TZ}')
 				AND coalesce(date_transfer, date_created) < ((?::date + 1)::timestamp AT TIME ZONE '${TZ}')
 			GROUP BY 1
@@ -90,6 +105,156 @@ export function registerAdminDashboardRoutes(router: any, context: any) {
 			revenue: rows.map((r: any) => ({ currency: r.currency, amount: Number(r.amount) })),
 		};
 	};
+
+	/**
+	 * Everyone the site saw between two Vietnam days, as people: a guest's events count for
+	 * the account they later signed in to (same anonymous_id). Team accounts left out.
+	 */
+	const PEOPLE_CTE = `
+		ev AS (
+			SELECT e.event, e.day, e.lesson_id, e.step, coalesce(e.user_id, m.user_id) AS uid, e.anonymous_id
+			FROM learning_events e
+			LEFT JOIN LATERAL (
+				SELECT x.user_id FROM learning_events x
+				WHERE e.user_id IS NULL AND x.anonymous_id = e.anonymous_id AND x.user_id IS NOT NULL LIMIT 1
+			) m ON true
+			WHERE e.day BETWEEN ?::date AND ?::date
+		),
+		p AS (
+			SELECT coalesce('u:' || uid::text, 'a:' || anonymous_id) AS person, uid, event, day, lesson_id, step
+			FROM ev WHERE ${real('ev.uid')}
+		)`;
+
+	/** Visited -> opened a lesson -> pressed Start -> finished one; with an account; came back */
+	const visitorJourney = async (from: string, to: string) => (await database.raw(`
+		WITH ${PEOPLE_CTE},
+		per AS (
+			SELECT person,
+				bool_or(event = 'lesson_open') AS opened,
+				bool_or(event = 'lesson_start') AS started,
+				bool_or(event = 'result') AS finished,
+				bool_or(uid IS NOT NULL) AS account,
+				count(DISTINCT day) AS days
+			FROM p GROUP BY person
+		)
+		SELECT count(*)::int AS visitors,
+			count(*) FILTER (WHERE opened)::int AS opened,
+			count(*) FILTER (WHERE started)::int AS started,
+			count(*) FILTER (WHERE finished)::int AS finished,
+			count(*) FILTER (WHERE finished AND account)::int AS finished_with_account,
+			count(*) FILTER (WHERE account)::int AS with_account,
+			count(*) FILTER (WHERE days >= 2)::int AS came_back
+		FROM per
+	`, [from, to])).rows[0];
+
+	/**
+	 * Where a lesson is left, step by step, among lessons that have that step:
+	 *   started / reached    people who pressed Start / got to the step (events: guests too, since deploy)
+	 *   sessions / answered  accounts that answered in the lesson / answered in the step
+	 */
+	const lessonSteps = async (from: string, to: string) => {
+		const ev = (await database.raw(`
+			WITH ${PEOPLE_CTE},
+			started AS (SELECT DISTINCT person, lesson_id FROM p WHERE event = 'lesson_start'),
+			ls AS (SELECT DISTINCT lesson_id, step FROM listening_clips WHERE status = 'published' AND step IS NOT NULL)
+			SELECT ls.step, count(*)::int AS eligible,
+				count(*) FILTER (WHERE EXISTS (
+					SELECT 1 FROM p WHERE p.person = s.person AND p.lesson_id = s.lesson_id AND p.event = 'step' AND p.step = ls.step
+				))::int AS reached
+			FROM started s JOIN ls ON ls.lesson_id = s.lesson_id
+			GROUP BY ls.step
+			UNION ALL
+			SELECT 'result', count(*)::int,
+				count(*) FILTER (WHERE EXISTS (
+					SELECT 1 FROM p WHERE p.person = s.person AND p.lesson_id = s.lesson_id AND p.event = 'result'
+				))::int
+			FROM started s
+		`, [from, to])).rows;
+		const ans = (await database.raw(`
+			WITH r AS (
+				SELECT (?::date::timestamp AT TIME ZONE '${TZ}') AS t0, ((?::date + 1)::timestamp AT TIME ZONE '${TZ}') AS t1
+			),
+			a AS (
+				SELECT DISTINCT user_id, lesson_id, step FROM listening_attempts, r
+				WHERE lesson_id IS NOT NULL AND date_created >= r.t0 AND date_created < r.t1 AND ${real('user_id')}
+			),
+			sessions AS (SELECT DISTINCT user_id, lesson_id FROM a),
+			ls AS (SELECT DISTINCT lesson_id, step FROM listening_clips WHERE status = 'published' AND step IS NOT NULL)
+			SELECT ls.step, count(*)::int AS eligible,
+				count(*) FILTER (WHERE EXISTS (SELECT 1 FROM a WHERE a.user_id = s.user_id AND a.lesson_id = s.lesson_id AND a.step = ls.step))::int AS answered
+			FROM sessions s JOIN ls ON ls.lesson_id = s.lesson_id
+			GROUP BY ls.step
+			UNION ALL
+			SELECT 'result', count(*)::int,
+				count(*) FILTER (WHERE EXISTS (
+					SELECT 1 FROM listening_progress pr WHERE pr.user_id = s.user_id AND pr.lesson_id = s.lesson_id AND pr.status = 'completed'
+				))::int
+			FROM sessions s
+		`, [from, to])).rows;
+		return ['type', 'voice', 'challenge', 'more', 'result'].map((step) => {
+			const e = ev.find((r: any) => r.step === step);
+			const a = ans.find((r: any) => r.step === step);
+			return { step, started: e?.eligible || 0, reached: e?.reached || 0, sessions: a?.eligible || 0, answered: a?.answered || 0 };
+		});
+	};
+
+	/**
+	 * Coming back, by sign-up week (last 8 weeks): accounts active (an answer or any event) on
+	 * the day after sign-up, in days 1-7 and in days 8-30. `*_due` = accounts old enough for it.
+	 */
+	const comingBack = async (today: string) => (await database.raw(`
+		WITH u AS (
+			SELECT id, (gl_created_at AT TIME ZONE '${TZ}')::date AS d0
+			FROM directus_users
+			WHERE status = 'active' AND NOT is_internal
+				AND gl_created_at >= (date_trunc('week', ?::date) - interval '7 weeks')::timestamp AT TIME ZONE '${TZ}'
+		),
+		learned AS (
+			SELECT DISTINCT user_id, (date_created AT TIME ZONE '${TZ}')::date AS d FROM listening_attempts WHERE user_id IN (SELECT id FROM u)
+		),
+		act AS (
+			SELECT user_id, d FROM learned
+			UNION
+			SELECT DISTINCT user_id, day FROM learning_events WHERE user_id IN (SELECT id FROM u)
+		),
+		f AS (
+			SELECT u.id, u.d0, date_trunc('week', u.d0)::date AS week,
+				EXISTS (SELECT 1 FROM act WHERE act.user_id = u.id AND act.d = u.d0) AS day0,
+				EXISTS (SELECT 1 FROM act WHERE act.user_id = u.id AND act.d = u.d0 + 1) AS day1,
+				EXISTS (SELECT 1 FROM act WHERE act.user_id = u.id AND act.d BETWEEN u.d0 + 1 AND u.d0 + 7) AS week1,
+				EXISTS (SELECT 1 FROM act WHERE act.user_id = u.id AND act.d BETWEEN u.d0 + 8 AND u.d0 + 30) AS month1,
+				EXISTS (SELECT 1 FROM learned l WHERE l.user_id = u.id AND l.d = u.d0 + 1) AS day1_learned,
+				EXISTS (SELECT 1 FROM learned l WHERE l.user_id = u.id AND l.d BETWEEN u.d0 + 1 AND u.d0 + 7) AS week1_learned,
+				EXISTS (SELECT 1 FROM learned l WHERE l.user_id = u.id AND l.d BETWEEN u.d0 + 8 AND u.d0 + 30) AS month1_learned
+			FROM u
+		)
+		SELECT to_char(week, 'YYYY-MM-DD') AS week, count(*)::int AS signups,
+			count(*) FILTER (WHERE day0)::int AS learned_day0,
+			count(*) FILTER (WHERE d0 + 1 <= ?::date)::int AS day1_due, count(*) FILTER (WHERE day1 AND d0 + 1 <= ?::date)::int AS day1,
+			count(*) FILTER (WHERE d0 + 7 <= ?::date)::int AS week1_due, count(*) FILTER (WHERE week1 AND d0 + 7 <= ?::date)::int AS week1,
+			count(*) FILTER (WHERE d0 + 30 <= ?::date)::int AS month1_due, count(*) FILTER (WHERE month1 AND d0 + 30 <= ?::date)::int AS month1,
+			count(*) FILTER (WHERE day1_learned AND d0 + 1 <= ?::date)::int AS day1_learned,
+			count(*) FILTER (WHERE week1_learned AND d0 + 7 <= ?::date)::int AS week1_learned,
+			count(*) FILTER (WHERE month1_learned AND d0 + 30 <= ?::date)::int AS month1_learned
+		FROM f GROUP BY week ORDER BY week DESC
+	`, [today, today, today, today, today, today, today, today, today, today])).rows;
+
+	/** North Star, the last 12 weeks (Monday first, this week so far last) */
+	const weeklyLearners = async (today: string) => (await database.raw(`
+		WITH w AS (
+			SELECT generate_series(date_trunc('week', ?::date) - interval '11 weeks', date_trunc('week', ?::date), interval '1 week')::date AS week
+		),
+		done AS (
+			SELECT user_id, (date_updated AT TIME ZONE '${TZ}')::date AS d FROM listening_progress WHERE status = 'completed' AND user_id IS NOT NULL
+			UNION
+			SELECT user_id, (completed_at AT TIME ZONE '${TZ}')::date FROM listening_progress WHERE completed_at IS NOT NULL AND user_id IS NOT NULL
+			UNION
+			SELECT user_id, day FROM learning_events WHERE event = 'result' AND user_id IS NOT NULL
+		)
+		SELECT to_char(w.week, 'YYYY-MM-DD') AS week,
+			(SELECT count(DISTINCT done.user_id) FROM done WHERE done.d >= w.week AND done.d < w.week + 7 AND ${real('done.user_id')})::int AS learners
+		FROM w ORDER BY w.week
+	`, [today, today])).rows;
 
 	router.get('/admin/dashboard', admin(async (req, res) => {
 		const days = PERIODS.includes(Number(req.query.days)) ? Number(req.query.days) : 30;
@@ -141,7 +306,7 @@ export function registerAdminDashboardRoutes(router: any, context: any) {
 		const funnel = (await database.raw(`
 			WITH u AS (
 				SELECT id FROM directus_users
-				WHERE status = 'active' AND gl_created_at >= (?::date::timestamp AT TIME ZONE '${TZ}')
+				WHERE status = 'active' AND NOT is_internal AND gl_created_at >= (?::date::timestamp AT TIME ZONE '${TZ}')
 			)
 			SELECT
 				(SELECT count(*) FROM u)::int AS signups,
@@ -159,16 +324,16 @@ export function registerAdminDashboardRoutes(router: any, context: any) {
 				SELECT lesson_id, count(*)::int AS attempts, count(DISTINCT user_id)::int AS learners,
 					avg(CASE WHEN is_correct THEN 1 ELSE 0 END) FILTER (WHERE attempt_number = 1) AS accuracy,
 					count(*) FILTER (WHERE attempt_number = 1)::int AS first_tries
-				FROM listening_attempts, r WHERE lesson_id IS NOT NULL AND date_created >= r.t0 AND date_created < r.t1
+				FROM listening_attempts, r WHERE lesson_id IS NOT NULL AND date_created >= r.t0 AND date_created < r.t1 AND ${real('user_id')}
 				GROUP BY 1
 			),
 			s AS (
 				SELECT lesson_id, count(*)::int AS starts
-				FROM listening_lesson_learners, r WHERE date_created >= r.t0 AND date_created < r.t1 GROUP BY 1
+				FROM listening_lesson_learners, r WHERE date_created >= r.t0 AND date_created < r.t1 AND ${real('user_id')} GROUP BY 1
 			),
 			c AS (
 				SELECT lesson_id, count(*)::int AS completions
-				FROM listening_progress, r WHERE status = 'completed' AND completed_at >= r.t0 AND completed_at < r.t1 GROUP BY 1
+				FROM listening_progress, r WHERE status = 'completed' AND completed_at >= r.t0 AND completed_at < r.t1 AND ${real('user_id')} GROUP BY 1
 			)
 			SELECT l.id, l.short_id, l.text, l.status, sk.name AS skill,
 				coalesce(s.starts, 0) AS starts, coalesce(a.learners, 0) AS learners, coalesce(a.attempts, 0) AS attempts,
@@ -194,8 +359,21 @@ export function registerAdminDashboardRoutes(router: any, context: any) {
 		`)).rows[0].n;
 		const premium = (await database.raw(`
 			SELECT count(*)::int AS n FROM directus_users
-			WHERE status = 'active' AND is_premium AND (premium_until IS NULL OR premium_until > now())
+			WHERE status = 'active' AND NOT is_internal AND is_premium AND (premium_until IS NULL OR premium_until > now())
 		`)).rows[0].n;
+
+		const [journey, steps, retention, eventsSince, northStar, releases] = await Promise.all([
+			visitorJourney(from, today), lessonSteps(from, today), comingBack(today),
+			database('learning_events').min('day as d').first().then((r: any) => (r?.d ? vnDay(new Date(r.d)) : null)),
+			weeklyLearners(today),
+			// Every change since the start of the 12 weeks of the North Star chart
+			database.raw(`
+				SELECT r.id, to_char(r.day, 'YYYY-MM-DD') AS day, r.title, u.email
+				FROM admin_releases r LEFT JOIN directus_users u ON u.id = r.user_created
+				WHERE r.day >= least(?::date, date_trunc('week', ?::date)::date - 77)
+				ORDER BY r.day DESC, r.id DESC
+			`, [prevFrom, today]).then((r: any) => r.rows),
+		]);
 
 		return res.json({
 			success: true,
@@ -215,8 +393,30 @@ export function registerAdminDashboardRoutes(router: any, context: any) {
 				popular_lessons: popular,
 				hardest_lessons: hardest,
 				estimated_signups: estimated,
+				events_since: eventsSince,
+				journey,
+				steps,
+				retention,
+				north_star: northStar,
+				releases,
 			},
 		});
+	}));
+
+	router.post('/admin/releases', admin(async (req, res) => {
+		const day = String(req.body?.day || '');
+		const title = typeof req.body?.title === 'string' ? req.body.title.trim().slice(0, 200) : '';
+		if (!/^\d{4}-\d{2}-\d{2}$/.test(day) || Number.isNaN(Date.parse(day))) throw bad('day must be YYYY-MM-DD');
+		if (!title) throw bad('title is required');
+		const [row] = await database('admin_releases').insert({ day, title, user_created: req.accountability.user }).returning(['id']);
+		return res.json({ success: true, data: { id: row?.id ?? row } });
+	}));
+
+	router.delete('/admin/releases/:id', admin(async (req, res) => {
+		const id = Number(req.params.id);
+		if (!Number.isInteger(id) || id <= 0) throw bad('Invalid id');
+		const n = await database('admin_releases').where({ id }).delete();
+		return n ? res.json({ success: true }) : res.status(404).json({ success: false, message: 'Not found' });
 	}));
 
 	router.put('/admin/goals', admin(async (req, res) => {

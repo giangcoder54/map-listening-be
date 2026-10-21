@@ -6,6 +6,7 @@ import { downgradeExpiredPremium } from '../lib/premium';
 import { registerLessonStep1Check } from './lessonStep1Check';
 import { registerLessonTextCase } from './lessonTextCase';
 import { registerEditorScope } from './editorScope';
+import { registerGoogleAvatar } from './googleAvatar';
 import { recordConversion, voidConversion } from '../lib/referrals';
 import { refreshGrowthConfig } from '../lib/growthConfig';
 
@@ -16,6 +17,9 @@ export default defineHook((registerEvents, context) => {
 
 	// Giữ raw body cho webhook SePay (bắt buộc để xác thực HMAC-SHA256)
 	registerSepayRawBody(registerEvents, context);
+
+	// Google sign-in: keep their Google profile picture (avatar_url)
+	registerGoogleAvatar(registerEvents);
 
 	// Mỗi giờ: Premium hết hạn -> role Free User
 	registerEvents.schedule('15 * * * *', async () => { await downgradeExpiredPremium(context.database, context.logger); });
