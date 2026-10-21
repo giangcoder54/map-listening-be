@@ -13,6 +13,7 @@
  */
 import { UUID_RE, answerOf } from '../lib/lessons';
 import { isPremiumUser } from '../lib/premium';
+import { PHRASE_XP } from '../lib/phrases';
 
 export const TZ = 'Asia/Ho_Chi_Minh';
 export const XP = { clip: 10, lesson: 20, review: 5 };
@@ -28,7 +29,8 @@ const periodStart = (unit: 'day' | 'week' | 'month') => `date_trunc('${unit}', n
 /** XP of every learner (or one) since a SQL timestamp expression */
 export function xpQuery(database: any, startSql: string, userId?: string) {
 	const own = userId ? 'AND user_id = ?' : '';
-	const bindings = userId ? [userId, userId] : [];
+	const bindings = userId ? [userId, userId, userId] : [];
+	// Phrase Lab: PHRASE_XP.lesson per phrase learned, PHRASE_XP.review per phrase answered right (once a day)
 	return database.raw(`
 		WITH c AS (
 			SELECT user_id,
@@ -42,10 +44,20 @@ export function xpQuery(database: any, startSql: string, userId?: string) {
 			FROM listening_progress
 			WHERE completed_at >= ${startSql} ${own}
 			GROUP BY user_id
+		), p AS (
+			SELECT user_id,
+				COUNT(*) FILTER (WHERE mode = 'lesson')::int AS lessons,
+				COUNT(DISTINCT ((date_created AT TIME ZONE '${TZ}')::date::text || phrase_id::text)) FILTER (WHERE mode <> 'lesson' AND correct)::int AS reviews
+			FROM phrase_review_logs
+			WHERE date_created >= ${startSql} ${own}
+			GROUP BY user_id
 		)
-		SELECT COALESCE(c.user_id, l.user_id) AS user_id,
-			(COALESCE(c.clips, 0) * ${XP.clip} + COALESCE(c.reviews, 0) * ${XP.review} + COALESCE(l.lessons, 0) * ${XP.lesson})::int AS xp
-		FROM c FULL JOIN l ON l.user_id = c.user_id
+		SELECT user_id, SUM(xp)::int AS xp FROM (
+			SELECT user_id, clips * ${XP.clip} + reviews * ${XP.review} AS xp FROM c
+			UNION ALL SELECT user_id, lessons * ${XP.lesson} FROM l
+			UNION ALL SELECT user_id, lessons * ${PHRASE_XP.lesson} + reviews * ${PHRASE_XP.review} FROM p
+		) x
+		GROUP BY user_id
 	`, bindings);
 }
 
@@ -58,9 +70,12 @@ async function xpOf(database: any, userId: string, unit: 'day' | 'week' | 'month
 export async function streakOf(database: any, userId: string) {
 	const res = await database.raw(`
 		SELECT DISTINCT to_char((date_created AT TIME ZONE '${TZ}')::date, 'YYYY-MM-DD') AS day
-		FROM listening_attempts
-		WHERE user_id = ? AND date_created >= now() - interval '400 days'
-	`, [userId]);
+		FROM (
+			SELECT date_created FROM listening_attempts WHERE user_id = ? AND date_created >= now() - interval '400 days'
+			UNION ALL
+			SELECT date_created FROM phrase_review_logs WHERE user_id = ? AND date_created >= now() - interval '400 days'
+		) d
+	`, [userId, userId]);
 	const days = new Set<string>((res.rows || []).map((r: any) => r.day));
 	const today = await database.raw(`SELECT to_char((now() AT TIME ZONE '${TZ}')::date, 'YYYY-MM-DD') AS d`);
 	const d = new Date(`${today.rows[0].d}T00:00:00Z`);
@@ -110,12 +125,13 @@ export function registerEngagementRoutes(router: any, context: any) {
 		const userId = needUser(req, res);
 		if (!userId) return;
 		try {
-			const [today, week, streak, user, due] = await Promise.all([
+			const [today, week, streak, user, due, phrasesDue] = await Promise.all([
 				xpOf(database, userId, 'day'),
 				xpOf(database, userId, 'week'),
 				streakOf(database, userId),
 				database('directus_users').select('daily_goal').where('id', userId).first(),
 				database('listening_reviews').where('user_id', userId).where('due_at', '<=', database.fn.now()).count('* as n').first(),
+				database('phrase_progress').where('user_id', userId).where('due', '<=', database.fn.now()).count('* as n').first(),
 			]);
 			return res.json({
 				success: true,
@@ -125,6 +141,7 @@ export function registerEngagementRoutes(router: any, context: any) {
 					daily_goal: Number(user?.daily_goal) || 50,
 					...streak,
 					reviews_due: Number(due?.n) || 0,
+					phrases_due: Number(phrasesDue?.n) || 0,
 				},
 			});
 		} catch (error) {
