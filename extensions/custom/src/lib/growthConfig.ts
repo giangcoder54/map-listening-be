@@ -50,6 +50,10 @@ export const growthConfig = () => ({
 	affiliateWithholdRate: num('affiliate_withhold_rate', 'AFFILIATE_WITHHOLD_RATE', 10, 0, 50),
 	/** Polar discount applied to card checkouts with an invite code (empty = invite codes are bank transfer only) */
 	polarReferralDiscountId: (raw('polar_referral_discount_id', 'POLAR_REFERRAL_DISCOUNT_ID') || '').trim(),
+	/** Phrase Lab, free learners: new phrases a day, open phrases per type, film clips per phrase */
+	phraseFreeNewPerDay: num('phrase_free_new_per_day', 'PHRASE_FREE_NEW_PER_DAY', 3, 0, 100),
+	phraseFreePerType: num('phrase_free_per_type', 'PHRASE_FREE_PER_TYPE', 3, 0, 1000),
+	phraseFreeClips: num('phrase_free_clips', 'PHRASE_FREE_CLIPS', 2, 1, 50),
 });
 
 /** Site origin for links shown to users (invite link...) */
