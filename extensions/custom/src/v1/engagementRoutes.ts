@@ -2,8 +2,8 @@
  * Daily goal, XP, streak, leaderboard and spaced review.
  *
  *   GET   /me/engagement          XP today / this week, daily goal, streak, reviews due
- *   GET   /me/settings            daily goal, hidden from the leaderboard
- *   PATCH /me/settings
+ *   GET   /me/settings            daily goal, hidden from the leaderboard, learning goal
+ *   PATCH /me/settings            (learning goal: the one-question survey after sign-in)
  *   GET   /leaderboard            ?period=week|month: top learners by XP (+ my rank)
  *   GET   /review/due             clips to review now (answer hidden)
  *   POST  /review/:clipId         { answer } -> right or wrong, next date
@@ -18,6 +18,8 @@ export const TZ = 'Asia/Ho_Chi_Minh';
 export const XP = { clip: 10, lesson: 20, review: 5 };
 /** Days until the next review, by box (0 = just missed) */
 export const REVIEW_INTERVALS = [1, 3, 7, 14, 30];
+/** Why they practise, one or more, no skip (2026-10-21_learning_goal.sql) */
+export const LEARNING_GOALS = ['exam', 'movies', 'work', 'general', 'other'];
 
 /** Same normalisation as the lesson player (listening-lab/[id].vue) */
 export const normalizeAnswer = (text: string) =>
@@ -75,12 +77,9 @@ export async function streakOf(database: any, userId: string) {
 }
 
 /** First name + initial of the last name: what other learners see */
-export const publicName = (first?: string | null, last?: string | null) => {
-	const f = String(first || '').trim();
-	const l = String(last || '').trim();
-	if (!f && !l) return 'Learner';
-	return l ? `${f || l} ${f ? `${l[0]}.` : ''}`.trim() : f;
-};
+/** Name on the leaderboard: first and last name in full ("Giang Nguyễn Thế Trường") */
+export const publicName = (first?: string | null, last?: string | null) =>
+	[first, last].map((p) => String(p || '').trim()).filter(Boolean).join(' ') || 'Learner';
 
 /**
  * A missed clip goes (back) to the review queue, due tomorrow. Called by the lesson
@@ -95,7 +94,7 @@ export async function scheduleReview(database: any, userId: string, clipId: stri
 }
 
 export function registerEngagementRoutes(router: any, context: any) {
-	const { database, logger } = context;
+	const { database, logger, services } = context;
 	const fail = (res: any, what: string, error: any) => {
 		logger?.error?.(`[engagement] ${what} failed: ${String(error)}`);
 		return res.status(500).json({ success: false, message: 'Server error' });
@@ -136,29 +135,56 @@ export function registerEngagementRoutes(router: any, context: any) {
 		const userId = needUser(req, res);
 		if (!userId) return;
 		try {
-			const row = await database('directus_users').select('daily_goal', 'leaderboard_hidden').where('id', userId).first();
-			return res.json({ success: true, data: { daily_goal: Number(row?.daily_goal) || 50, leaderboard_hidden: !!row?.leaderboard_hidden } });
+			const row = await database('directus_users').select('daily_goal', 'leaderboard_hidden', 'learning_goals').where('id', userId).first();
+			return res.json({
+				success: true,
+				data: {
+					daily_goal: Number(row?.daily_goal) || 50,
+					leaderboard_hidden: !!row?.leaderboard_hidden,
+					learning_goals: Array.isArray(row?.learning_goals) ? row.learning_goals : null,
+				},
+			});
 		} catch (error) {
 			return fail(res, 'Load settings', error);
 		}
 	});
 
-	// body: { daily_goal?: 20..500, leaderboard_hidden?: boolean }
+	// body: { daily_goal?: 20..500, leaderboard_hidden?: boolean, learning_goals?: LEARNING_GOALS[] (1+), learning_goal_other?: string }
 	router.patch('/me/settings', async (req: any, res: any) => {
 		const userId = needUser(req, res);
 		if (!userId) return;
 		const body = req.body || {};
 		const patch: Record<string, any> = {};
+		let goals: { learning_goals: string[]; learning_goal_other: string | null; learning_goal_at: string } | null = null;
 		if (body.daily_goal !== undefined) {
 			const goal = Math.round(Number(body.daily_goal));
 			if (!Number.isFinite(goal) || goal < 20 || goal > 500) return res.status(400).json({ success: false, message: 'Daily goal must be 20-500 XP' });
 			patch.daily_goal = goal;
 		}
 		if (body.leaderboard_hidden !== undefined) patch.leaderboard_hidden = body.leaderboard_hidden === true;
-		if (!Object.keys(patch).length) return res.status(400).json({ success: false, message: 'Nothing to update' });
+		if (body.learning_goals !== undefined) {
+			const list = Array.isArray(body.learning_goals) ? [...new Set(body.learning_goals.map(String))] : [];
+			if (!list.length || !list.every((g) => LEARNING_GOALS.includes(g))) {
+				return res.status(400).json({ success: false, message: 'Invalid learning goals' });
+			}
+			goals = {
+				learning_goals: list,
+				learning_goal_other: list.includes('other') && typeof body.learning_goal_other === 'string'
+					? body.learning_goal_other.trim().slice(0, 500) || null
+					: null,
+				learning_goal_at: new Date().toISOString(),
+			};
+		}
+		if (!Object.keys(patch).length && !goals) return res.status(400).json({ success: false, message: 'Nothing to update' });
 		try {
-			await database('directus_users').where('id', userId).update(patch);
-			return res.json({ success: true, data: patch });
+			if (Object.keys(patch).length) await database('directus_users').where('id', userId).update(patch);
+			// The site reads learning_goals from users/me, which Directus caches: write it through
+			// the users service so that cache is cleared (a plain update leaves the old answer there)
+			if (goals) {
+				const users = new services.UsersService({ schema: req.schema, accountability: { admin: true } });
+				await users.updateOne(userId, goals);
+			}
+			return res.json({ success: true, data: goals ? { ...patch, learning_goals: goals.learning_goals } : patch });
 		} catch (error) {
 			return fail(res, 'Save settings', error);
 		}
@@ -176,7 +202,7 @@ export function registerEngagementRoutes(router: any, context: any) {
 				.sort((a: any, b: any) => b.xp - a.xp);
 			const ids = ranked.map((r: any) => r.user_id);
 			const users = ids.length
-				? await database('directus_users').select('id', 'first_name', 'last_name', 'avatar', 'leaderboard_hidden', 'status').whereIn('id', ids)
+				? await database('directus_users').select('id', 'first_name', 'last_name', 'avatar', 'avatar_url', 'leaderboard_hidden', 'status').whereIn('id', ids)
 				: [];
 			const byId = new Map(users.map((u: any) => [u.id, u]));
 			const visible = ranked.filter((r: any) => {
@@ -185,7 +211,15 @@ export function registerEngagementRoutes(router: any, context: any) {
 			});
 			const rows = visible.map((r: any, i: number) => {
 				const u: any = byId.get(r.user_id);
-				return { rank: i + 1, name: publicName(u.first_name, u.last_name), avatar: u.avatar || null, xp: r.xp, me: r.user_id === userId };
+				return {
+					rank: i + 1,
+					name: publicName(u.first_name, u.last_name),
+					// An uploaded avatar (file id) first, else their Google picture (a link)
+					avatar: u.avatar || null,
+					avatar_url: u.avatar ? null : u.avatar_url || null,
+					xp: r.xp,
+					me: r.user_id === userId,
+				};
 			});
 			const mine = rows.find((r: any) => r.me) || null;
 			const ends = await database.raw(`SELECT (date_trunc('${unit}', now() AT TIME ZONE '${TZ}') + interval '1 ${unit}') AT TIME ZONE '${TZ}' AS ends_at`);

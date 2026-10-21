@@ -16,6 +16,7 @@ import { registerAdminGrowthRoutes } from './adminGrowthRoutes';
 import { registerAdminDashboardRoutes } from './adminDashboardRoutes';
 import { registerFeedbackRoutes } from './feedbackRoutes';
 import { registerAdminLessonRoutes } from './adminLessonRoutes';
+import { registerEventRoutes } from './eventRoutes';
 import { staffRole } from '../lib/staff';
 
 
@@ -261,6 +262,7 @@ export default defineEndpoint((router, context) => {
 	registerAdminDashboardRoutes(router, context);
 	registerFeedbackRoutes(router, context);
 	registerAdminLessonRoutes(router, context);
+	registerEventRoutes(router, context);
 
 	// =====================================================================
 	// POST /phrase-requests -> gợi ý cụm từ muốn có bài luyện (phải đăng nhập, không lưu ai gửi)
