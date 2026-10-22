@@ -3,7 +3,7 @@ import { newPaymentCode } from './paymentCode';
 import { getReceivingAccount } from '../lib/sepayBankAccount';
 import { addVat, breakdownFromPreTax } from '../lib/vat';
 import { calculateEndDate, activatePremiumForUser, purchaseCycle } from '../utils';
-import { applyCode, applyPromotion, publicCode, resolveCode, type ResolvedCode } from '../lib/promotions';
+import { applyCode, applyPromotion, cycleAllowed, publicCode, resolveCode, type ResolvedCode } from '../lib/promotions';
 
 export function handleCheckout(router: Router, context: any) {
   router.post('/checkout', async (req: any, res: any) => {
@@ -36,9 +36,15 @@ export function handleCheckout(router: Router, context: any) {
       const targetCurrency = 'vnd';
 
       // Lifetime Premium already covers everything: no order to pay
-      const buyer = await database('directus_users').select('subscription_type').where('id', userId).first();
+      const buyer = await database('directus_users').select('subscription_type', 'is_premium', 'premium_until').where('id', userId).first();
       if (buyer?.subscription_type === 'lifetime') {
         return res.status(409).json({ success: false, error: 'You already have lifetime Premium.' });
+      }
+      // Premium still running: only an upgrade to lifetime, as for card payments (polar.ts).
+      // Stops a coupon from being stacked on an active plan.
+      const activeUntil = buyer?.premium_until ? new Date(buyer.premium_until).getTime() : 0;
+      if (buyer?.is_premium && activeUntil > Date.now() && Number(billing_cycle) !== 0) {
+        return res.status(409).json({ success: false, code: 'ALREADY_PREMIUM', error: 'You already have an active Premium plan.' });
       }
 
       const plansService = new ItemsService('plans', {
@@ -104,7 +110,10 @@ export function handleCheckout(router: Router, context: any) {
       // resolveCode). Client cũ gửi `promotion` (id). Mã sai/hết hạn -> 400 để khách biết.
       const promoCode = typeof req.body.promotion_code === 'string' ? req.body.promotion_code.trim() : '';
       if (promoCode) {
-        const check = await resolveCode(database, promoCode, userId);
+        const check = await resolveCode(database, promoCode, userId, Number(billing_cycle));
+        if (!check.ok && check.reason === 'wrong-cycle') {
+          return res.status(400).json({ success: false, code: 'PROMOTION_WRONG_CYCLE', billing_cycles: check.billingCycles, error: 'This code is not valid for this plan.' });
+        }
         if (!check.ok) {
           // Same answer whatever the reason (expired, used up, own code...)
           return res.status(400).json({ success: false, code: 'PROMOTION_INVALID', error: 'This code is not valid.' });
@@ -118,7 +127,7 @@ export function handleCheckout(router: Router, context: any) {
             accountability: { admin: true },
           });
           const promo = await promotionsService.readOne(promotion_id, { fields: ['*'] });
-          if (promo && promo.status === 'published') promotionData = promo;
+          if (promo && promo.status === 'published' && cycleAllowed(promo, Number(billing_cycle))) promotionData = promo;
         } catch (e: any) {
           logger.warn(`Promotion not found or invalid: ${promotion_id}`);
         }
@@ -172,17 +181,23 @@ export function handleCheckout(router: Router, context: any) {
 
         const cycle = purchaseCycle(billing_cycle, totalPrice);
         const endDate = calculateEndDate(new Date(), cycle);
-        const usersService = new ItemsService('directus_users', {
+        // UsersService, not ItemsService: a role change must clear Directus' permission
+        // cache, or /users/me answers with the old role's fields (only `id`) and the
+        // header keeps showing "Free"
+        const usersService = new services.UsersService({
           schema,
           accountability: { admin: true },
         });
         await activatePremiumForUser(userId, endDate, dbPlan.code || 'pro', usersService, database, logger);
+        // The page shows the new plan from this, without waiting for /users/me
+        const premium = await database('directus_users').select('premium_until', 'subscription_type').where('id', userId).first();
 
         return res.status(200).json({
           success: true,
           type: 1,
           purchaseHistoryId: purchaseHistory,
           product_id: targetPlanId,
+          premium: { premium_until: premium?.premium_until ?? null, subscription_type: premium?.subscription_type ?? null },
         });
       }
 
@@ -273,6 +288,23 @@ export function handleCheckout(router: Router, context: any) {
         error: 'Internal server error',
         details: error.message || 'Unknown error',
       });
+    }
+  });
+
+  // Status of one of the buyer's own bank orders (learners cannot read purchase_histories):
+  // the checkout page asks it every few seconds, 'published' = paid and Premium is on
+  router.get('/checkout/:id/status', async (req: any, res: any) => {
+    const userId = req.accountability?.user;
+    if (!userId) return res.status(401).json({ success: false, error: 'Unauthorized' });
+    const id = String(req.params.id || '');
+    if (!/^[0-9a-f-]{36}$/i.test(id)) return res.status(400).json({ success: false, error: 'Bad order id' });
+    try {
+      const row = await context.database('purchase_histories').where({ id, user: userId }).first('status');
+      if (!row) return res.status(404).json({ success: false, error: 'Order not found' });
+      return res.json({ success: true, status: row.status });
+    } catch (error: any) {
+      context.logger.error(`[Checkout] Order status ${id}: ${String(error)}`);
+      return res.status(500).json({ success: false, error: 'Internal server error' });
     }
   });
 }

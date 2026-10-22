@@ -23,20 +23,27 @@ export async function isPremiumUser(database: any, userId: string | null, logger
  * Premium hết hạn -> trả về role Free User và tắt is_premium, để role trong Directus khớp
  * với trạng thái thật (quyền truy cập bài vẫn do isPremiumUser quyết định, không theo role).
  * Lifetime (premium_until NULL) không bao giờ bị hạ.
+ * Ghi qua UsersService (không ghi thẳng bằng SQL): đổi role phải xoá cache quyền của Directus,
+ * nếu không /users/me vẫn trả về theo role cũ tới khi cache hết hạn.
  */
-export async function downgradeExpiredPremium(database: any, logger?: any): Promise<number> {
+export async function downgradeExpiredPremium(context: { database: any; logger?: any; services: any; getSchema: () => Promise<any> }): Promise<number> {
+	const { database, logger } = context;
 	try {
 		const [premiumRole, freeRole] = await Promise.all([
 			database('directus_roles').whereRaw("trim(name) = 'Premium User'").first('id'),
 			database('directus_roles').whereRaw("trim(name) = 'Free User'").first('id'),
 		]);
 		if (!premiumRole || !freeRole) return 0;
-		const count = await database('directus_users')
+		const ids: string[] = await database('directus_users')
 			.where('role', premiumRole.id)
 			.whereNotNull('premium_until')
 			.where('premium_until', '<', new Date())
-			.update({ role: freeRole.id, is_premium: false });
-		if (count) logger?.info?.(`[premium] Hạ ${count} user hết hạn Premium về Free User`);
+			.pluck('id');
+		if (!ids.length) return 0;
+		const users = new context.services.UsersService({ schema: await context.getSchema(), accountability: { admin: true } });
+		await users.updateMany(ids, { role: freeRole.id, is_premium: false });
+		const count = ids.length;
+		logger?.info?.(`[premium] Hạ ${count} user hết hạn Premium về Free User`);
 		return count;
 	} catch (error: any) {
 		logger?.error?.(`[premium] Không hạ được user hết hạn Premium: ${String(error)}`);

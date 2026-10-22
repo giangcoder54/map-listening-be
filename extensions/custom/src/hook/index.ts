@@ -7,6 +7,7 @@ import { registerLessonStep1Check } from './lessonStep1Check';
 import { registerLessonTextCase } from './lessonTextCase';
 import { registerEditorScope } from './editorScope';
 import { registerGoogleAvatar } from './googleAvatar';
+import { registerDefaultRole } from './defaultRole';
 import { recordConversion, voidConversion } from '../lib/referrals';
 import { refreshGrowthConfig } from '../lib/growthConfig';
 
@@ -21,8 +22,11 @@ export default defineHook((registerEvents, context) => {
 	// Google sign-in: keep their Google profile picture (avatar_url)
 	registerGoogleAvatar(registerEvents);
 
+	// User made without a role (e.g. in the Directus admin): Free User
+	registerDefaultRole(registerEvents, context);
+
 	// Mỗi giờ: Premium hết hạn -> role Free User
-	registerEvents.schedule('15 * * * *', async () => { await downgradeExpiredPremium(context.database, context.logger); });
+	registerEvents.schedule('15 * * * *', async () => { await downgradeExpiredPremium(context); });
 
 	// Referral / affiliate numbers edited in Directus (growth_settings): no restart needed
 	refreshGrowthConfig(context.database, context.logger);
@@ -40,7 +44,8 @@ export default defineHook((registerEvents, context) => {
 					schema: hookContext.schema,
 					accountability: { admin: true },
 				});
-				const usersService = new ItemsService('directus_users', {
+				// UsersService: the role change clears the permission cache (see utils.ts)
+				const usersService = new services.UsersService({
 					schema: hookContext.schema,
 					accountability: { admin: true },
 				});
