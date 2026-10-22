@@ -23,7 +23,7 @@
  *   PATCH  /admin/support/:id             { status }
  */
 import { UUID_RE } from '../lib/lessons';
-import { PROMO_CODE_RE } from '../lib/promotions';
+import { BILLING_CYCLES, PROMO_CODE_RE } from '../lib/promotions';
 import { codeTaken, ensureReferralCode } from '../lib/referrals';
 import { growthConfig, minPayout, suggestedWithholding } from '../lib/growthConfig';
 
@@ -185,6 +185,13 @@ export function registerAdminGrowthRoutes(router: any, context: any) {
 			out.affiliate_user_id = id;
 		}
 		if (body.polar_discount_id !== undefined) out.polar_discount_id = str(body.polar_discount_id, 64) || null;
+		if (body.billing_cycles !== undefined) {
+			const list = Array.isArray(body.billing_cycles) ? body.billing_cycles.map(Number) : [];
+			if (list.some((c: number) => !(BILLING_CYCLES as readonly number[]).includes(c))) throw bad('Plans: monthly (1), yearly (12) or lifetime (0)');
+			const cycles = BILLING_CYCLES.filter((c) => list.includes(c));
+			// None or all ticked = no limit
+			out.billing_cycles = cycles.length && cycles.length < BILLING_CYCLES.length ? cycles : null;
+		}
 		return out;
 	};
 

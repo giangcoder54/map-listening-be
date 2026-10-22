@@ -182,7 +182,9 @@ export function handlePolar(router: Router, context: any) {
       let referrerId: string | null = null
       let discountCode: string | null = null
       if (typeof promotion_code === 'string' && promotion_code.trim()) {
-        const check = await resolveCode(database, promotion_code, userId)
+        const check = await resolveCode(database, promotion_code, userId, cycle)
+        if (!check.ok && check.reason === 'wrong-cycle')
+          return res.status(400).json({ success: false, code: 'PROMOTION_WRONG_CYCLE', billing_cycles: check.billingCycles, error: 'This code is not valid for this plan.' })
         if (!check.ok)
           return res.status(400).json({ success: false, code: 'PROMOTION_INVALID', error: 'This code is not valid.' })
         if (!check.polarDiscountId)

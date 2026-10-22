@@ -21,7 +21,12 @@ export function calculateEndDate(startDate: Date, billingCycle: string | number)
   return endDate.toISOString();
 }
 
-/** endDate null = lifetime */
+/**
+ * endDate null = lifetime.
+ * `usersService` must be a UsersService (not ItemsService('directus_users')): only it clears
+ * Directus' permission cache when the role changes, else the learner's /users/me keeps the
+ * old role's fields until the cache expires.
+ */
 export async function activatePremiumForUser(
   customerId: string,
   endDate: string | null,

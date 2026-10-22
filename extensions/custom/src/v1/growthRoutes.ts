@@ -530,14 +530,25 @@ export function registerGrowthRoutes(router: any, context: any) {
 	});
 
 	// ── Coupons ───────────────────────────────────────────────────────────
-	// body: { code } -> { valid, promotion? } (promotion.kind: 'promotion' | 'referral')
+	// body: { code, billing_cycle? } -> { valid, promotion? } (promotion.kind: 'promotion' | 'referral')
 	router.post('/promotions/validate', async (req: any, res: any) => {
 		const userId = needUser(req, res);
 		if (!userId) return;
 		try {
 			const code = str(req.body?.code, 40);
 			if (!code) return res.json({ success: true, data: { valid: false } });
-			const check = await resolveCode(database, code, userId);
+			// Billing cycle of the checkout (1, 12, 0); left out = not checked
+			const raw = req.body?.billing_cycle;
+			const cycle = raw === undefined || raw === null || raw === '' ? NaN : Number(raw);
+			const check = await resolveCode(database, code, userId, Number.isFinite(cycle) ? cycle : undefined);
+			// A good code for another plan: say which plans, so the buyer can switch
+			if (!check.ok && check.reason === 'wrong-cycle') {
+				return res.json({ success: true, data: { valid: false, reason: 'wrong-cycle', billing_cycles: check.billingCycles } });
+			}
+			// Already used by this learner: say so (only about their own orders)
+			if (!check.ok && check.reason === 'already-used') {
+				return res.json({ success: true, data: { valid: false, reason: 'already-used' } });
+			}
 			// Why a code is refused (expired, used up, own code...) is not told: no probing of codes
 			if (!check.ok) return res.json({ success: true, data: { valid: false } });
 			return res.json({ success: true, data: { valid: true, promotion: publicCode(check) } });

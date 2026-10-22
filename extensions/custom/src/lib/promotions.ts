@@ -4,8 +4,9 @@
  *   type 'Percent'  value = % off
  *   type 'Fixed'    value = VND off (bank transfer only; card needs a Polar discount)
  *
- * A coupon can be limited in time (valid_from / valid_until), in uses (max_redemptions:
- * paid orders that used it) and to a buyer's first order. `affiliate_user_id` links it to
+ * A learner can use a coupon once. It can be limited in time (valid_from / valid_until), in
+ * uses (max_redemptions: paid orders that used it), to a buyer's first order and to some billing cycles
+ * (billing_cycles: 1 monthly, 12 yearly, 0 lifetime; null = all). `affiliate_user_id` links it to
  * an affiliate: a buyer who uses it is counted as theirs. `polar_discount_id` is the same
  * discount created on Polar, used for card checkouts.
  */
@@ -28,13 +29,22 @@ export type PromotionRow = {
 	first_purchase_only: boolean;
 	affiliate_user_id: string | null;
 	polar_discount_id: string | null;
+	billing_cycles: number[] | null;
 };
 
 export const PROMO_CODE_RE = /^[A-Za-z0-9_-]{3,40}$/;
 
-export type PromoCheck =
-	| { ok: true; promo: PromotionRow }
-	| { ok: false; reason: 'invalid' | 'expired' | 'not-started' | 'used-up' | 'first-order-only' | 'own-code' };
+/** Billing cycles a coupon can be limited to: monthly, yearly, lifetime */
+export const BILLING_CYCLES = [1, 12, 0] as const;
+
+type Refused =
+	| { ok: false; reason: 'invalid' | 'expired' | 'not-started' | 'used-up' | 'first-order-only' | 'own-code' }
+	/** This learner already used it: told as such (it is about their own orders) */
+	| { ok: false; reason: 'already-used' }
+	/** A good coupon, but not for this billing cycle: the buyer is told which ones it is for */
+	| { ok: false; reason: 'wrong-cycle'; billingCycles: number[] };
+
+export type PromoCheck = { ok: true; promo: PromotionRow } | Refused;
 
 /** Times a coupon was used: published orders, free ones (100% coupons) included */
 export async function redemptionsOf(database: any, promotionId: string): Promise<number> {
@@ -45,7 +55,8 @@ export async function redemptionsOf(database: any, promotionId: string): Promise
 	return Number(row?.n) || 0;
 }
 
-export async function checkPromotion(database: any, code: string, userId: string | null): Promise<PromoCheck> {
+/** `billingCycle` undefined = not known yet (cycle not checked) */
+export async function checkPromotion(database: any, code: string, userId: string | null, billingCycle?: number): Promise<PromoCheck> {
 	const clean = String(code || '').trim();
 	if (!PROMO_CODE_RE.test(clean)) return { ok: false, reason: 'invalid' };
 	const promo: PromotionRow | undefined = await database('promotions')
@@ -65,8 +76,20 @@ export async function checkPromotion(database: any, code: string, userId: string
 		const used = await database('purchase_histories').where({ user: userId, status: 'published' }).first('id');
 		if (used) return { ok: false, reason: 'first-order-only' };
 	}
+	// One use per learner: a paid (or free) order of theirs with this coupon
+	if (userId) {
+		const again = await database('purchase_histories').where({ user: userId, promotion_id: promo.id, status: 'published' }).first('id');
+		if (again) return { ok: false, reason: 'already-used' };
+	}
+	if (billingCycle !== undefined && !cycleAllowed(promo, billingCycle)) {
+		return { ok: false, reason: 'wrong-cycle', billingCycles: promo.billing_cycles || [] };
+	}
 	return { ok: true, promo };
 }
+
+/** Does the coupon work for this billing cycle? (no limit set = every cycle) */
+export const cycleAllowed = (promo: Pick<PromotionRow, 'billing_cycles'>, billingCycle: number) =>
+	!promo.billing_cycles?.length || promo.billing_cycles.map(Number).includes(Number(billingCycle));
 
 /** Price after a coupon (VND or any currency for a percent coupon) */
 export function applyPromotion(price: number, promo: Pick<PromotionRow, 'type' | 'value'>): number {
@@ -101,7 +124,7 @@ export type ResolvedCode =
 		/** Polar discount for card payments, null = bank transfer only */
 		polarDiscountId: string | null;
 	}
-	| { ok: false; reason: 'invalid' | 'expired' | 'not-started' | 'used-up' | 'first-order-only' | 'own-code' };
+	| Refused;
 
 /** Is the buyer the owner of the code, under another address of the same mailbox? */
 async function sameOwner(database: any, buyerId: string | null, ownerId: string | null) {
@@ -112,8 +135,8 @@ async function sameOwner(database: any, buyerId: string | null, ownerId: string 
 	return sameMailbox(email(buyerId), email(ownerId));
 }
 
-export async function resolveCode(database: any, code: string, userId: string | null): Promise<ResolvedCode> {
-	const coupon = await checkPromotion(database, code, userId);
+export async function resolveCode(database: any, code: string, userId: string | null, billingCycle?: number): Promise<ResolvedCode> {
+	const coupon = await checkPromotion(database, code, userId, billingCycle);
 	if (coupon.ok) {
 		const promo = coupon.promo;
 		if (await sameOwner(database, userId, promo.affiliate_user_id)) return { ok: false, reason: 'own-code' };
@@ -164,4 +187,6 @@ export const publicCode = (code: Extract<ResolvedCode, { ok: true }>) => ({
 	referrer_name: code.referrerName,
 	/** Card payment gets the discount only through a matching Polar discount */
 	card: !!code.polarDiscountId,
+	/** Billing cycles it works for, null = all */
+	billing_cycles: code.promo?.billing_cycles?.length ? code.promo.billing_cycles.map(Number) : null,
 });

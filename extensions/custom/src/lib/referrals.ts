@@ -226,8 +226,8 @@ export async function recordConversion(purchaseId: string, context: any, schema:
 	const current = referrer.is_premium && referrer.premium_until ? new Date(referrer.premium_until) : null;
 	const from = current && current.getTime() > Date.now() ? current : new Date();
 	const endDate = addDays(from, cfg.referralRewardDays).toISOString();
-	const { ItemsService } = services;
-	const usersService = new ItemsService('directus_users', { schema, accountability: { admin: true } });
+	// UsersService: the role change clears the permission cache (see utils.ts)
+	const usersService = new services.UsersService({ schema, accountability: { admin: true } });
 	await activatePremiumForUser(referrer.id, endDate, referrer.subscription_type || 'premium', usersService, database, logger);
 	logger?.info?.(`[referral] ${referrer.id} earned ${cfg.referralRewardDays} Premium days (order ${purchaseId})`);
 }
