@@ -24,10 +24,15 @@
  * Team and test accounts (directus_users.is_internal, 2026-10-21_analytics.sql) are left out
  * of every number.
  *
- * Visitor journey, steps and coming back (2026-10-21_analytics.sql): `journey` and the event
- * columns of `steps` come from learning_events (guests included, only since it was deployed:
- * `events_since`); the answer columns of `steps` and `retention` also use listening_attempts,
- * so they have the past too.
+ * Visitor journey, steps and coming back (2026-10-21_analytics.sql): `journey`, `landing` and
+ * the event columns of `steps` come from learning_events (guests included). Only rows from real
+ * people count (`human`, 2026-10-26_analytics_humans.sql: bots dropped, nothing sent before a
+ * scroll, tap or key), so they start on the day that was deployed: `events_since`. The answer
+ * columns of `steps` and `retention` also use listening_attempts, so they have the past too.
+ *
+ * Practice settings (2026-10-26_practice_modes.sql): `practice` = per step, who reached it and
+ * who pressed "Skip this step"; per setting, the accounts that played that way (their answers),
+ * the people who picked it in the period (events) and the accounts that have it saved now.
  *
  * Sign-up dates: accounts made before 2026-10-09 got a date estimated from their first
  * activity (database/migrations/2026-10-15_admin_dashboard.sql). `estimated_signups` counts
@@ -112,16 +117,16 @@ export function registerAdminDashboardRoutes(router: any, context: any) {
 	 */
 	const PEOPLE_CTE = `
 		ev AS (
-			SELECT e.event, e.day, e.lesson_id, e.step, coalesce(e.user_id, m.user_id) AS uid, e.anonymous_id
+			SELECT e.event, e.day, e.lesson_id, e.step, e.path, coalesce(e.user_id, m.user_id) AS uid, e.anonymous_id
 			FROM learning_events e
 			LEFT JOIN LATERAL (
 				SELECT x.user_id FROM learning_events x
 				WHERE e.user_id IS NULL AND x.anonymous_id = e.anonymous_id AND x.user_id IS NOT NULL LIMIT 1
 			) m ON true
-			WHERE e.day BETWEEN ?::date AND ?::date
+			WHERE e.human AND e.day BETWEEN ?::date AND ?::date
 		),
 		p AS (
-			SELECT coalesce('u:' || uid::text, 'a:' || anonymous_id) AS person, uid, event, day, lesson_id, step
+			SELECT coalesce('u:' || uid::text, 'a:' || anonymous_id) AS person, uid, event, day, lesson_id, step, path
 			FROM ev WHERE ${real('ev.uid')}
 		)`;
 
@@ -144,6 +149,39 @@ export function registerAdminDashboardRoutes(router: any, context: any) {
 			count(*) FILTER (WHERE finished AND account)::int AS finished_with_account,
 			count(*) FILTER (WHERE account)::int AS with_account,
 			count(*) FILTER (WHERE days >= 2)::int AS came_back
+		FROM per
+	`, [from, to])).rows[0];
+
+	/**
+	 * Home page: people whose day started there (their `visit` was to /, /vi...) or who used its
+	 * ear test -> played the clip -> picked an answer (the right one) -> clicked on to the
+	 * lessons; and of them, who opened a lesson / pressed Start that day or later in the period.
+	 */
+	const landingFunnel = async (from: string, to: string) => (await database.raw(`
+		WITH ${PEOPLE_CTE},
+		landed AS (
+			SELECT person, min(day) AS day FROM p
+			WHERE (event = 'visit' AND path ~ '^/([a-z]{2}(-[A-Za-z]{2}){0,1}){0,1}/{0,1}$') OR event = 'landing'
+			GROUP BY person
+		),
+		per AS (
+			SELECT l.person,
+				bool_or(p.event = 'landing' AND p.step = 'play') AS played,
+				bool_or(p.event = 'landing' AND p.step = 'answer') AS answered,
+				bool_or(p.event = 'landing' AND p.step = 'right') AS right_answer,
+				bool_or(p.event = 'landing' AND p.step = 'cta') AS clicked,
+				bool_or(p.event = 'lesson_open' AND p.day >= l.day) AS opened,
+				bool_or(p.event = 'lesson_start' AND p.day >= l.day) AS started
+			FROM landed l JOIN p ON p.person = l.person
+			GROUP BY l.person
+		)
+		SELECT count(*)::int AS landed,
+			count(*) FILTER (WHERE played)::int AS played,
+			count(*) FILTER (WHERE answered)::int AS answered,
+			count(*) FILTER (WHERE right_answer)::int AS right_answer,
+			count(*) FILTER (WHERE clicked)::int AS clicked,
+			count(*) FILTER (WHERE opened)::int AS opened,
+			count(*) FILTER (WHERE started)::int AS started
 		FROM per
 	`, [from, to])).rows[0];
 
@@ -196,6 +234,59 @@ export function registerAdminDashboardRoutes(router: any, context: any) {
 			const a = ans.find((r: any) => r.step === step);
 			return { step, started: e?.eligible || 0, reached: e?.reached || 0, sessions: a?.eligible || 0, answered: a?.answered || 0 };
 		});
+	};
+
+	/** Steps 2-4: reached / skipped (people), the settings picked in the period, the ones saved now */
+	const practice = async (from: string, to: string) => {
+		const ev = (await database.raw(`
+			WITH ${PEOPLE_CTE}
+			SELECT event, step, count(DISTINCT person)::int AS people FROM p
+			WHERE (event = 'step' AND step IN ('voice', 'challenge', 'more')) OR event IN ('skip', 'setting')
+			GROUP BY event, step
+		`, [from, to])).rows;
+		const saved = (await database.raw(`
+			SELECT 'voice_' || coalesce(practice_prefs->>'voice', 'type') AS k, count(*)::int AS n FROM directus_users
+			WHERE practice_prefs IS NOT NULL AND status = 'active' AND NOT is_internal GROUP BY 1
+			UNION ALL
+			SELECT 'challenge_' || coalesce(practice_prefs->>'challenge', 'medium'), count(*)::int FROM directus_users
+			WHERE practice_prefs IS NOT NULL AND status = 'active' AND NOT is_internal GROUP BY 1
+		`)).rows;
+		// What accounts actually played (listening_attempts.mode), defaults included: each account
+		// once per step, by the last mode it used in the period. Step 3 from whole-sentence clips
+		// only (a "faster" clip is the same at medium and hard). Counted from the first attempt
+		// made with these settings, so the weeks before them (all "type it" / "hard") stay out.
+		const used = (await database.raw(`
+			WITH r AS (
+				SELECT greatest(
+					(?::date::timestamp AT TIME ZONE '${TZ}'),
+					(SELECT min(date_created) FROM listening_attempts WHERE mode IN ('listen', 'sentence_medium', 'sentence_easy', 'speed_easy'))
+				) AS t0, ((?::date + 1)::timestamp AT TIME ZONE '${TZ}') AS t1
+			),
+			last AS (
+				SELECT DISTINCT ON (user_id, step) user_id, step, mode FROM listening_attempts, r
+				WHERE step IN ('voice', 'challenge') AND date_created >= r.t0 AND date_created < r.t1 AND ${real('user_id')}
+					AND (step = 'voice' OR mode IN ('sentence', 'sentence_medium', 'sentence_easy'))
+				ORDER BY user_id, step, date_created DESC
+			)
+			SELECT CASE
+					WHEN step = 'voice' THEN CASE WHEN mode = 'listen' THEN 'voice_listen' ELSE 'voice_type' END
+					WHEN mode = 'sentence_easy' THEN 'challenge_easy'
+					WHEN mode = 'sentence_medium' THEN 'challenge_medium'
+					ELSE 'challenge_hard'
+				END AS k, count(*)::int AS n
+			FROM last GROUP BY 1
+		`, [from, to])).rows;
+		const n = (event: string, step: string) => ev.find((r: any) => r.event === event && r.step === step)?.people || 0;
+		const settings = ['voice_type', 'voice_listen', 'challenge_easy', 'challenge_medium', 'challenge_hard'];
+		return {
+			steps: ['voice', 'challenge', 'more'].map((step) => ({ step, reached: n('step', step), skipped: n('skip', step) })),
+			settings: settings.map((key) => ({
+				key,
+				used: used.find((r: any) => r.k === key)?.n || 0,
+				picked: n('setting', key),
+				saved: saved.find((r: any) => r.k === key)?.n || 0,
+			})),
+		};
 	};
 
 	/**
@@ -325,6 +416,7 @@ export function registerAdminDashboardRoutes(router: any, context: any) {
 					avg(CASE WHEN is_correct THEN 1 ELSE 0 END) FILTER (WHERE attempt_number = 1) AS accuracy,
 					count(*) FILTER (WHERE attempt_number = 1)::int AS first_tries
 				FROM listening_attempts, r WHERE lesson_id IS NOT NULL AND date_created >= r.t0 AND date_created < r.t1 AND ${real('user_id')}
+					AND answer IS DISTINCT FROM '[HEARD]'
 				GROUP BY 1
 			),
 			s AS (
@@ -362,9 +454,9 @@ export function registerAdminDashboardRoutes(router: any, context: any) {
 			WHERE status = 'active' AND NOT is_internal AND is_premium AND (premium_until IS NULL OR premium_until > now())
 		`)).rows[0].n;
 
-		const [journey, steps, retention, eventsSince, northStar, releases] = await Promise.all([
-			visitorJourney(from, today), lessonSteps(from, today), comingBack(today),
-			database('learning_events').min('day as d').first().then((r: any) => (r?.d ? vnDay(new Date(r.d)) : null)),
+		const [journey, landing, steps, retention, eventsSince, northStar, releases, practiceStats] = await Promise.all([
+			visitorJourney(from, today), landingFunnel(from, today), lessonSteps(from, today), comingBack(today),
+			database('learning_events').where('human', true).min('day as d').first().then((r: any) => (r?.d ? vnDay(new Date(r.d)) : null)),
 			weeklyLearners(today),
 			// Every change since the start of the 12 weeks of the North Star chart
 			database.raw(`
@@ -373,6 +465,7 @@ export function registerAdminDashboardRoutes(router: any, context: any) {
 				WHERE r.day >= least(?::date, date_trunc('week', ?::date)::date - 77)
 				ORDER BY r.day DESC, r.id DESC
 			`, [prevFrom, today]).then((r: any) => r.rows),
+			practice(from, today),
 		]);
 
 		return res.json({
@@ -395,7 +488,9 @@ export function registerAdminDashboardRoutes(router: any, context: any) {
 				estimated_signups: estimated,
 				events_since: eventsSince,
 				journey,
+				landing,
 				steps,
+				practice: practiceStats,
 				retention,
 				north_star: northStar,
 				releases,

@@ -19,6 +19,23 @@ export type AnswerMode = 'one_answer' | 'per_clip';
 export type StepKey = 'type' | 'voice' | 'challenge' | 'more';
 export const CLIP_STEPS: StepKey[] = ['type', 'voice', 'challenge', 'more'];
 
+/**
+ * How a learner likes to practise (directus_users.practice_prefs, 2026-10-26_practice_modes.sql):
+ * step 2 typed again or only listened to, how much of step 3 is typed. The lesson page
+ * applies it; the server stores it and checks the answers the same way whatever the level.
+ */
+export const PRACTICE = { voice: ['type', 'listen'], challenge: ['easy', 'medium', 'hard'] } as const;
+export type PracticePrefs = { voice: (typeof PRACTICE.voice)[number]; challenge: (typeof PRACTICE.challenge)[number] };
+export const DEFAULT_PRACTICE: PracticePrefs = { voice: 'type', challenge: 'medium' };
+/** The stored value, anything unknown back to its default */
+export function practicePrefsOf(raw: any): PracticePrefs {
+	const v = raw && typeof raw === 'object' ? raw : {};
+	return {
+		voice: (PRACTICE.voice as readonly string[]).includes(v.voice) ? v.voice : DEFAULT_PRACTICE.voice,
+		challenge: (PRACTICE.challenge as readonly string[]).includes(v.challenge) ? v.challenge : DEFAULT_PRACTICE.challenge,
+	};
+}
+
 type Translation = { languages_code: string; [k: string]: any };
 
 export type GroupRow = {
@@ -58,9 +75,10 @@ const bySort = (a: { sort: number | null; name?: string }, b: { sort: number | n
 export const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
- * The answer of a clip: its own `answer`; else the whole transcript for a "whole sentence"
- * challenge; else the [bracketed] part (per-clip groups, and step 4 "more practice", whose
- * clips are other phrases: "let him go" in a "tell him" lesson); else the lesson text.
+ * The answer of a clip: its own `answer`; else the [bracketed] part for per-clip groups,
+ * step 4 "more practice" (other phrases: "let him go" in a "tell him" lesson) and a "whole
+ * sentence" challenge (lines outside the brackets are context, heard but not typed); else
+ * the lesson text.
  */
 export function answerOf(
 	clip: { answer?: string | null; transcript?: string | null; step?: string | null; challenge_mode?: string | null },
@@ -68,13 +86,9 @@ export function answerOf(
 	mode: AnswerMode,
 ) {
 	if (clip.answer && clip.answer.trim()) return clip.answer.trim();
-	if (clip.step === 'challenge' && clip.challenge_mode === 'sentence') {
-		const sentence = String(clip.transcript || '').replace(/[[\]]/g, '').replace(/\s+/g, ' ').trim();
-		if (sentence) return sentence;
-	}
-	if (mode === 'per_clip' || clip.step === 'more') {
+	if (mode === 'per_clip' || clip.step === 'more' || (clip.step === 'challenge' && clip.challenge_mode === 'sentence')) {
 		const m = String(clip.transcript || '').match(/\[([^\]]+)\]/);
-		if (m?.[1]) return m[1].trim();
+		if (m?.[1]) return m[1].replace(/\s+/g, ' ').trim();
 	}
 	return lessonText;
 }

@@ -1,21 +1,23 @@
 /**
  * Daily goal, XP, streak, leaderboard and spaced review.
  *
- *   GET   /me/engagement          XP today / this week, daily goal, streak, reviews due
- *   GET   /me/settings            daily goal, hidden from the leaderboard, learning goal
+ *   GET   /me/engagement          XP today / this week, daily goal, streak, level, freezes,
+ *                                 goal days in a row, rewards not shown yet, reviews due
+ *   POST  /me/rewards/seen        { ids } the rewards were shown to the learner
+ *   GET   /me/settings            daily goal, hidden from the leaderboard, learning goal,
+ *                                 practice (how steps 2 and 3 are played, lib/lessons.ts PRACTICE)
  *   PATCH /me/settings            (learning goal: the one-question survey after sign-in)
  *   GET   /leaderboard            ?period=week|month: top learners by XP (+ my rank)
  *   GET   /review/due             clips to review now (answer hidden)
  *   POST  /review/:clipId         { answer } -> right or wrong, next date
  *
- * XP: 10 per clip answered right (once per clip per day), 20 per lesson finished (once),
- * 5 per review answered right. Days are counted in Vietnam time, like the profile heatmap.
+ * XP, streak, freezes and rewards: lib/xp.ts (rules, the ledger, the reads). Days are Vietnam days.
  */
-import { UUID_RE, answerOf } from '../lib/lessons';
+import { PRACTICE, UUID_RE, answerOf, practicePrefsOf } from '../lib/lessons';
 import { isPremiumUser } from '../lib/premium';
+import { DEFAULT_GOAL, TZ, XP, engagementOf, grantRewards, recordPractice } from '../lib/xp';
 
-export const TZ = 'Asia/Ho_Chi_Minh';
-export const XP = { clip: 10, lesson: 20, review: 5 };
+export { TZ, XP };
 /** Days until the next review, by box (0 = just missed) */
 export const REVIEW_INTERVALS = [1, 3, 7, 14, 30];
 /** Why they practise, one or more, no skip (2026-10-21_learning_goal.sql) */
@@ -25,56 +27,11 @@ export const LEARNING_GOALS = ['exam', 'movies', 'work', 'general', 'other'];
 export const normalizeAnswer = (text: string) =>
 	String(text || '').toLowerCase().replace(/[^\w\s']/g, '').replace(/\s+/g, ' ').trim();
 
-const periodStart = (unit: 'day' | 'week' | 'month') => `date_trunc('${unit}', now() AT TIME ZONE '${TZ}') AT TIME ZONE '${TZ}'`;
+const periodStart = (unit: 'week' | 'month') => `date_trunc('${unit}', now() AT TIME ZONE '${TZ}')::date`;
 
-/** XP of every learner (or one) since a SQL timestamp expression */
-export function xpQuery(database: any, startSql: string, userId?: string) {
-	const own = userId ? 'AND user_id = ?' : '';
-	const bindings = userId ? [userId, userId] : [];
-	return database.raw(`
-		WITH c AS (
-			SELECT user_id,
-				COUNT(DISTINCT ((date_created AT TIME ZONE '${TZ}')::date::text || clip_id::text)) FILTER (WHERE source IS DISTINCT FROM 'review')::int AS clips,
-				COUNT(*) FILTER (WHERE source = 'review')::int AS reviews
-			FROM listening_attempts
-			WHERE is_correct AND user_id IS NOT NULL AND date_created >= ${startSql} ${own}
-			GROUP BY user_id
-		), l AS (
-			SELECT user_id, COUNT(*)::int AS lessons
-			FROM listening_progress
-			WHERE completed_at >= ${startSql} ${own}
-			GROUP BY user_id
-		)
-		SELECT COALESCE(c.user_id, l.user_id) AS user_id,
-			(COALESCE(c.clips, 0) * ${XP.clip} + COALESCE(c.reviews, 0) * ${XP.review} + COALESCE(l.lessons, 0) * ${XP.lesson})::int AS xp
-		FROM c FULL JOIN l ON l.user_id = c.user_id
-	`, bindings);
-}
-
-async function xpOf(database: any, userId: string, unit: 'day' | 'week' | 'month') {
-	const res = await xpQuery(database, periodStart(unit), userId);
-	return Number(res.rows?.[0]?.xp) || 0;
-}
-
-/** Days in a row with practice, up to today (or yesterday: today is not over yet) */
-export async function streakOf(database: any, userId: string) {
-	const res = await database.raw(`
-		SELECT DISTINCT to_char((date_created AT TIME ZONE '${TZ}')::date, 'YYYY-MM-DD') AS day
-		FROM listening_attempts
-		WHERE user_id = ? AND date_created >= now() - interval '400 days'
-	`, [userId]);
-	const days = new Set<string>((res.rows || []).map((r: any) => r.day));
-	const today = await database.raw(`SELECT to_char((now() AT TIME ZONE '${TZ}')::date, 'YYYY-MM-DD') AS d`);
-	const d = new Date(`${today.rows[0].d}T00:00:00Z`);
-	const key = () => d.toISOString().slice(0, 10);
-	if (!days.has(key())) d.setUTCDate(d.getUTCDate() - 1);
-	let count = 0;
-	while (days.has(key())) {
-		count++;
-		d.setUTCDate(d.getUTCDate() - 1);
-	}
-	return { streak: count, practiced_today: days.has(today.rows[0].d) };
-}
+/** Ranked learners of a period, kept 2 minutes: the board is read far more than it changes */
+const LEADERBOARD_TTL_MS = 120_000;
+const leaderboardCache = new Map<string, { at: number; rows: { user_id: string; xp: number }[] }>();
 
 /** First name + initial of the last name: what other learners see */
 /** Name on the leaderboard: first and last name in full ("Giang Nguyễn Thế Trường") */
@@ -109,25 +66,26 @@ export function registerEngagementRoutes(router: any, context: any) {
 		const userId = needUser(req, res);
 		if (!userId) return;
 		try {
-			const [today, week, streak, user, due] = await Promise.all([
-				xpOf(database, userId, 'day'),
-				xpOf(database, userId, 'week'),
-				streakOf(database, userId),
-				database('directus_users').select('daily_goal').where('id', userId).first(),
+			const [engagement, due] = await Promise.all([
+				engagementOf(database, userId),
 				database('listening_reviews').where('user_id', userId).where('due_at', '<=', database.fn.now()).count('* as n').first(),
 			]);
-			return res.json({
-				success: true,
-				data: {
-					xp_today: today,
-					xp_week: week,
-					daily_goal: Number(user?.daily_goal) || 50,
-					...streak,
-					reviews_due: Number(due?.n) || 0,
-				},
-			});
+			return res.json({ success: true, data: { ...engagement, reviews_due: Number(due?.n) || 0 } });
 		} catch (error) {
 			return fail(res, 'Load engagement', error);
+		}
+	});
+
+	router.post('/me/rewards/seen', async (req: any, res: any) => {
+		const userId = needUser(req, res);
+		if (!userId) return;
+		const ids = Array.isArray(req.body?.ids) ? req.body.ids.map(Number).filter(Number.isInteger).slice(0, 50) : [];
+		if (!ids.length) return res.status(400).json({ success: false, message: 'Which rewards?' });
+		try {
+			await database('user_rewards').where('user_id', userId).whereIn('id', ids).whereNull('seen_at').update({ seen_at: database.fn.now() });
+			return res.json({ success: true });
+		} catch (error) {
+			return fail(res, 'Save rewards seen', error);
 		}
 	});
 
@@ -135,13 +93,15 @@ export function registerEngagementRoutes(router: any, context: any) {
 		const userId = needUser(req, res);
 		if (!userId) return;
 		try {
-			const row = await database('directus_users').select('daily_goal', 'leaderboard_hidden', 'learning_goals').where('id', userId).first();
+			const row = await database('directus_users').select('daily_goal', 'leaderboard_hidden', 'learning_goals', 'practice_prefs').where('id', userId).first();
 			return res.json({
 				success: true,
 				data: {
-					daily_goal: Number(row?.daily_goal) || 50,
+					daily_goal: Number(row?.daily_goal) || DEFAULT_GOAL,
 					leaderboard_hidden: !!row?.leaderboard_hidden,
 					learning_goals: Array.isArray(row?.learning_goals) ? row.learning_goals : null,
+					/** null: never set, the page keeps what this browser has */
+					practice: row?.practice_prefs ? practicePrefsOf(row.practice_prefs) : null,
 				},
 			});
 		} catch (error) {
@@ -149,7 +109,8 @@ export function registerEngagementRoutes(router: any, context: any) {
 		}
 	});
 
-	// body: { daily_goal?: 20..500, leaderboard_hidden?: boolean, learning_goals?: LEARNING_GOALS[] (1+), learning_goal_other?: string }
+	// body: { daily_goal?: 20..500, leaderboard_hidden?: boolean, learning_goals?: LEARNING_GOALS[] (1+), learning_goal_other?: string,
+	//         practice?: { voice?: 'type' | 'listen', challenge?: 'easy' | 'medium' | 'hard' } }
 	router.patch('/me/settings', async (req: any, res: any) => {
 		const userId = needUser(req, res);
 		if (!userId) return;
@@ -162,6 +123,16 @@ export function registerEngagementRoutes(router: any, context: any) {
 			patch.daily_goal = goal;
 		}
 		if (body.leaderboard_hidden !== undefined) patch.leaderboard_hidden = body.leaderboard_hidden === true;
+		if (body.practice !== undefined) {
+			const p = body.practice || {};
+			if ((p.voice !== undefined && !(PRACTICE.voice as readonly string[]).includes(p.voice))
+				|| (p.challenge !== undefined && !(PRACTICE.challenge as readonly string[]).includes(p.challenge))) {
+				return res.status(400).json({ success: false, message: 'Invalid practice settings' });
+			}
+			// One field at a time: the other one keeps what was saved
+			const row = await database('directus_users').select('practice_prefs').where('id', userId).first().catch(() => null);
+			patch.practice_prefs = JSON.stringify(practicePrefsOf({ ...practicePrefsOf(row?.practice_prefs), ...p }));
+		}
 		if (body.learning_goals !== undefined) {
 			const list = Array.isArray(body.learning_goals) ? [...new Set(body.learning_goals.map(String))] : [];
 			if (!list.length || !list.every((g) => LEARNING_GOALS.includes(g))) {
@@ -195,11 +166,16 @@ export function registerEngagementRoutes(router: any, context: any) {
 		const userId = req.accountability?.user ?? null;
 		const unit = req.query.period === 'month' ? 'month' : 'week';
 		try {
-			const res1 = await xpQuery(database, periodStart(unit));
-			const ranked = (res1.rows || [])
-				.map((r: any) => ({ user_id: r.user_id, xp: Number(r.xp) || 0 }))
-				.filter((r: any) => r.xp > 0)
-				.sort((a: any, b: any) => b.xp - a.xp);
+			let cached = leaderboardCache.get(unit);
+			if (!cached || Date.now() - cached.at > LEADERBOARD_TTL_MS) {
+				const sums = await database.raw(`
+					SELECT user_id, sum(xp)::int AS xp FROM user_daily_stats
+					WHERE day >= ${periodStart(unit)} GROUP BY user_id HAVING sum(xp) > 0 ORDER BY xp DESC
+				`);
+				cached = { at: Date.now(), rows: (sums.rows || []).map((r: any) => ({ user_id: r.user_id, xp: Number(r.xp) || 0 })) };
+				leaderboardCache.set(unit, cached);
+			}
+			const ranked = cached.rows;
 			const ids = ranked.map((r: any) => r.user_id);
 			const users = ids.length
 				? await database('directus_users').select('id', 'first_name', 'last_name', 'avatar', 'avatar_url', 'leaderboard_hidden', 'status').whereIn('id', ids)
@@ -330,7 +306,7 @@ export function registerEngagementRoutes(router: any, context: any) {
 					last_reviewed_at: database.fn.now(),
 				});
 			}
-			await database('listening_attempts').insert({
+			const [attempt] = await database('listening_attempts').insert({
 				id: database.raw('gen_random_uuid()'),
 				user_id: userId,
 				clip_id: r.clip_id,
@@ -343,7 +319,12 @@ export function registerEngagementRoutes(router: any, context: any) {
 				mode: 'phrase',
 				source: 'review',
 				date_created: database.fn.now(),
+			}).returning('id');
+			const won = await recordPractice(database, userId, {
+				attempts: 1,
+				xp: correct ? { reason: 'review', dedupe: `review:${attempt.id}`, lessonId: r.lesson_id } : null,
 			});
+			await grantRewards(context, req.schema, userId, won.rewards);
 			return res.json({
 				success: true,
 				data: {
@@ -352,7 +333,8 @@ export function registerEngagementRoutes(router: any, context: any) {
 					transcript: String(r.transcript || '').replace(/[[\]]/g, '') || null,
 					mastered,
 					next_in_days: mastered ? null : REVIEW_INTERVALS[box] ?? null,
-					xp: correct ? XP.review : 0,
+					xp: won.xp,
+					rewards: won.rewards,
 				},
 			});
 		} catch (error) {
