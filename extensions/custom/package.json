@@ -37,7 +37,8 @@
 		"dev": "directus-extension build -w --no-minify",
 		"link": "directus-extension link",
 		"validate": "directus-extension validate",
-		"add": "directus-extension add"
+		"add": "directus-extension add",
+		"test:xp": "esbuild test/xp.test.ts --bundle --platform=node --format=esm --outfile=test/.out/xp.test.mjs --log-level=warning && docker exec map-listening-api node --test /directus/extensions/custom/test/.out/xp.test.mjs"
 	},
 	"devDependencies": {
 		"@directus/extensions-sdk": "17.1.4",

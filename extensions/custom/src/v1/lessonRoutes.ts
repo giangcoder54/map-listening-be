@@ -8,7 +8,8 @@
  *   GET  /listening-lab/lessons/:key/next      what to do after this lesson
  *   POST /listening-lab/lessons/:key/progress  result card reached: save status / score, XP won
  *   GET  /listening-lab/lessons/:key/attempts  this learner's answers per clip (to resume)
- *   POST /listening-lab/attempts               one Check / Show answer on a clip
+ *   POST /listening-lab/attempts               one Check / Show answer on a clip (the server checks
+ *                                              the answer itself; XP: lib/xp.ts)
  *   GET  /listening-lab/progress/clips         clip ids this learner answered right
  *   GET  /listening-lab/my-progress            profile page
  *   GET  /listening-lab/my-activity            daily counts for the heatmap
@@ -18,10 +19,29 @@
  */
 import { isPremiumUser } from '../lib/premium';
 import { CLIP_STEPS, UUID_RE, answerOf, loadLessonGraph, type LessonGraph, type LessonRow, type StepKey } from '../lib/lessons';
-import { TZ, XP, scheduleReview } from './engagementRoutes';
+import { normalizeAnswer, scheduleReview } from './engagementRoutes';
+import { grantRewards, lessonXp, recordPractice } from '../lib/xp';
 
 const ANON_ID_RE = /^[A-Za-z0-9-]{16,64}$/;
+/** listening_attempts.mode: the way the clip was played (2026-10-26_practice_modes.sql) */
+const ATTEMPT_MODES = ['phrase', 'sentence', 'speed', 'sentence_medium', 'sentence_easy', 'speed_easy'];
 const badKey = (key: string) => !key || key.length > 64;
+
+/**
+ * The answer of a clip, as the lesson page gets it (clipOut, withPracticeLessons): a step-4
+ * clip borrowing another lesson takes that lesson's answer.
+ */
+async function clipAnswer(database: any, clip: any) {
+	if (clip.step === 'more' && clip.practice_lesson_id && !(clip.answer && clip.answer.trim())) {
+		const [other, src] = await Promise.all([
+			database('listening_lessons').select('text').where('id', clip.practice_lesson_id).first(),
+			database('listening_clips').select('answer').where({ lesson_id: clip.practice_lesson_id, step: 'type' })
+				.orderBy([{ column: 'sort', order: 'asc', nulls: 'last' }, { column: 'id' }]).first(),
+		]);
+		return answerOf({ ...clip, answer: src?.answer || other?.text || '' }, clip.text, clip.answer_mode);
+	}
+	return answerOf(clip, clip.text, clip.answer_mode);
+}
 
 /** Clip fields a player needs, with the video it comes from. */
 async function readClips(database: any, lessonIds: string[]) {
@@ -451,12 +471,17 @@ export function registerLessonRoutes(router: any, context: any) {
 			if (!lesson) return res.status(404).json({ success: false, message: 'Lesson not found' });
 
 			const body = req.body || {};
-			const completed = body.completed === true;
+			// Completed = every step-1 clip answered right (checked by the server), whatever the page says
+			const [hasStep1, open] = await Promise.all([
+				database('listening_clips').where({ lesson_id: lesson.id, step: 'type' }).first('id'),
+				database('listening_clips as c')
+					.where({ 'c.lesson_id': lesson.id, 'c.step': 'type' })
+					.whereNotExists(database('listening_attempts as a').whereRaw('a.clip_id = c.id').where({ 'a.user_id': userId, 'a.is_correct': true }))
+					.count('* as n').first(),
+			]);
+			const completed = !!hasStep1 && Number(open?.n) === 0;
 			const score = Number.isFinite(body.score) ? Math.max(0, Math.min(100, Math.round(body.score))) : null;
 			const stepResults = body.step_results && typeof body.step_results === 'object' ? JSON.stringify(body.step_results).slice(0, 4000) : null;
-			// When the learner opened the lesson: clips right since then count as XP won here
-			const startedMs = Date.parse(String(body.started_at || ''));
-			const startedAt = Number.isFinite(startedMs) ? new Date(Math.min(Date.now(), Math.max(startedMs, Date.now() - 6 * 3600_000))) : new Date();
 
 			const row = (await database.raw(`
 				INSERT INTO listening_progress (user_id, lesson_id, status, step_results, score, completed_at, date_updated)
@@ -467,32 +492,24 @@ export function registerLessonRoutes(router: any, context: any) {
 					score = COALESCE(EXCLUDED.score, listening_progress.score),
 					completed_at = COALESCE(listening_progress.completed_at, EXCLUDED.completed_at),
 					date_updated = now()
-				RETURNING status, completed_at = now() AS first_completion
+				RETURNING status
 			`, [userId, lesson.id, completed ? 'completed' : 'in_progress', stepResults, score, completed])).rows?.[0];
 
-			// XP won in this go (same rules as engagementRoutes' xpQuery): a clip of the lesson
-			// answered right for the first time today, since the lesson was opened; the lesson
-			// bonus the first time it is finished.
-			const clipsWon = Number((await database.raw(`
-				SELECT COUNT(*)::int AS n FROM (
-					SELECT clip_id, MIN(date_created) AS first_right
-					FROM listening_attempts
-					WHERE user_id = ? AND lesson_id = ? AND is_correct AND source IS DISTINCT FROM 'review'
-						AND date_created >= date_trunc('day', now() AT TIME ZONE '${TZ}') AT TIME ZONE '${TZ}'
-					GROUP BY clip_id
-				) x WHERE first_right >= ?
-			`, [userId, lesson.id, startedAt])).rows?.[0]?.n) || 0;
-			const xp = { clips: clipsWon * XP.clip, lesson: row?.first_completion ? XP.lesson : 0, total: 0 };
-			xp.total = xp.clips + xp.lesson;
+			// XP is by lesson (lib/xp.ts lessonXp): +20 the first time (+10 with an answer looked
+			// at), +5 when done again today
+			const won = completed ? await lessonXp(database, userId, lesson.id) : { xp: 0, rewards: [], kind: null };
+			await grantRewards(context, req.schema, userId, won.rewards);
+			const xp = { total: won.xp, kind: won.kind };
 
-			return res.json({ success: true, data: { saved: true, status: row?.status, xp } });
+			return res.json({ success: true, data: { saved: true, status: row?.status, xp, rewards: won.rewards } });
 		} catch (error) {
 			return fail(res, 'Save progress', error);
 		}
 	});
 
 	// What this learner did in the lesson, so the page resumes where they left it:
-	// { status: 'in_progress' | 'completed' | null, clips: [{ clip_id, tries, correct, revealed }] }
+	// { status: 'in_progress' | 'completed' | null, clips: [{ clip_id, tries, correct, revealed, heard }] }
+	// heard: step 2 played in "listen" mode and confirmed (not a typed answer, so not `correct`)
 	router.get('/listening-lab/lessons/:key/attempts', async (req: any, res: any) => {
 		const userId = req.accountability?.user ?? null;
 		const key = String(req.params.key || '');
@@ -506,9 +523,10 @@ export function registerLessonRoutes(router: any, context: any) {
 				database('listening_attempts')
 					.select(
 						'clip_id',
-						database.raw(`COUNT(*) FILTER (WHERE answer <> '[REVEALED]')::int AS tries`),
+						database.raw(`COUNT(*) FILTER (WHERE answer NOT IN ('[REVEALED]', '[HEARD]'))::int AS tries`),
 						database.raw('BOOL_OR(is_correct) AS correct'),
 						database.raw(`BOOL_OR(answer = '[REVEALED]') AS revealed`),
+						database.raw(`BOOL_OR(answer = '[HEARD]') AS heard`),
 					)
 					.where({ user_id: userId, lesson_id: lesson.id })
 					.whereNotNull('clip_id')
@@ -521,13 +539,15 @@ export function registerLessonRoutes(router: any, context: any) {
 	});
 
 	// ── Attempts ──────────────────────────────────────────────────────────
-	// body: { clip_id, type: 'check' | 'reveal', answer?, is_correct?, attempt_number?, mode?, anonymous_id? }
+	// body: { clip_id, type: 'check' | 'reveal' | 'listen', answer?, is_correct?, attempt_number?, mode?, anonymous_id? }
+	// listen: a step-2 clip in "listen only" mode, heard and confirmed: saved as '[HEARD]', never right
+	// mode: phrase | sentence | speed (step 3 hard) | sentence_medium | sentence_easy | speed_easy | listen
 	// Logged-in learner: saved (+ the lesson is marked "in progress"). Guest: only counted once
 	// in learners_count. Premium lesson without Premium: 403 PREMIUM_REQUIRED.
 	router.post('/listening-lab/attempts', async (req: any, res: any) => {
 		const userId = req.accountability?.user ?? null;
 		const body = req.body || {};
-		const type = body.type === 'reveal' ? 'reveal' : 'check';
+		const type = body.type === 'reveal' || body.type === 'listen' ? body.type : 'check';
 		const anonymousId = typeof body.anonymous_id === 'string' && ANON_ID_RE.test(body.anonymous_id) ? body.anonymous_id : null;
 		if (typeof body.clip_id !== 'string' || !UUID_RE.test(body.clip_id)) {
 			return res.status(400).json({ success: false, message: 'Invalid clip_id' });
@@ -538,15 +558,26 @@ export function registerLessonRoutes(router: any, context: any) {
 				.join('listening_lessons as l', 'l.id', 'c.lesson_id')
 				.join('listening_skills as s', 's.id', 'l.skill_id')
 				.join('listening_groups as g', 'g.id', 's.group_id')
-				.select('c.id', 'c.step', 'c.source_video_id', 'c.practice_lesson_id', 'l.id as lesson_id', database.raw('(l.is_premium OR s.is_premium OR g.is_premium) AS premium_content'))
+				.select('c.id', 'c.step', 'c.source_video_id', 'c.practice_lesson_id', 'c.answer', 'c.transcript', 'c.challenge_mode',
+					'l.id as lesson_id', 'l.text', 'g.answer_mode', database.raw('(l.is_premium OR s.is_premium OR g.is_premium) AS premium_content'))
 				.where('c.id', body.clip_id)
 				.first();
 			if (!clip) return res.status(404).json({ success: false, message: 'Clip not found' });
+			if (type === 'listen' && clip.step !== 'voice') return res.status(400).json({ success: false, message: 'Only step 2 can be listened to' });
 
 			if (clip.premium_content && !(await isPremiumUser(database, userId, logger))) {
 				return res.status(403).json({ success: false, code: 'PREMIUM_REQUIRED', message: 'Bài này dành cho gói Premium.' });
 			}
 
+			// Right or wrong is the server's call: the page's is_correct is only compared, to spot a
+			// clip whose answer the page and the server see differently
+			const given = String(body.answer ?? '').slice(0, 255);
+			const correct = type === 'check' && !!given.trim() && normalizeAnswer(given) === normalizeAnswer(await clipAnswer(database, clip));
+			if (type === 'check' && body.is_correct === true && !correct) {
+				logger?.warn?.(`[attempts] clip ${clip.id}: the page said right, the server wrong ("${given}")`);
+			}
+
+			let won = { xp: 0, rewards: [] as any[] };
 			if (userId) {
 				const attemptNumber = Number.isInteger(body.attempt_number) && body.attempt_number > 0 ? body.attempt_number : 1;
 				await database('listening_attempts').insert({
@@ -555,11 +586,11 @@ export function registerLessonRoutes(router: any, context: any) {
 					clip_id: clip.id,
 					lesson_id: clip.lesson_id,
 					step: clip.step,
-					answer: type === 'reveal' ? '[REVEALED]' : String(body.answer ?? '').slice(0, 255),
-					is_correct: type === 'check' && body.is_correct === true,
+					answer: type === 'reveal' ? '[REVEALED]' : type === 'listen' ? '[HEARD]' : given,
+					is_correct: correct,
 					attempt_number: attemptNumber,
 					listen_count: 1,
-					mode: body.mode === 'sentence' || body.mode === 'speed' ? body.mode : 'phrase',
+					mode: type === 'listen' ? 'listen' : ATTEMPT_MODES.includes(body.mode) ? body.mode : 'phrase',
 					date_created: database.fn.now(),
 				});
 				await database.raw(`
@@ -568,16 +599,19 @@ export function registerLessonRoutes(router: any, context: any) {
 				`, [userId, clip.lesson_id]);
 				// Missed (wrong or "show answer"): back in the review queue for tomorrow. Step-4 clips
 				// borrowed from another lesson have no video of their own: not reviewable.
-				if ((type === 'reveal' || body.is_correct !== true) && clip.source_video_id && !clip.practice_lesson_id) {
+				if (!correct && type !== 'listen' && clip.source_video_id && !clip.practice_lesson_id) {
 					await scheduleReview(database, userId, clip.id, clip.lesson_id).catch((e: any) => logger?.warn?.(`[review] ${String(e)}`));
 				}
+				// A practice day (the streak). XP is by lesson, on its result card (lessonXp)
+				won = await recordPractice(database, userId, { attempts: 1 });
+				await grantRewards(context, req.schema, userId, won.rewards);
 			}
 
 			let counted = false;
 			if (type === 'check' && (userId || anonymousId)) {
 				counted = await registerLearner(database, clip.lesson_id, userId, anonymousId);
 			}
-			return res.status(201).json({ success: true, data: { lesson_id: clip.lesson_id, counted } });
+			return res.status(201).json({ success: true, data: { lesson_id: clip.lesson_id, counted, correct, xp: won.xp, rewards: won.rewards } });
 		} catch (error) {
 			return fail(res, 'Save attempt', error);
 		}
@@ -604,7 +638,7 @@ export function registerLessonRoutes(router: any, context: any) {
 				WITH mine AS (
 					SELECT a.lesson_id,
 						COUNT(DISTINCT a.clip_id) FILTER (WHERE a.is_correct)::int AS completed_clips,
-						COUNT(*) FILTER (WHERE a.answer IS DISTINCT FROM '[REVEALED]')::int AS checks,
+						COUNT(*) FILTER (WHERE a.answer IS DISTINCT FROM '[REVEALED]' AND a.answer IS DISTINCT FROM '[HEARD]')::int AS checks,
 						COUNT(*) FILTER (WHERE a.is_correct)::int AS correct_checks,
 						COUNT(*) FILTER (WHERE a.answer = '[REVEALED]')::int AS reveals,
 						MIN(a.date_created) AS first_at, MAX(a.date_created) AS last_at
@@ -678,7 +712,7 @@ export function registerLessonRoutes(router: any, context: any) {
 				SELECT to_char(DATE(date_created AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Ho_Chi_Minh'), 'YYYY-MM-DD') AS day,
 					COUNT(*)::int AS checks, COUNT(*) FILTER (WHERE is_correct)::int AS correct
 				FROM listening_attempts
-				WHERE user_id = ? AND answer IS DISTINCT FROM '[REVEALED]' AND date_created >= NOW() - INTERVAL '365 days'
+				WHERE user_id = ? AND answer IS DISTINCT FROM '[REVEALED]' AND answer IS DISTINCT FROM '[HEARD]' AND date_created >= NOW() - INTERVAL '365 days'
 				GROUP BY 1 ORDER BY 1
 			`, [userId])).rows || []).map((r: any) => ({ day: r.day, checks: Number(r.checks) || 0, correct: Number(r.correct) || 0 }));
 
@@ -687,7 +721,7 @@ export function registerLessonRoutes(router: any, context: any) {
 				FROM listening_attempts a
 				JOIN listening_lessons l ON l.id = a.lesson_id
 				JOIN listening_skills s ON s.id = l.skill_id
-				WHERE a.user_id = ? AND a.answer IS DISTINCT FROM '[REVEALED]'
+				WHERE a.user_id = ? AND a.answer IS DISTINCT FROM '[REVEALED]' AND a.answer IS DISTINCT FROM '[HEARD]'
 				GROUP BY s.id, s.name, s.slug
 				ORDER BY checks DESC
 			`, [userId])).rows || []).map((r: any) => {
@@ -706,11 +740,12 @@ export function registerLessonRoutes(router: any, context: any) {
 		const userId = req.accountability?.user ?? null;
 		if (!userId) return res.status(401).json({ success: false, message: 'Unauthorized' });
 		try {
+			// Answers per Vietnam day: one row a day in user_daily_stats (lib/xp.ts)
 			const rows = (await database.raw(`
-				SELECT to_char(DATE(date_created AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Ho_Chi_Minh'), 'YYYY-MM-DD') AS day, COUNT(*)::int AS count
-				FROM listening_attempts
-				WHERE user_id = ? AND date_created >= NOW() - INTERVAL '365 days'
-				GROUP BY 1 ORDER BY 1
+				SELECT to_char(day, 'YYYY-MM-DD') AS day, attempts AS count
+				FROM user_daily_stats
+				WHERE user_id = ? AND attempts > 0 AND day > (now() AT TIME ZONE 'Asia/Ho_Chi_Minh')::date - 365
+				ORDER BY 1
 			`, [userId])).rows || [];
 			return res.json({ success: true, data: Object.fromEntries(rows.map((r: any) => [r.day, Number(r.count) || 0])) });
 		} catch (error) {
