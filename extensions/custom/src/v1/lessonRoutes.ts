@@ -50,7 +50,7 @@ async function readClips(database: any, lessonIds: string[]) {
 		.leftJoin('source_videos as sv', 'sv.id', 'c.source_video_id')
 		.select(
 			'c.id', 'c.lesson_id', 'c.step', 'c.sort', 'c.challenge_mode', 'c.answer', 'c.transcript', 'c.start_time', 'c.end_time',
-			'c.practice_lesson_id', 'c.explanation_en', 'c.explanation_vi', 'c.playback_rate',
+			'c.practice_lesson_id', 'c.explanation_en', 'c.explanation_vi', 'c.playback_rate', 'c.sounds_like',
 			'c.explanation_image', 'c.explanation_video', 'c.answer_format', 'c.choices',
 			'sv.id as video_id', 'sv.youtube_video_id', 'sv.title as video_title', 'sv.channel_name', 'sv.thumbnail_url',
 			'c.cues',
@@ -90,6 +90,8 @@ async function withPracticeLessons(database: any, g: LessonGraph, rows: any[]) {
 			// Its own explanation, else the one of the lesson it comes from
 			explanation_en: r.explanation_en, explanation_vi: r.explanation_vi,
 			playback_rate: r.playback_rate ?? src.playback_rate,
+			// Said by that clip's speaker, so its own respelling unless this clip has one
+			sounds_like: r.sounds_like || src.sounds_like,
 			practice_translations: trs.get(r.practice_lesson_id) || [],
 			// Its own image / video, else those of the lesson it comes from
 			explanation_image: r.explanation_image, explanation_video: r.explanation_video,
@@ -131,6 +133,8 @@ function clipOut(row: any, lessonText: string, mode: ReturnType<LessonGraph['gro
 		cues,
 		lines: cues ? null : sourceLines(row.source_lines),
 		translations: clipTranslations(row),
+		// How the phrase sounds here ("o-fyu-GO"); null = none
+		sounds_like: String(row.sounds_like ?? '').trim() || null,
 	};
 }
 
