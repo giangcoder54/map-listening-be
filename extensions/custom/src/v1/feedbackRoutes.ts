@@ -206,7 +206,7 @@ export function registerFeedbackRoutes(router: any, context: any) {
 				if (status) qb.where('a.status', status);
 				return qb;
 			};
-			const [rows, total, counts, clips, goals, goalOthers] = await Promise.all([
+			const [rows, total, counts, clips, goals, goalOthers, levels, goalLevels] = await Promise.all([
 				filtered()
 					.join('listening_lessons as l', 'l.id', 'a.lesson_id')
 					.leftJoin('listening_clips as c', 'c.id', 'a.clip_id')
@@ -254,6 +254,19 @@ export function registerFeedbackRoutes(router: any, context: any) {
 					.select('learning_goal_other as text', 'learning_goal_at as date', 'email')
 					.orderBy('learning_goal_at', 'desc')
 					.limit(30),
+				// Their listening level, one each (2026-10-30_listening_level.sql)
+				kind !== 'result' ? Promise.resolve([]) : database('directus_users')
+					.whereNotNull('listening_level')
+					.groupBy('listening_level')
+					.select('listening_level as level')
+					.count('* as n'),
+				// Goal x level: learners who answered both, one count per goal they picked
+				kind !== 'result' ? Promise.resolve({ rows: [] }) : database.raw(`
+					SELECT g AS goal, listening_level AS level, COUNT(*)::int AS n
+					FROM directus_users, jsonb_array_elements_text(learning_goals) AS g
+					WHERE jsonb_typeof(learning_goals) = 'array' AND listening_level IS NOT NULL
+					GROUP BY g, listening_level
+				`),
 			]);
 			const byQuestion: Record<string, Record<string, number>> = {};
 			for (const c of counts as any[]) (byQuestion[c.question] ||= {})[c.answer] = Number(c.n) || 0;
@@ -263,6 +276,12 @@ export function registerFeedbackRoutes(router: any, context: any) {
 					kind, rows, total: Number(total?.n) || 0, counts: byQuestion, clips,
 					user_goals: Object.fromEntries(((goals as any).rows || []).map((g: any) => [g.goal, Number(g.n) || 0])),
 					goal_others: goalOthers,
+					user_levels: Object.fromEntries((levels as any[]).map((l) => [l.level, Number(l.n) || 0])),
+					/** { goal: { level: n } } */
+					user_goal_levels: ((goalLevels as any).rows || []).reduce((acc: Record<string, Record<string, number>>, r: any) => {
+						(acc[r.goal] ||= {})[r.level] = Number(r.n) || 0;
+						return acc;
+					}, {}),
 				},
 			});
 		} catch (error) {

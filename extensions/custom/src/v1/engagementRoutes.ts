@@ -22,6 +22,8 @@ export { TZ, XP };
 export const REVIEW_INTERVALS = [1, 3, 7, 14, 30];
 /** Why they practise, one or more, no skip (2026-10-21_learning_goal.sql) */
 export const LEARNING_GOALS = ['exam', 'movies', 'work', 'general', 'other'];
+/** How well they understand spoken English, in their own view: one answer (2026-10-30_listening_level.sql) */
+export const LISTENING_LEVELS = ['beginner', 'elementary', 'intermediate', 'advanced'];
 
 /** Same normalisation as the lesson player (listening-lab/[id].vue) */
 export const normalizeAnswer = (text: string) =>
@@ -93,13 +95,14 @@ export function registerEngagementRoutes(router: any, context: any) {
 		const userId = needUser(req, res);
 		if (!userId) return;
 		try {
-			const row = await database('directus_users').select('daily_goal', 'leaderboard_hidden', 'learning_goals', 'practice_prefs').where('id', userId).first();
+			const row = await database('directus_users').select('daily_goal', 'leaderboard_hidden', 'learning_goals', 'listening_level', 'practice_prefs').where('id', userId).first();
 			return res.json({
 				success: true,
 				data: {
 					daily_goal: Number(row?.daily_goal) || DEFAULT_GOAL,
 					leaderboard_hidden: !!row?.leaderboard_hidden,
 					learning_goals: Array.isArray(row?.learning_goals) ? row.learning_goals : null,
+					listening_level: row?.listening_level || null,
 					/** null: never set, the page keeps what this browser has */
 					practice: row?.practice_prefs ? practicePrefsOf(row.practice_prefs) : null,
 				},
@@ -110,13 +113,14 @@ export function registerEngagementRoutes(router: any, context: any) {
 	});
 
 	// body: { daily_goal?: 20..500, leaderboard_hidden?: boolean, learning_goals?: LEARNING_GOALS[] (1+), learning_goal_other?: string,
-	//         practice?: { voice?: 'type' | 'listen', challenge?: 'easy' | 'medium' | 'hard' } }
+	//         listening_level?: LISTENING_LEVELS, practice?: { voice?: 'type' | 'listen', challenge?: 'easy' | 'medium' | 'hard' } }
 	router.patch('/me/settings', async (req: any, res: any) => {
 		const userId = needUser(req, res);
 		if (!userId) return;
 		const body = req.body || {};
 		const patch: Record<string, any> = {};
-		let goals: { learning_goals: string[]; learning_goal_other: string | null; learning_goal_at: string } | null = null;
+		/** Survey answers: read from users/me, so written through the users service (below) */
+		let goals: Record<string, any> | null = null;
 		if (body.daily_goal !== undefined) {
 			const goal = Math.round(Number(body.daily_goal));
 			if (!Number.isFinite(goal) || goal < 20 || goal > 500) return res.status(400).json({ success: false, message: 'Daily goal must be 20-500 XP' });
@@ -146,6 +150,12 @@ export function registerEngagementRoutes(router: any, context: any) {
 				learning_goal_at: new Date().toISOString(),
 			};
 		}
+		if (body.listening_level !== undefined) {
+			if (!LISTENING_LEVELS.includes(String(body.listening_level))) {
+				return res.status(400).json({ success: false, message: 'Invalid listening level' });
+			}
+			goals = { ...goals, listening_level: String(body.listening_level), listening_level_at: new Date().toISOString() };
+		}
 		if (!Object.keys(patch).length && !goals) return res.status(400).json({ success: false, message: 'Nothing to update' });
 		try {
 			if (Object.keys(patch).length) await database('directus_users').where('id', userId).update(patch);
@@ -155,7 +165,10 @@ export function registerEngagementRoutes(router: any, context: any) {
 				const users = new services.UsersService({ schema: req.schema, accountability: { admin: true } });
 				await users.updateOne(userId, goals);
 			}
-			return res.json({ success: true, data: goals ? { ...patch, learning_goals: goals.learning_goals } : patch });
+			return res.json({
+				success: true,
+				data: goals ? { ...patch, learning_goals: goals.learning_goals, listening_level: goals.listening_level } : patch,
+			});
 		} catch (error) {
 			return fail(res, 'Save settings', error);
 		}
