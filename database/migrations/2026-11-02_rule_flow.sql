@@ -72,6 +72,27 @@ FROM ranked r WHERE r.id = c.id;
 
 -- At most one core clip per lesson
 CREATE UNIQUE INDEX IF NOT EXISTS listening_clips_one_core ON listening_clips (lesson_id) WHERE role = 'core';
+
+-- The admin clip editor still saves `step`: a clip saved without a role gets one from its
+-- step (the lesson's first step-1 clip = core). An explicit role is never overwritten.
+CREATE OR REPLACE FUNCTION listening_clips_role_from_step() RETURNS trigger AS $$
+BEGIN
+	IF NEW.step IS NULL OR NEW.lesson_id IS NULL THEN RETURN NEW; END IF;
+	IF TG_OP = 'UPDATE' AND NEW.role IS NOT NULL AND NEW.role IS DISTINCT FROM OLD.role THEN RETURN NEW; END IF;
+	IF TG_OP = 'UPDATE' AND NEW.role IS NOT NULL AND NEW.step IS NOT DISTINCT FROM OLD.step THEN RETURN NEW; END IF;
+	NEW.role := CASE NEW.step
+		WHEN 'type' THEN CASE WHEN EXISTS (
+				SELECT 1 FROM listening_clips c WHERE c.lesson_id = NEW.lesson_id AND c.role = 'core' AND c.id <> NEW.id
+			) THEN 'pool' ELSE 'core' END
+		WHEN 'voice' THEN 'voice'
+		WHEN 'challenge' THEN 'challenge'
+		ELSE 'pool'
+	END;
+	RETURN NEW;
+END $$ LANGUAGE plpgsql;
+DROP TRIGGER IF EXISTS listening_clips_role_from_step ON listening_clips;
+CREATE TRIGGER listening_clips_role_from_step BEFORE INSERT OR UPDATE OF step, role, lesson_id ON listening_clips
+	FOR EACH ROW EXECUTE FUNCTION listening_clips_role_from_step();
 CREATE INDEX IF NOT EXISTS listening_clips_pool_idx ON listening_clips (lesson_id, role, status);
 
 -- Other rules a clip shows ("not at all": Flap T + linking); its main rule is lesson_id
