@@ -11,7 +11,9 @@ import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 import { readdirSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
-import { RUN, drawLesson, formatFor, isRight, summaryOf, withRetry, type PoolClip, type RunItem } from '../src/lib/runs';
+import { RUN, drawLesson, drawReview, drawTest, formatFor, isRight, passed, summaryOf, weakestForms, withRetry, type PoolClip, type RunItem } from '../src/lib/runs';
+import { gradeOf, masteryOf, schedule } from '../src/lib/review';
+import { Rating } from 'ts-fsrs';
 import { COIN, CoinError, buyFreeze, earnCoins, unlockLesson, walletOf } from '../src/lib/coins';
 
 const PNPM = '/directus/node_modules/.pnpm';
@@ -159,6 +161,113 @@ describe('retry and summary', () => {
 		assert.equal(s.hinted, true);
 		assert.equal(s.finished, true);
 		assert.equal(s.right, 3);
+	});
+});
+
+describe('skip-ahead and final tests', () => {
+	const form = (lessonId: string, pool = 6, traps = 1, difficulties = [1, 2, 3]) => ({
+		lessonId,
+		clips: [
+			...Array.from({ length: pool }, (_, i) => clip('pool', { difficulty: difficulties[i % difficulties.length]! })),
+			...Array.from({ length: traps }, () => clip('trap')),
+			clip('core'), clip('voice'),
+		],
+	});
+
+	test('the size asked, from pool and trap clips only', () => {
+		const items = drawTest([form('a')], 4);
+		assert.equal(items.length, 4);
+		assert.ok(items.every((it) => it.phase === 'test' && it.lesson_id === 'a'));
+	});
+
+	test('every form of the rule is asked about, evenly', () => {
+		for (let k = 0; k < 30; k++) {
+			const items = drawTest([form('a'), form('b'), form('c'), form('d')], 8);
+			const per = new Map<string, number>();
+			for (const it of items) per.set(it.lesson_id!, (per.get(it.lesson_id!) || 0) + 1);
+			assert.deepEqual([...per.values()].sort(), [2, 2, 2, 2]);
+		}
+	});
+
+	test('a trap is always there when the forms have one', () => {
+		for (let k = 0; k < 50; k++) {
+			const f = [form('a', 8, 0), form('b', 8, 1)];
+			const traps = new Set(f.flatMap((x) => x.clips.filter((c) => c.role === 'trap').map((c) => c.id)));
+			assert.ok(drawTest(f, 3).some((it) => traps.has(it.clip_id)));
+		}
+	});
+
+	test('difficulties are mixed, not all hard', () => {
+		const items = drawTest([form('a', 9, 0)], 5);
+		const all = form('a').clips; // ids differ: look the drawn ones up by difficulty through a fresh pool
+		const f = form('x', 9, 0);
+		const drawn = drawTest([f], 5).map((it) => f.clips.find((c) => c.id === it.clip_id)!.difficulty);
+		assert.ok(items.length === 5 && all.length > 0);
+		assert.ok(drawn.filter((d) => d === 3).length <= 1, `at most one hard in five: ${drawn}`);
+		assert.ok(drawn.includes(1) && drawn.includes(2));
+	});
+
+	test('clips not met come first; a small pool gives a shorter test', () => {
+		const f = form('a', 6, 0);
+		const met = new Set(f.clips.slice(0, 3).map((c) => c.id));
+		for (const it of drawTest([f], 3, met)) assert.ok(!met.has(it.clip_id));
+		assert.equal(drawTest([form('b', 2, 0)], 5).length, 2);
+	});
+
+	test('pass mark and weakest forms', () => {
+		const r = (correct: boolean) => ({ correct, answer: '', listens: 1, slow: false, hint: false });
+		const items = [
+			{ clip_id: '1', lesson_id: 'a', phase: 'test', format: 'type', result: r(true) },
+			{ clip_id: '2', lesson_id: 'a', phase: 'test', format: 'type', result: r(true) },
+			{ clip_id: '3', lesson_id: 'b', phase: 'test', format: 'type', result: r(false) },
+			{ clip_id: '4', lesson_id: 'b', phase: 'test', format: 'type', result: r(true) },
+			{ clip_id: '5', lesson_id: 'c', phase: 'test', format: 'type', result: r(true) },
+		] as RunItem[];
+		assert.equal(passed(items, 0.8), true, '4/5 = 80%');
+		items[0]!.result = r(false);
+		assert.equal(passed(items, 0.8), false, '3/5');
+		assert.deepEqual(weakestForms(items).map((w) => w.lessonId).sort(), ['a', 'b']);
+	});
+});
+
+describe('reviews', () => {
+	test('one new clip per form due, in order, up to the limit', () => {
+		const forms = ['a', 'b', 'c'].map((id) => ({ lessonId: id, clips: [clip('pool'), clip('pool'), clip('trap')] }));
+		const met = new Set([forms[0]!.clips[0]!.id, forms[0]!.clips[1]!.id]);
+		const items = drawReview(forms, 2, met);
+		assert.deepEqual(items.map((it) => it.lesson_id), ['a', 'b']);
+		assert.equal(items[0]!.clip_id, forms[0]!.clips[2]!.id, 'the clip not met yet');
+		assert.ok(items.every((it) => it.phase === 'review'));
+	});
+
+	test('grades: miss Again, slow Hard, 2nd listen Good, 1st listen Easy', () => {
+		const g = (o: Partial<{ correct: boolean; listens: number; slow: boolean; hint: boolean }>) =>
+			gradeOf({ correct: true, listens: 1, slow: false, hint: false, ...o });
+		assert.equal(g({ correct: false }), Rating.Again);
+		assert.equal(g({ hint: true }), Rating.Again);
+		assert.equal(g({ slow: true }), Rating.Hard);
+		assert.equal(g({ listens: 3 }), Rating.Hard);
+		assert.equal(g({ listens: 2 }), Rating.Good);
+		assert.equal(g({}), Rating.Easy);
+	});
+
+	test('a miss brings the form back sooner than an easy answer', () => {
+		const now = new Date('2026-03-04T05:00:00Z');
+		const first = schedule(null, Rating.Good, now);
+		const later = new Date(first.due.getTime() + 60_000);
+		const missed = schedule({ ...first, due: first.due, last_review: now }, Rating.Again, later);
+		const easy = schedule({ ...first, due: first.due, last_review: now }, Rating.Easy, later);
+		assert.ok(missed.due < easy.due);
+		assert.ok(easy.due.getTime() - later.getTime() >= 86_400_000, 'whole days only');
+	});
+
+	test('mastery fades without review', () => {
+		const now = new Date('2026-03-04T05:00:00Z');
+		const card = { ...schedule(null, Rating.Good, now), last_review: now };
+		const soon = masteryOf([card], new Date(now.getTime() + 86_400_000));
+		const late = masteryOf([card], new Date(now.getTime() + 60 * 86_400_000));
+		assert.ok(soon > late);
+		assert.equal(masteryOf([]), 0);
 	});
 });
 

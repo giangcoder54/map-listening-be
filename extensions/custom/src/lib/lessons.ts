@@ -186,6 +186,19 @@ export async function loadLessonGraph(req: any, context: any) {
 	/** Open: free content, a Premium learner, or a lesson bought with Xu (kept after Premium ends) */
 	const isLocked = (l: LessonRow) => !premium && isPremiumContent(l) && !unlocked.has(l.id);
 	const numberOf = (l: LessonRow) => (lessonsBySkill.get(l.skill_id) || []).findIndex((x) => x.id === l.id) + 1;
+	/**
+	 * The lessons of a rule open one after the other for a signed-in learner: a lesson opens
+	 * once every lesson before it is done or skipped by a test (its skip-ahead test is always
+	 * there). A lesson already started stays open. Guests keep no progress: nothing is locked.
+	 */
+	const isOrderLocked = (l: LessonRow) => {
+		if (!userId || done.has(l.id) || started.has(l.id)) return false;
+		for (const x of lessonsBySkill.get(l.skill_id) || []) {
+			if (x.id === l.id) return false;
+			if (!done.has(x.id)) return true;
+		}
+		return false;
+	};
 
 	/** Public card of a lesson. `text` is the answer in one-answer groups: only once done. */
 	const lessonCard = (l: LessonRow) => {
@@ -200,6 +213,8 @@ export async function loadLessonGraph(req: any, context: any) {
 			locked: isLocked(l),
 			/** Bought with Xu */
 			unlocked: unlocked.has(l.id),
+			/** An earlier lesson of the rule is not done yet: learn it, or pass this one's skip-ahead test */
+			order_locked: isOrderLocked(l),
 			kind: l.kind || 'pattern',
 			done: done.has(l.id),
 			tested_out: testedOut.has(l.id),
@@ -260,7 +275,7 @@ export async function loadLessonGraph(req: any, context: any) {
 
 	return {
 		userId, premium, groups, groupById, skills, skillById, lessons: playable, lessonById, lessonsBySkill, clipStats,
-		done, started, skillOf, groupOf, isPremiumContent, isLocked, numberOf, lessonCard, nextOf, skillSummary, groupSummary, findLesson,
+		done, started, testedOut, skillOf, groupOf, isPremiumContent, isLocked, isOrderLocked, numberOf, lessonCard, nextOf, skillSummary, groupSummary, findLesson,
 	};
 }
 

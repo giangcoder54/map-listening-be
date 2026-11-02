@@ -18,6 +18,8 @@ export const COIN = {
 	unlock: { pattern: 150, trap: 150, mixed: 250 } as Record<string, number>,
 	weeklyUnlocks: 2,
 	freeze: 50,
+	/** A rule's test is free once a day; another go the same day costs this */
+	retest: 30,
 };
 
 export type CoinReason = 'lesson' | 'perfect' | 'goal' | 'streak' | 'review' | 'ad' | 'unlock' | 'premium_day' | 'freeze' | 'retest' | 'refund' | 'admin';
@@ -95,6 +97,14 @@ export async function unlockLesson(db: any, userId: string, lesson: { id: string
 		const paid = await spend(trx, userId, price, 'unlock', `unlock:${lesson.id}`, lesson.id, today);
 		await trx('listening_unlocks').insert({ user_id: userId, lesson_id: lesson.id, source: 'coins', coin_event_id: paid.eventId });
 		return { price, coins: paid.coins };
+	});
+}
+
+/** Pay for another go at a rule's test today; `n` = goes already taken today (the key holds it) */
+export async function payRetest(db: any, userId: string, skillId: string, n: number, today = vnDay()) {
+	return db.transaction(async (trx: any) => {
+		const paid = await spend(trx, userId, COIN.retest, 'retest', `retest:${skillId}:${today}:${n}`, null, today);
+		return { coins: paid.coins };
 	});
 }
 
