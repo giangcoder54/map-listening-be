@@ -268,6 +268,16 @@ WITH gift AS (
 UPDATE user_xp u SET coins = u.coins + g.amount, coins_earned_total = u.coins_earned_total + g.amount
 FROM gift g WHERE g.user_id = u.user_id;
 
+-- ── Content editors write the new lesson fields (their policy lists fields one by one) ──
+UPDATE directus_permissions p SET fields = p.fields || ',kind,explain_clear_url,explain_natural_url,explanation_image,explanation_video'
+FROM directus_policies pol
+WHERE pol.id = p.policy AND pol.name = 'Content Editor Access' AND p.collection = 'listening_lessons'
+	AND p.action IN ('create', 'update') AND p.fields <> '*' AND p.fields NOT LIKE '%explain_clear_url%';
+UPDATE directus_permissions p SET fields = p.fields || ',title'
+FROM directus_policies pol
+WHERE pol.id = p.policy AND pol.name = 'Content Editor Access' AND p.collection = 'listening_lessons_translations'
+	AND p.action = 'update' AND p.fields <> '*' AND p.fields NOT LIKE '%title%';
+
 -- ── Indexes Postgres never makes for foreign keys (read on hot paths) ──
 CREATE INDEX IF NOT EXISTS listening_lessons_translations_owner ON listening_lessons_translations (listening_lessons_id);
 CREATE INDEX IF NOT EXISTS listening_skills_translations_owner ON listening_skills_translations (listening_skills_id);

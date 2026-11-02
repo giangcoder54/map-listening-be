@@ -6,30 +6,35 @@
  *
  *   GET /admin/lessons        ?skill=<uuid> &author=me|none|<uuid> &state=all|needs_work|drafts
  *                             &q=<phrase> &page=1 &limit=50
- *                             -> rows (skill order, then lesson order) with clips per step,
+ *                             -> rows (skill order, then lesson order) with clips per role,
  *                                total, and the count of each state tab for the other filters
  *   GET /admin/lessons/stats  every lesson: total, published, drafts, needs work, premium,
  *                             hidden, overall and per skill
+ *   GET /admin/lessons/:id/readiness   the publish checklist of a lesson (lib/readiness.ts)
+ *   GET /admin/skills/:id/test-readiness  can the rule's skip-ahead / final test be drawn
  *
  * "Needs work" is what the page flags on a row (src/utils/adminLessons.ts lessonIssues):
- * not published, or no clip in Step 1, 2 or 3. "Hidden": published without a Step 1 clip
- * (the site does not show it). "Premium": the lesson, its skill or its group is premium.
+ * not published, or short of clips of a role (lib/readiness.ts READY; focus, choices and
+ * explanation are checked on the lesson page). "Hidden": published without a core or pool
+ * clip (the site does not show it). "Premium": the lesson, its skill or its group is premium.
  */
 import { UUID_RE } from '../lib/lessons';
 import { isStaff } from '../lib/staff';
+import { READY, readinessOf, skillTestReadiness } from '../lib/readiness';
 
 const STATES = ['all', 'needs_work', 'drafts'] as const;
 type State = (typeof STATES)[number];
 
-/** Clips per step of every lesson */
+/** Clips per role of every lesson */
 const CLIPS = `
 	SELECT lesson_id,
-		count(*) FILTER (WHERE step = 'type')::int AS type,
-		count(*) FILTER (WHERE step = 'voice')::int AS voice,
-		count(*) FILTER (WHERE step = 'challenge')::int AS challenge,
-		count(*) FILTER (WHERE step = 'more')::int AS more
+		count(*) FILTER (WHERE role = 'core')::int AS core,
+		count(*) FILTER (WHERE role = 'voice')::int AS voice,
+		count(*) FILTER (WHERE role = 'pool')::int AS pool,
+		count(*) FILTER (WHERE role = 'challenge')::int AS challenge,
+		count(*) FILTER (WHERE role = 'trap')::int AS trap
 	FROM listening_clips
-	WHERE lesson_id IS NOT NULL
+	WHERE lesson_id IS NOT NULL AND status = 'published'
 	GROUP BY lesson_id`;
 
 /** Lessons of a skill that sits in a group: the ones the page lists */
@@ -40,8 +45,10 @@ const FROM = `
 	LEFT JOIN clips c ON c.lesson_id = l.id`;
 
 const DRAFT = `l.status IS DISTINCT FROM 'published'`;
-const NEEDS_WORK = `(${DRAFT} OR coalesce(c.type, 0) = 0 OR coalesce(c.voice, 0) = 0 OR coalesce(c.challenge, 0) = 0)`;
-const HIDDEN = `(l.status = 'published' AND coalesce(c.type, 0) = 0)`;
+const SHORT = `(coalesce(c.core, 0) <> ${READY.core} OR coalesce(c.voice, 0) < ${READY.voice} OR coalesce(c.pool, 0) < ${READY.pool}
+	OR coalesce(c.challenge, 0) < ${READY.challenge} OR coalesce(c.trap, 0) < ${READY.trap})`;
+const NEEDS_WORK = `(${DRAFT} OR ${SHORT})`;
+const HIDDEN = `(l.status = 'published' AND coalesce(c.core, 0) + coalesce(c.pool, 0) = 0)`;
 const PREMIUM = `(coalesce(l.is_premium, false) OR coalesce(s.is_premium, false) OR coalesce(g.is_premium, false))`;
 const STATE_SQL: Record<State, string | null> = { all: null, needs_work: NEEDS_WORK, drafts: DRAFT };
 
@@ -112,8 +119,8 @@ export function registerAdminLessonRoutes(router: any, context: any) {
 				WITH clips AS (${CLIPS})
 				SELECT l.id, l.text, l.status, l.is_premium, l.difficulty, l.sort, l.short_id, l.skill_id, l.published_at,
 					l.user_created AS author_id, u.first_name AS author_first_name, u.last_name AS author_last_name,
-					coalesce(c.type, 0) AS type, coalesce(c.voice, 0) AS voice,
-					coalesce(c.challenge, 0) AS challenge, coalesce(c.more, 0) AS more,
+					coalesce(c.core, 0) AS core, coalesce(c.voice, 0) AS voice, coalesce(c.pool, 0) AS pool,
+					coalesce(c.challenge, 0) AS challenge, coalesce(c.trap, 0) AS trap,
 					count(*) OVER (PARTITION BY l.skill_id)::int AS skill_matches,
 					count(*) OVER ()::int AS total
 				${FROM}
@@ -148,7 +155,7 @@ export function registerAdminLessonRoutes(router: any, context: any) {
 					skill_id: r.skill_id,
 					published_at: r.published_at,
 					user_created: r.author_id ? { id: r.author_id, first_name: r.author_first_name, last_name: r.author_last_name } : null,
-					counts: { type: r.type, voice: r.voice, challenge: r.challenge, more: r.more },
+					counts: { core: r.core, voice: r.voice, pool: r.pool, challenge: r.challenge, trap: r.trap },
 				})),
 				// Lessons of each skill on this page that match, on every page
 				skill_totals: Object.fromEntries(list.map((r) => [r.skill_id, r.skill_matches])),
@@ -175,5 +182,17 @@ export function registerAdminLessonRoutes(router: any, context: any) {
 		const keys = ['total', 'published', 'drafts', 'needs_work', 'premium', 'hidden'] as const;
 		const totals = Object.fromEntries(keys.map((k) => [k, bySkill.reduce((n, r) => n + (Number(r[k]) || 0), 0)]));
 		return res.json({ success: true, data: { totals, by_skill: bySkill } });
+	}));
+
+	router.get('/admin/lessons/:id/readiness', staff(async (req, res) => {
+		const id = String(req.params.id || '');
+		if (!UUID_RE.test(id)) return res.status(400).json({ success: false, message: 'Invalid lesson' });
+		return res.json({ success: true, data: await readinessOf(database, id) });
+	}));
+
+	router.get('/admin/skills/:id/test-readiness', staff(async (req, res) => {
+		const id = String(req.params.id || '');
+		if (!UUID_RE.test(id)) return res.status(400).json({ success: false, message: 'Invalid skill' });
+		return res.json({ success: true, data: await skillTestReadiness(database, id) });
 	}));
 }
