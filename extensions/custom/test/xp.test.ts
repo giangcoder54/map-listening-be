@@ -14,7 +14,7 @@ import { createRequire } from 'node:module';
 import { readdirSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import {
-	FREEZE_EVERY_XP, GOAL_DAYS_FOR_REWARD, LEVELS, MAX_FREEZES, XP,
+	GOAL_DAYS_FOR_REWARD, LEVELS, MAX_FREEZES, XP,
 	engagementOf, grantRewards, lessonXp, levelOf, recordPractice, type NewReward,
 } from '../src/lib/xp';
 
@@ -47,27 +47,16 @@ const reachGoal = async (n: number, goal = 30) => {
 	return rewards.filter((r) => r.kind === 'premium_day');
 };
 
-/** A lesson with `clips` step-1 clips (and a step-2 one): group, skill, lesson, clips */
-const makeLesson = async (clips = 5) => {
+/** A lesson: group, skill, lesson */
+const makeLesson = async () => {
 	const k = randomUUID().slice(0, 8);
 	const [g] = await trx('listening_groups').insert({ name: `T ${k}`, slug: `t-${k}` }).returning('id');
 	const [sk] = await trx('listening_skills').insert({ group_id: g.id, name: `T ${k}`, slug: `t-${k}` }).returning('id');
 	const [l] = await trx('listening_lessons').insert({ skill_id: sk.id, short_id: `t${k}`, text: `phrase ${k}` }).returning('id');
-	const ids = Array.from({ length: clips }, () => randomUUID());
-	await trx('listening_clips').insert([
-		...ids.map((id) => ({ id, lesson_id: l.id, step: 'type' })),
-		{ id: randomUUID(), lesson_id: l.id, step: 'voice' },
-	]);
-	return { id: l.id as string, clips: ids };
+	return { id: l.id as string };
 };
-/** An answer on day n, at noon in Vietnam: right, wrong, or "show answer" */
-const answer = (n: number, clipId: string, kind: 'right' | 'wrong' | 'reveal' = 'right') =>
-	trx('listening_attempts').insert({
-		id: randomUUID(), user_id: user, clip_id: clipId, is_correct: kind === 'right',
-		answer: kind === 'reveal' ? '[REVEALED]' : 'x', date_created: `${day(n)}T05:00:00Z`,
-	});
-const answerAll = async (n: number, lesson: { clips: string[] }) => { for (const c of lesson.clips) await answer(n, c); };
-const finish = (n: number, lesson: { id: string }) => lessonXp(trx, user, lesson.id, day(n));
+/** A run of the lesson finished on day n; hinted = an answer was looked at */
+const finish = (n: number, lesson: { id: string }, hinted = false) => lessonXp(trx, user, lesson.id, hinted, day(n));
 const account = () => trx('user_xp').where('user_id', user).first();
 const eng = (n: number) => engagementOf(trx, user, day(n));
 
@@ -84,45 +73,26 @@ beforeEach(async () => {
 afterEach(async () => trx.rollback());
 
 describe('XP rules (by lesson)', () => {
-	test('a lesson gives 20 XP the first time, whatever its number of clips', async () => {
-		const five = await makeLesson(5);
-		await answerAll(0, five);
-		assert.deepEqual(await finish(0, five).then(({ xp, kind }) => ({ xp, kind })), { xp: XP.lesson, kind: 'new' });
-		const one = await makeLesson(1);
-		await answerAll(0, one);
-		assert.equal((await finish(0, one)).xp, XP.lesson, 'one clip or five: the same');
+	test('a lesson gives 20 XP the first time', async () => {
+		const a = await makeLesson();
+		assert.deepEqual(await finish(0, a).then(({ xp, kind }) => ({ xp, kind })), { xp: XP.lesson, kind: 'new' });
+		const b = await makeLesson();
+		assert.equal((await finish(0, b)).xp, XP.lesson);
 		assert.equal((await account()).xp_total, 2 * XP.lesson);
 	});
 
-	test('an answer of step 1 looked at: 10 XP instead of 20', async () => {
-		const lesson = await makeLesson(3);
-		await answer(0, lesson.clips[1]!, 'reveal');
-		await answerAll(0, lesson);
-		const won = await finish(0, lesson);
+	test('an answer looked at: 10 XP instead of 20', async () => {
+		const won = await finish(0, await makeLesson(), true);
 		assert.equal(won.xp, XP.lessonRevealed);
 		assert.equal(won.kind, 'revealed');
 	});
 
-	test('wrong tries before the right one cost nothing', async () => {
-		const lesson = await makeLesson(2);
-		await answer(0, lesson.clips[0]!, 'wrong');
-		await answer(0, lesson.clips[0]!, 'wrong');
-		await answerAll(0, lesson);
-		assert.equal((await finish(0, lesson)).xp, XP.lesson);
-	});
-
-	test('done again: 5 XP, once a day, only when step 1 was answered right again that day', async () => {
-		const lesson = await makeLesson(3);
-		await answerAll(0, lesson);
+	test('done again: 5 XP, once a day, from the next day on', async () => {
+		const lesson = await makeLesson();
 		assert.equal((await finish(0, lesson)).xp, XP.lesson);
 		assert.deepEqual(await finish(0, lesson).then(({ xp, kind }) => ({ xp, kind })), { xp: 0, kind: null }, 'the same day');
-		assert.equal((await finish(1, lesson)).xp, 0, 'next day, without answering: nothing');
-		await answer(1, lesson.clips[0]!);
-		assert.equal((await finish(1, lesson)).xp, 0, 'only part of step 1 done again');
-		await answerAll(1, lesson);
 		assert.deepEqual(await finish(1, lesson).then(({ xp, kind }) => ({ xp, kind })), { xp: XP.replay, kind: 'replay' });
 		assert.equal((await finish(1, lesson)).xp, 0, 'twice the same day');
-		await answerAll(2, lesson);
 		assert.equal((await finish(2, lesson)).xp, XP.replay, 'and again the next day');
 	});
 
@@ -212,23 +182,11 @@ describe('Streak freezes', () => {
 		assert.equal((await eng(1)).freezes, 1);
 	});
 
-	test('a freeze every 500 XP, as a reward', async () => {
-		await trx('user_xp').insert({ user_id: user, xp_total: FREEZE_EVERY_XP - 10 });
+	test('XP no longer gives freezes (they are bought with Xu)', async () => {
+		await trx('user_xp').insert({ user_id: user, xp_total: 190 });
 		const { rewards } = await gain(0);
-		assert.deepEqual(rewards, [{ kind: 'freeze', days: 0, key: 'freeze:1' }]);
-		const acc = await account();
-		assert.equal(acc.freezes, 1);
-		assert.equal(acc.freezes_awarded, 1);
-		assert.equal((await gain(0)).rewards.length, 0, 'not again before the next 500');
-	});
-
-	test(`never more than ${MAX_FREEZES} held`, async () => {
-		await trx('user_xp').insert({ user_id: user, xp_total: 2 * FREEZE_EVERY_XP - 10, freezes: MAX_FREEZES, freezes_awarded: 1 });
-		const { rewards } = await gain(0);
-		assert.equal(rewards.length, 0, 'full: no reward to show');
-		const acc = await account();
-		assert.equal(acc.freezes, MAX_FREEZES);
-		assert.equal(acc.freezes_awarded, 2, 'the 1000 is used up all the same');
+		assert.equal(rewards.length, 0);
+		assert.equal((await account()).freezes, 0);
 	});
 });
 

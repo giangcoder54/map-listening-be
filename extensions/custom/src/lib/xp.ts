@@ -19,11 +19,13 @@
  *   Days are Vietnam days.
  */
 import { activatePremiumForUser } from '../utils';
+import { COIN } from './coins';
 
-export const TZ = 'Asia/Ho_Chi_Minh';
+import { TZ, vnDay } from './days';
+
+export { TZ, vnDay };
 export const XP = { lesson: 20, lessonRevealed: 10, replay: 5, review: 5 };
-/** A streak freeze per this much lifetime XP (10 lessons), at most MAX_FREEZES held */
-export const FREEZE_EVERY_XP = 200;
+/** Streak freezes held at most; they are bought with Xu (lib/coins.ts) */
 export const MAX_FREEZES = 2;
 /** Daily goal reached this many days in a row: REWARD_PREMIUM_DAYS of Premium */
 export const GOAL_DAYS_FOR_REWARD = 7;
@@ -40,8 +42,6 @@ export type NewReward = { kind: 'premium_day' | 'freeze'; days: number; key: str
 
 const AMOUNT: Record<XpRule['reason'], number> = { lesson: XP.lesson, replay: XP.replay, review: XP.review };
 
-/** 'YYYY-MM-DD' in Vietnam */
-export const vnDay = (date = new Date()) => new Intl.DateTimeFormat('en-CA', { timeZone: TZ }).format(date);
 const addDays = (day: string, n: number) => {
 	const d = new Date(`${day}T00:00:00Z`);
 	d.setUTCDate(d.getUTCDate() + n);
@@ -123,21 +123,9 @@ export async function recordPractice(database: any, userId: string, opts: { atte
 
 		const rewards: NewReward[] = [];
 		if (won) {
-			// Lifetime XP, and a freeze for each 500 reached
+			// Lifetime XP. Streak freezes are bought with Xu now (lib/coins.ts buyFreeze)
 			const total = (Number(acc.xp_total) || 0) + won;
-			const blocks = Math.floor(total / FREEZE_EVERY_XP);
-			const fresh = await trx('user_xp').select('freezes', 'freezes_awarded').where('user_id', userId).first();
-			const newBlocks = blocks - (Number(fresh.freezes_awarded) || 0);
-			const patch: Record<string, any> = { xp_total: total, date_updated: trx.fn.now() };
-			if (newBlocks > 0) {
-				patch.freezes_awarded = blocks;
-				patch.freezes = Math.min(MAX_FREEZES, (Number(fresh.freezes) || 0) + newBlocks);
-				if (patch.freezes > (Number(fresh.freezes) || 0)) {
-					await trx('user_rewards').insert({ user_id: userId, kind: 'freeze', dedupe_key: `freeze:${blocks}` }).onConflict(['user_id', 'dedupe_key']).ignore();
-					rewards.push({ kind: 'freeze', days: 0, key: `freeze:${blocks}` });
-				}
-			}
-			await trx('user_xp').where('user_id', userId).update(patch);
+			await trx('user_xp').where('user_id', userId).update({ xp_total: total, date_updated: trx.fn.now() });
 
 			// Today's goal just reached: the 7th (14th...) goal day in a row gives a Premium day
 			const xpBefore = Number(before?.xp) || 0;
@@ -218,7 +206,9 @@ export async function engagementOf(database: any, userId: string, today = vnDay(
 		levels: LEVELS,
 		freezes: acc.freezes,
 		max_freezes: MAX_FREEZES,
-		freeze_every: FREEZE_EVERY_XP,
+		freeze_price: COIN.freeze,
+		coins: Number(acc.coins) || 0,
+		coins_cap: COIN.cap,
 		// Days in a row with the daily goal reached (today counts once reached)
 		goal_days: goalRun,
 		goal_met_today: xpToday >= goal,
@@ -228,32 +218,21 @@ export async function engagementOf(database: any, userId: string, today = vnDay(
 }
 
 /**
- * The result card of a lesson (POST /listening-lab/lessons/:key/progress), once the server
- * found step 1 all right:
- *   - first time: +20, or +10 if an answer of step 1 was looked at ("Show answer")
- *   - finished on an earlier day: +5, once a day, and only when step 1 was answered right
- *     again today (calling the endpoint alone gives nothing; nor does a second go the same day)
+ * A lesson run finished (POST /listening-lab/runs/:id/finish: the server saw every item
+ * answered, lib/runs.ts):
+ *   - first time: +20, or +10 if an answer was looked at ("I can't hear it")
+ *   - finished on an earlier day: +5, once a day (a second go the same day gives nothing)
  * kind: what the XP was for, null when nothing was won (already counted today).
  */
-export async function lessonXp(database: any, userId: string, lessonId: string, today = vnDay()) {
-	const step1 = database('listening_clips').select('id').where({ lesson_id: lessonId, step: 'type' });
-	const revealed = await database('listening_attempts')
-		.where({ user_id: userId, answer: '[REVEALED]' }).whereIn('clip_id', step1).first('id');
+export async function lessonXp(database: any, userId: string, lessonId: string, hinted: boolean, today = vnDay()) {
 	const first = await recordPractice(database, userId, {
-		xp: { reason: 'lesson', dedupe: `lesson:${lessonId}`, lessonId, amount: revealed ? XP.lessonRevealed : XP.lesson },
+		xp: { reason: 'lesson', dedupe: `lesson:${lessonId}`, lessonId, amount: hinted ? XP.lessonRevealed : XP.lesson },
 	}, today);
-	if (first.xp) return { ...first, kind: revealed ? 'revealed' as const : 'new' as const };
+	if (first.xp) return { ...first, kind: hinted ? 'revealed' as const : 'new' as const };
 
 	const none = { xp: 0, rewards: [] as NewReward[], kind: null };
 	const firstDone = await database('xp_events').where({ user_id: userId, dedupe_key: `lesson:${lessonId}` }).first('day');
 	if (!firstDone || dayOf(firstDone.day) >= today) return none;
-	const dayStart = (await database.raw(`SELECT (?::date::timestamp AT TIME ZONE '${TZ}') AS t`, [today])).rows[0].t;
-	const notToday = await database('listening_clips as c')
-		.where({ 'c.lesson_id': lessonId, 'c.step': 'type' })
-		.whereNotExists(database('listening_attempts as a').whereRaw('a.clip_id = c.id')
-			.where({ 'a.user_id': userId, 'a.is_correct': true }).where('a.date_created', '>=', dayStart))
-		.first('c.id');
-	if (notToday) return none;
 	const again = await recordPractice(database, userId, { xp: { reason: 'replay', dedupe: `replay:${lessonId}:${today}`, lessonId } }, today);
 	return { ...again, kind: again.xp ? 'replay' as const : null };
 }

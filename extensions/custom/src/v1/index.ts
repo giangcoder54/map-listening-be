@@ -6,6 +6,7 @@ import { handleYoutubeCrawl } from './youtube';
 import { handleVideoTranscripts } from './videoTranscripts';
 import { ensurePaymentSchema } from '../lib/paymentSchema';
 import { registerLessonRoutes } from './lessonRoutes';
+import { registerRunRoutes } from './runRoutes';
 import { ensurePhraseRequestsTable, handlePhraseRequest } from '../lib/phraseRequests';
 import { registerGrowthRoutes } from './growthRoutes';
 import { registerEngagementRoutes } from './engagementRoutes';
@@ -250,6 +251,7 @@ export default defineEndpoint((router, context) => {
 
 	// Listening Lab: groups > skills > lessons (see ./lessonRoutes.ts)
 	registerLessonRoutes(router, context);
+	registerRunRoutes(router, context);
 
 	// Growth: referral / affiliate / coupons, XP + review, placement test,
 	// blog, ops (health, error reports, contact) and their admin. See docs/growth-roadmap.md (web repo).
