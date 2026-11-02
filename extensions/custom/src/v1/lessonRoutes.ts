@@ -16,6 +16,7 @@
  */
 import { UUID_RE, answerOf, loadLessonGraph, type LessonGraph, type LessonRow } from '../lib/lessons';
 import { COIN } from '../lib/coins';
+import { masteryOf } from '../lib/review';
 
 const badKey = (key: string) => !key || key.length > 64;
 
@@ -276,12 +277,43 @@ export function registerLessonRoutes(router: any, context: any) {
 			const skill = g.skills.find((x) => x.slug === slug);
 			if (!skill) return res.status(404).json({ success: false, message: 'Skill not found' });
 			const group = g.groupById.get(skill.group_id)!;
+			const lessons = g.lessonsBySkill.get(skill.id) || [];
+			// The learner on this rule: learning / mastered / tested out, the bar that fades without
+			// review, and the rule's test (skip it: Premium; final test: once every open lesson is done)
+			let standing: any = null;
+			if (g.userId) {
+				const [row, cards, settings, tried] = await Promise.all([
+					database('listening_skill_progress').where({ user_id: g.userId, skill_id: skill.id }).first(),
+					database('listening_review_cards as c').join('listening_lessons as l', 'l.id', 'c.lesson_id')
+						.select('c.*').where({ 'c.user_id': g.userId, 'l.skill_id': skill.id }),
+					database('listening_skills').select('test_size', 'pass_ratio').where('id', skill.id).first(),
+					database('listening_runs').where({ user_id: g.userId, mode: 'skill_test', skill_id: skill.id })
+						.where('started_at', '>=', database.raw(`date_trunc('day', now() AT TIME ZONE 'Asia/Ho_Chi_Minh') AT TIME ZONE 'Asia/Ho_Chi_Minh'`))
+						.count('* as n').first(),
+				]);
+				const open = lessons.filter((l) => !g.isLocked(l));
+				const allDone = open.length > 0 && open.every((l) => g.done.has(l.id));
+				standing = {
+					status: row?.status || (cards.length ? 'learning' : null),
+					mastery: Math.round(masteryOf(cards) * 100),
+					lessons_done: lessons.filter((l) => g.done.has(l.id)).length,
+					test: {
+						kind: allDone ? 'final' : 'skip',
+						available: open.length > 0 && (allDone || g.premium),
+						size: Number(settings?.test_size) || 8,
+						pass: Math.round((Number(settings?.pass_ratio) || 0.8) * 100),
+						// A second go the same day costs Xu
+						retest_price: Number(tried?.n) > 0 ? COIN.retest : 0,
+					},
+				};
+			}
 			return res.json({
 				success: true,
 				data: {
 					premium: g.premium,
 					skill: { ...g.skillSummary(skill), group: { id: group.id, name: group.name, slug: group.slug, answer_mode: group.answer_mode } },
-					lessons: (g.lessonsBySkill.get(skill.id) || []).map(g.lessonCard),
+					lessons: lessons.map(g.lessonCard),
+					standing,
 				},
 			});
 		} catch (error) {

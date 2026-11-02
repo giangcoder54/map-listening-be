@@ -19,12 +19,17 @@
 import { normalizeAnswer } from '../v1/engagementRoutes';
 
 export const RUN = { pre: 3, voice: 2, practice: 6, challenge: 1, post: 3, maxListens: 3 };
+/** Skip-ahead of one lesson: a few new phrases, 2 listens, no slow play nor "I can't hear it" */
+export const LESSON_TEST = { size: 4, maxListens: 2 };
+/** Listens per item by run mode */
+export const MAX_LISTENS: Record<string, number> = { learn: RUN.maxListens, review: RUN.maxListens, lesson_test: LESSON_TEST.maxListens, skill_test: LESSON_TEST.maxListens };
 
-export type Phase = 'pre' | 'voice' | 'practice' | 'retry' | 'challenge' | 'post';
+export type Phase = 'pre' | 'voice' | 'practice' | 'retry' | 'challenge' | 'post' | 'test' | 'review';
 export type Format = 'type' | 'gap' | 'choice' | 'tap';
 export const FORMATS: Format[] = ['type', 'gap', 'choice', 'tap'];
 export type ItemResult = { correct: boolean; answer: string; listens: number; slow: boolean; hint: boolean };
-export type RunItem = { clip_id: string; phase: Phase; format: Format; result?: ItemResult | null };
+/** lesson_id: the form the clip belongs to (tests of a rule and reviews mix forms) */
+export type RunItem = { clip_id: string; phase: Phase; format: Format; lesson_id?: string; result?: ItemResult | null };
 
 /** What drawing needs to know of a clip */
 export type PoolClip = {
@@ -123,6 +128,91 @@ export function drawLesson(pool: PoolClip[], met: Set<string> = new Set(), rand:
 		...challenge.map((c) => item(c, 'challenge')),
 		...post.map((c) => item(c, 'post')),
 	];
+}
+
+/** Clips not met first, in random order */
+const freshFirst = (list: PoolClip[], met: Set<string>, rand: () => number) =>
+	shuffle(list, rand).sort((a, b) => Number(met.has(a.id)) - Number(met.has(b.id)));
+
+/** Difficulty wanted for the n-th test item: easy and medium mostly, a hard one in five */
+const DIFFICULTY_CYCLE = [1, 2, 2, 1, 3];
+
+/**
+ * A skip-ahead or final test, drawn for each learner and each try from the pool and trap
+ * clips of the given forms (one form: a lesson's skip-ahead; every form of a rule: the
+ * rule's test). The rules every draw keeps:
+ *   - the forms take turns, so each one is asked about (as evenly as `size` allows)
+ *   - at least one trap when the forms have one
+ *   - difficulties mixed (DIFFICULTY_CYCLE), clips the learner has not met first
+ * Items are typed (the whole phrase, or the part with the rule for a long sentence).
+ */
+export function drawTest(
+	forms: { lessonId: string; clips: PoolClip[] }[],
+	size: number,
+	met: Set<string> = new Set(),
+	rand: () => number = Math.random,
+): RunItem[] {
+	const queues = shuffle(forms, rand)
+		.map((f) => ({ lessonId: f.lessonId, left: freshFirst(f.clips.filter((c) => c.role === 'pool' || c.role === 'trap'), met, rand) }))
+		.filter((q) => q.left.length);
+	const picked: { lessonId: string; clip: PoolClip }[] = [];
+	// Not met comes first, then the difficulty wanted among those
+	const takeFrom = (q: (typeof queues)[number], want: number) => {
+		const fresh = q.left.filter((c) => !met.has(c.id)).length || q.left.length;
+		const i = Math.max(0, q.left.slice(0, fresh).findIndex((c) => (c.difficulty ?? 2) === want));
+		return q.left.splice(i, 1)[0]!;
+	};
+	let turn = 0;
+	while (picked.length < size && queues.some((q) => q.left.length)) {
+		const q = queues[turn % queues.length]!;
+		turn++;
+		if (!q.left.length) continue;
+		picked.push({ lessonId: q.lessonId, clip: takeFrom(q, DIFFICULTY_CYCLE[picked.length % DIFFICULTY_CYCLE.length]!) });
+	}
+	// A trap that did not come up in turn replaces a pick of the same form, so the forms stay even
+	if (picked.length && !picked.some((p) => p.clip.role === 'trap')) {
+		const q = queues.find((x) => x.left.some((c) => c.role === 'trap'));
+		if (q) {
+			const trap = q.left.splice(q.left.findIndex((c) => c.role === 'trap'), 1)[0]!;
+			let at = picked.map((p) => p.lessonId).lastIndexOf(q.lessonId);
+			if (at < 0) at = picked.length - 1;
+			picked[at] = { lessonId: q.lessonId, clip: trap };
+		}
+	}
+	return shuffle(picked, rand).map((p) => ({ clip_id: p.clip.id, lesson_id: p.lessonId, phase: 'test', format: formatFor(p.clip, 'post'), result: null }));
+}
+
+/**
+ * A review: one new clip for each form due (in the order given, most overdue first), at most
+ * `limit`. Clips the learner has met come last, so a review is a phrase not heard before
+ * whenever the pool still has one.
+ */
+export function drawReview(
+	due: { lessonId: string; clips: PoolClip[] }[],
+	limit: number,
+	met: Set<string> = new Set(),
+	rand: () => number = Math.random,
+): RunItem[] {
+	const out: RunItem[] = [];
+	for (const form of due) {
+		if (out.length >= limit) break;
+		const clip = freshFirst(form.clips.filter((c) => c.role === 'pool' || c.role === 'trap' || c.role === 'core'), met, rand)[0];
+		if (clip) out.push({ clip_id: clip.id, lesson_id: form.lessonId, phase: 'review', format: formatFor(clip, 'post'), result: null });
+	}
+	return out;
+}
+
+/** Passed a skip-ahead or final test: at least `ratio` of the items right */
+export const passed = (items: RunItem[], ratio: number) => {
+	const done = items.filter((it) => it.result);
+	return done.length > 0 && done.filter((it) => it.result!.correct).length / done.length >= ratio - 1e-9;
+};
+
+/** The forms missed most in a test, worst first: where to send a learner who failed */
+export function weakestForms(items: RunItem[]) {
+	const miss = new Map<string, number>();
+	for (const it of items) if (it.lesson_id && it.result && !it.result.correct) miss.set(it.lesson_id, (miss.get(it.lesson_id) || 0) + 1);
+	return [...miss.entries()].sort((a, b) => b[1] - a[1]).map(([lessonId, missed]) => ({ lessonId, missed }));
 }
 
 /** Right or wrong, by format: the phrase, or only the part with the rule (gap, tap) */

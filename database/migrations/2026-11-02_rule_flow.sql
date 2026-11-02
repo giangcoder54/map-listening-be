@@ -207,6 +207,7 @@ CREATE TABLE IF NOT EXISTS listening_review_cards (
 	difficulty      double precision NOT NULL DEFAULT 0,
 	elapsed_days    integer NOT NULL DEFAULT 0,
 	scheduled_days  integer NOT NULL DEFAULT 0,
+	learning_steps  integer NOT NULL DEFAULT 0,
 	reps            integer NOT NULL DEFAULT 0,
 	lapses          integer NOT NULL DEFAULT 0,
 	state           smallint NOT NULL DEFAULT 0,
@@ -214,10 +215,22 @@ CREATE TABLE IF NOT EXISTS listening_review_cards (
 	source          varchar(20) NOT NULL DEFAULT 'learned' CHECK (source IN ('learned', 'tested_out')),
 	PRIMARY KEY (user_id, lesson_id)
 );
+ALTER TABLE listening_review_cards ADD COLUMN IF NOT EXISTS learning_steps integer NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS listening_review_cards_due ON listening_review_cards (user_id, due);
 CREATE INDEX IF NOT EXISTS listening_review_cards_lesson ON listening_review_cards (lesson_id);
 
 ALTER TABLE user_daily_stats ADD COLUMN IF NOT EXISTS reviews smallint NOT NULL DEFAULT 0;
+
+-- Review moves from clips to forms: what was waiting in the old clip queue keeps its date,
+-- and every lesson already finished gets its first review a day after it was finished
+INSERT INTO listening_review_cards (user_id, lesson_id, due, source)
+SELECT user_id, lesson_id, min(due_at), 'learned' FROM listening_reviews
+WHERE lesson_id IS NOT NULL GROUP BY user_id, lesson_id
+ON CONFLICT (user_id, lesson_id) DO NOTHING;
+INSERT INTO listening_review_cards (user_id, lesson_id, due, source)
+SELECT user_id, lesson_id, coalesce(completed_at, date_updated, now()) + interval '1 day', 'learned'
+FROM listening_progress WHERE status = 'completed'
+ON CONFLICT (user_id, lesson_id) DO NOTHING;
 
 -- ── Xu: ledger + balance, lessons bought ──────────────────────────────
 ALTER TABLE user_xp ADD COLUMN IF NOT EXISTS coins integer NOT NULL DEFAULT 0;
