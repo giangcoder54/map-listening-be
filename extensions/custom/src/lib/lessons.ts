@@ -2,16 +2,15 @@
  * Listening Lab: groups, skills, lessons and clips.
  *
  *   listening_groups     Connected Speech         answer_mode, is_premium
- *     listening_skills   H-dropping               category ("Elision"), is_premium
- *       listening_lessons  "tell him"             text = the answer, is_premium, sort
- *         listening_clips  step type | voice | challenge (+ challenge_mode, answer)
+ *     listening_skills   H-dropping (a rule)      category ("Elision"), is_premium, pass_ratio
+ *       listening_lessons  one form of the rule   text = its typical phrase, kind, is_premium, sort
+ *         listening_clips  the lesson's pool       role core | voice | pool | challenge | trap
  *
- * A lesson is played as: 1 type (its "type" clips) -> 2 voice -> 3 challenge ->
- * 4 more (the "type" clip of other lessons of the same skill) -> result.
- * A step with no clip is left out. Every clip of a step has to be answered.
+ * A lesson is played as a run (lib/runs.ts): the server draws its items from the pool.
  *
  * Premium: a lesson is locked for a free learner when its group, its skill or the lesson
- * itself is premium. Progress lives in listening_progress (one row per user x lesson).
+ * itself is premium, unless they bought it with Xu (listening_unlocks, lib/coins.ts).
+ * Progress lives in listening_progress (one row per user x lesson).
  */
 import { isPremiumUser } from './premium';
 
@@ -67,6 +66,7 @@ export type LessonRow = {
 	sort: number | null;
 	learners_count: number | null;
 	date_created: string | null;
+	kind?: 'pattern' | 'trap' | 'mixed' | null;
 };
 
 const bySort = (a: { sort: number | null; name?: string }, b: { sort: number | null; name?: string }) =>
@@ -81,12 +81,13 @@ export const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f
  * the lesson text.
  */
 export function answerOf(
-	clip: { answer?: string | null; transcript?: string | null; step?: string | null; challenge_mode?: string | null },
+	clip: { answer?: string | null; transcript?: string | null; step?: string | null; role?: string | null; challenge_mode?: string | null },
 	lessonText: string,
 	mode: AnswerMode,
 ) {
 	if (clip.answer && clip.answer.trim()) return clip.answer.trim();
-	if (mode === 'per_clip' || clip.step === 'more' || (clip.step === 'challenge' && clip.challenge_mode === 'sentence')) {
+	const otherPhrase = clip.step === 'more' || (clip.step !== 'type' && (clip.role === 'pool' || clip.role === 'trap'));
+	if (mode === 'per_clip' || otherPhrase || (clip.step === 'challenge' && clip.challenge_mode === 'sentence')) {
 		const m = String(clip.transcript || '').match(/\[([^\]]+)\]/);
 		if (m?.[1]) return m[1].replace(/\s+/g, ' ').trim();
 	}
@@ -105,18 +106,17 @@ export async function loadLessonGraph(req: any, context: any) {
 	const [groupRows, skillRows, lessonRows, groupTr, skillTr, clipRows] = await Promise.all([
 		database('listening_groups').select('id', 'name', 'slug', 'sort', 'answer_mode', 'is_premium').where('status', 'published'),
 		database('listening_skills').select('id', 'group_id', 'name', 'slug', 'sort', 'category', 'is_premium').where('status', 'published'),
-		database('listening_lessons').select('id', 'skill_id', 'short_id', 'text', 'difficulty', 'is_premium', 'sort', 'learners_count', 'date_created').where('status', 'published'),
+		database('listening_lessons').select('id', 'skill_id', 'short_id', 'text', 'difficulty', 'is_premium', 'sort', 'learners_count', 'date_created', 'kind').where('status', 'published'),
 		database('listening_groups_translations').select('listening_groups_id as owner', 'languages_code', 'description'),
 		database('listening_skills_translations').select('listening_skills_id as owner', 'languages_code', 'description', 'example'),
 		database.raw(`
 			SELECT c.lesson_id,
 				COUNT(*)::int AS total_clips,
-				COUNT(*) FILTER (WHERE c.step = 'type')::int AS type_clips,
-				ARRAY_AGG(DISTINCT c.step) AS steps,
-				(ARRAY_AGG(sv.thumbnail_url ORDER BY (c.step = 'type') DESC, c.sort NULLS LAST, c.id))[1] AS thumbnail
+				COUNT(*) FILTER (WHERE c.role IN ('core', 'pool'))::int AS type_clips,
+				(ARRAY_AGG(sv.thumbnail_url ORDER BY (c.role = 'core') DESC, c.sort NULLS LAST, c.id))[1] AS thumbnail
 			FROM listening_clips c
 			LEFT JOIN source_videos sv ON sv.id = c.source_video_id
-			WHERE c.lesson_id IS NOT NULL AND c.step IS NOT NULL
+			WHERE c.lesson_id IS NOT NULL AND c.role IS NOT NULL AND c.status = 'published'
 			GROUP BY c.lesson_id
 		`),
 	]);
@@ -144,12 +144,11 @@ export async function loadLessonGraph(req: any, context: any) {
 	const skillById = new Map(skills.map((s) => [s.id, s]));
 	const lessons: LessonRow[] = lessonRows.filter((l: any) => skillById.has(l.skill_id));
 
-	const clipStats = new Map<string, { total: number; type: number; thumbnail: string; steps: StepKey[] }>();
+	const clipStats = new Map<string, { total: number; type: number; thumbnail: string }>();
 	for (const row of clipRows?.rows || []) {
-		const steps = CLIP_STEPS.filter((s) => (row.steps || []).includes(s));
-		clipStats.set(row.lesson_id, { total: Number(row.total_clips) || 0, type: Number(row.type_clips) || 0, thumbnail: row.thumbnail || '', steps });
+		clipStats.set(row.lesson_id, { total: Number(row.total_clips) || 0, type: Number(row.type_clips) || 0, thumbnail: row.thumbnail || '' });
 	}
-	// A lesson without a step-1 clip cannot be played: it is not listed anywhere
+	// A lesson without a clip to type (core or pool) cannot be played: it is not listed anywhere
 	const playable = lessons.filter((l) => (clipStats.get(l.id)?.type || 0) > 0);
 
 	const lessonsBySkill = new Map<string, LessonRow[]>();
@@ -161,33 +160,31 @@ export async function loadLessonGraph(req: any, context: any) {
 	const lessonById = new Map(playable.map((l) => [l.id, l]));
 
 	const done = new Set<string>();
+	const testedOut = new Set<string>();
 	const started = new Set<string>();
+	const unlocked = new Set<string>();
+	let premium = false;
 	if (userId) {
-		const rows = await database('listening_progress').select('lesson_id', 'status').where('user_id', userId);
-		for (const r of rows) (r.status === 'completed' ? done : started).add(r.lesson_id);
-	}
-	// Lessons being worked on: the furthest step answered in, shown as "Step 3 of 4"
-	const stepReached = new Map<string, number>();
-	if (userId && started.size) {
-		const rows = await database('listening_attempts')
-			.select('lesson_id', database.raw('ARRAY_AGG(DISTINCT step) AS steps'))
-			.where('user_id', userId)
-			.whereIn('lesson_id', [...started])
-			.groupBy('lesson_id');
+		const [rows, buys, isPremium] = await Promise.all([
+			database('listening_progress').select('lesson_id', 'status').where('user_id', userId),
+			database('listening_unlocks').select('lesson_id').where('user_id', userId),
+			isPremiumUser(database, userId, logger),
+		]);
 		for (const r of rows) {
-			const own = clipStats.get(r.lesson_id)?.steps || [];
-			const reached = Math.max(-1, ...(r.steps || []).map((s: StepKey) => own.indexOf(s)));
-			if (reached >= 0) stepReached.set(r.lesson_id, reached + 1);
+			if (r.status === 'in_progress') started.add(r.lesson_id);
+			else done.add(r.lesson_id);
+			if (r.status === 'tested_out') testedOut.add(r.lesson_id);
 		}
+		for (const r of buys) unlocked.add(r.lesson_id);
+		premium = isPremium;
 	}
-
-	const premium = userId ? await isPremiumUser(database, userId, logger) : false;
 
 	const skillOf = (l: LessonRow) => skillById.get(l.skill_id)!;
 	const groupOf = (l: LessonRow) => groupById.get(skillOf(l).group_id)!;
 	/** Premium content: the lesson, its skill or its group. */
 	const isPremiumContent = (l: LessonRow) => l.is_premium || skillOf(l).is_premium || groupOf(l).is_premium;
-	const isLocked = (l: LessonRow) => !premium && isPremiumContent(l);
+	/** Open: free content, a Premium learner, or a lesson bought with Xu (kept after Premium ends) */
+	const isLocked = (l: LessonRow) => !premium && isPremiumContent(l) && !unlocked.has(l.id);
 	const numberOf = (l: LessonRow) => (lessonsBySkill.get(l.skill_id) || []).findIndex((x) => x.id === l.id) + 1;
 
 	/** Public card of a lesson. `text` is the answer in one-answer groups: only once done. */
@@ -201,12 +198,12 @@ export async function loadLessonGraph(req: any, context: any) {
 			difficulty: l.difficulty,
 			is_premium: isPremiumContent(l),
 			locked: isLocked(l),
+			/** Bought with Xu */
+			unlocked: unlocked.has(l.id),
+			kind: l.kind || 'pattern',
 			done: done.has(l.id),
+			tested_out: testedOut.has(l.id),
 			in_progress: started.has(l.id),
-			/** In progress: the step reached, e.g. { step: 3, steps: 4 } */
-			progress_step: started.has(l.id) && stepReached.has(l.id)
-				? { step: stepReached.get(l.id)!, steps: clipStats.get(l.id)?.steps.length || 0 }
-				: null,
 			total_clips: clipStats.get(l.id)?.total || 0,
 			learners_count: Number(l.learners_count) || 0,
 			date_created: l.date_created,

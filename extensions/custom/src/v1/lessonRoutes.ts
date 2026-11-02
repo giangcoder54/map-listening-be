@@ -4,12 +4,9 @@
  *   GET  /listening-lab/groups                 every group with its skills + "continue" card
  *   GET  /listening-lab/groups/:slug           one group and its skills
  *   GET  /listening-lab/skills/:slug           one skill and its lessons, in order
- *   GET  /listening-lab/lessons/:key           a lesson to play: steps + clips (:key = short_id or id)
+ *   GET  /listening-lab/lessons/:key           a lesson: card, explanation, lock (:key = short_id or id);
+ *                                              its items come with a run (v1/runRoutes.ts)
  *   GET  /listening-lab/lessons/:key/next      what to do after this lesson
- *   POST /listening-lab/lessons/:key/progress  result card reached: save status / score, XP won
- *   GET  /listening-lab/lessons/:key/attempts  this learner's answers per clip (to resume)
- *   POST /listening-lab/attempts               one Check / Show answer on a clip (the server checks
- *                                              the answer itself; XP: lib/xp.ts)
  *   GET  /listening-lab/progress/clips         clip ids this learner answered right
  *   GET  /listening-lab/my-progress            profile page
  *   GET  /listening-lab/my-activity            daily counts for the heatmap
@@ -17,40 +14,19 @@
  * The answer of a one-answer lesson is its text: lesson cards only show it once the
  * learner has finished the lesson.
  */
-import { isPremiumUser } from '../lib/premium';
-import { CLIP_STEPS, UUID_RE, answerOf, loadLessonGraph, type LessonGraph, type LessonRow, type StepKey } from '../lib/lessons';
-import { normalizeAnswer, scheduleReview } from './engagementRoutes';
-import { grantRewards, lessonXp, recordPractice } from '../lib/xp';
+import { UUID_RE, answerOf, loadLessonGraph, type LessonGraph, type LessonRow } from '../lib/lessons';
+import { COIN } from '../lib/coins';
 
-const ANON_ID_RE = /^[A-Za-z0-9-]{16,64}$/;
-/** listening_attempts.mode: the way the clip was played (2026-10-26_practice_modes.sql) */
-const ATTEMPT_MODES = ['phrase', 'sentence', 'speed', 'sentence_medium', 'sentence_easy', 'speed_easy'];
 const badKey = (key: string) => !key || key.length > 64;
 
-/**
- * The answer of a clip, as the lesson page gets it (clipOut, withPracticeLessons): a step-4
- * clip borrowing another lesson takes that lesson's answer.
- */
-async function clipAnswer(database: any, clip: any) {
-	if (clip.step === 'more' && clip.practice_lesson_id && !(clip.answer && clip.answer.trim())) {
-		const [other, src] = await Promise.all([
-			database('listening_lessons').select('text').where('id', clip.practice_lesson_id).first(),
-			database('listening_clips').select('answer').where({ lesson_id: clip.practice_lesson_id, step: 'type' })
-				.orderBy([{ column: 'sort', order: 'asc', nulls: 'last' }, { column: 'id' }]).first(),
-		]);
-		return answerOf({ ...clip, answer: src?.answer || other?.text || '' }, clip.text, clip.answer_mode);
-	}
-	return answerOf(clip, clip.text, clip.answer_mode);
-}
-
 /** Clip fields a player needs, with the video it comes from. */
-async function readClips(database: any, lessonIds: string[]) {
+export async function readClips(database: any, lessonIds: string[]) {
 	if (!lessonIds.length) return [];
 	return database('listening_clips as c')
 		.leftJoin('source_videos as sv', 'sv.id', 'c.source_video_id')
 		.select(
-			'c.id', 'c.lesson_id', 'c.step', 'c.sort', 'c.challenge_mode', 'c.answer', 'c.transcript', 'c.start_time', 'c.end_time',
-			'c.practice_lesson_id', 'c.explanation_en', 'c.explanation_vi', 'c.playback_rate', 'c.sounds_like',
+			'c.id', 'c.lesson_id', 'c.step', 'c.role', 'c.focus_text', 'c.difficulty', 'c.sort', 'c.challenge_mode', 'c.answer', 'c.transcript',
+			'c.start_time', 'c.end_time', 'c.explanation_en', 'c.explanation_vi', 'c.playback_rate', 'c.sounds_like',
 			'c.explanation_image', 'c.explanation_video', 'c.answer_format', 'c.choices',
 			'sv.id as video_id', 'sv.youtube_video_id', 'sv.title as video_title', 'sv.channel_name', 'sv.thumbnail_url',
 			'c.cues',
@@ -61,51 +37,16 @@ async function readClips(database: any, lessonIds: string[]) {
 			['$[*] ? (@.end > $s && @.start < $e)']),
 		)
 		.whereIn('c.lesson_id', lessonIds)
-		.whereNotNull('c.step')
+		.whereNotNull('c.role')
+		.where('c.status', 'published')
 		.orderBy([{ column: 'c.sort', order: 'asc', nulls: 'last' }, { column: 'c.id' }]);
-}
-
-/**
- * Step-4 clips that point to another lesson take that lesson's step-1 clip (video, times,
- * transcript) and its text as the answer. Locked or clip-less lessons are left out.
- * The clip keeps its own id and lesson, so answering it never counts for that lesson.
- */
-async function withPracticeLessons(database: any, g: LessonGraph, rows: any[]) {
-	const ids = [...new Set(rows.filter((r) => r.step === 'more' && r.practice_lesson_id).map((r) => r.practice_lesson_id as string))];
-	if (!ids.length) return rows;
-	const firstClip = new Map<string, any>();
-	const [clipRows, trs, media] = await Promise.all([readClips(database, ids), lessonTranslations(database, ids), lessonMedia(database, ids)]);
-	for (const row of clipRows) {
-		if (row.step === 'type' && !firstClip.has(row.lesson_id)) firstClip.set(row.lesson_id, row);
-	}
-	return rows.flatMap((r) => {
-		if (r.step !== 'more' || !r.practice_lesson_id) return [r];
-		const other = g.lessonById.get(r.practice_lesson_id);
-		const src = firstClip.get(r.practice_lesson_id);
-		if (!other || !src || g.isLocked(other)) return [];
-		return [{
-			...src,
-			id: r.id, lesson_id: r.lesson_id, step: r.step, sort: r.sort, challenge_mode: null,
-			answer: r.answer || src.answer || other.text,
-			// Its own explanation, else the one of the lesson it comes from
-			explanation_en: r.explanation_en, explanation_vi: r.explanation_vi,
-			playback_rate: r.playback_rate ?? src.playback_rate,
-			// Said by that clip's speaker, so its own respelling unless this clip has one
-			sounds_like: r.sounds_like || src.sounds_like,
-			practice_translations: trs.get(r.practice_lesson_id) || [],
-			// Its own image / video, else those of the lesson it comes from
-			explanation_image: r.explanation_image, explanation_video: r.explanation_video,
-			practice_media: mediaOf(src) || media.get(r.practice_lesson_id) || null,
-			answer_format: r.answer_format, choices: r.choices,
-		}];
-	});
 }
 
 /**
  * @param pool phrases the wrong choices are picked from when the admin set none (other
  *             lessons of the skill, other answers of the lesson)
  */
-function clipOut(row: any, lessonText: string, mode: ReturnType<LessonGraph['groupOf']>['answer_mode'], open: boolean, pool: string[] = []) {
+export function clipOut(row: any, lessonText: string, mode: ReturnType<LessonGraph['groupOf']>['answer_mode'], open: boolean, pool: string[] = []) {
 	const video = {
 		id: row.video_id,
 		youtube_video_id: row.youtube_video_id,
@@ -113,7 +54,7 @@ function clipOut(row: any, lessonText: string, mode: ReturnType<LessonGraph['gro
 		channel_name: row.channel_name,
 		thumbnail_url: row.thumbnail_url,
 	};
-	const base = { id: row.id, lesson_id: row.lesson_id, step: row.step as StepKey, sort: row.sort, mode: row.challenge_mode || null, rate: Number(row.playback_rate) || null, video };
+	const base = { id: row.id, lesson_id: row.lesson_id, role: row.role, sort: row.sort, mode: row.challenge_mode || null, rate: Number(row.playback_rate) || null, video };
 	if (!open) return { ...base, answer: null, transcript: null, start_time: null, end_time: null, cues: null, lines: null, format: 'type', choices: null, media: null };
 	const cues = cuesOf(row.cues);
 	const answer = answerOf(row, lessonText, mode);
@@ -124,8 +65,8 @@ function clipOut(row: any, lessonText: string, mode: ReturnType<LessonGraph['gro
 		// 'choice': pick the answer among `choices` instead of typing it
 		format: choices ? 'choice' : 'type',
 		choices,
-		// Image / video of its explanation; null = the lesson's (steps 1-3)
-		media: mediaOf(row) || row.practice_media || null,
+		// Image / video of its explanation; null = the lesson's
+		media: mediaOf(row),
 		transcript: row.transcript,
 		start_time: row.start_time,
 		end_time: row.end_time,
@@ -161,7 +102,7 @@ function seededShuffle<T>(list: T[], seed: string): T[] {
  * Choices of a "pick the answer" clip: the answer and the wrong ones set by the admin, else 3
  * phrases of the pool. Null when there is nothing to put next to the answer.
  */
-function choicesOf(row: any, answer: string, pool: string[]): string[] | null {
+export function choicesOf(row: any, answer: string, pool: string[]): string[] | null {
 	const list = typeof row.choices === 'string' ? safeJson(row.choices) : row.choices;
 	const key = normPhrase(answer);
 	const seen = new Set([key]);
@@ -205,7 +146,7 @@ function mediaOf(row: any): { image: string | null; video: { id: string; start: 
 	return image || video ? { image, video } : null;
 }
 
-async function lessonMedia(database: any, lessonIds: string[]) {
+export async function lessonMedia(database: any, lessonIds: string[]) {
 	const map = new Map<string, ReturnType<typeof mediaOf>>();
 	if (!lessonIds.length) return map;
 	const rows = await database('listening_lessons').select('id', 'explanation_image', 'explanation_video').whereIn('id', lessonIds);
@@ -239,23 +180,18 @@ function safeJson(text: string) {
 	try { return JSON.parse(text); } catch { return null; }
 }
 
-/**
- * Explanation of a clip, shaped like the lesson's translations. Empty: the page shows the
- * lesson's (steps 1-3) or nothing (step 4, whose clips are other phrases).
- */
+/** Explanation of a clip, shaped like the lesson's translations. Empty: the page shows the lesson's. */
 function clipTranslations(row: any): { languages_code: string; explanation: string | null; tips?: string | null }[] {
-	const own = [
+	return [
 		{ languages_code: 'en', explanation: row.explanation_en },
 		{ languages_code: 'vi', explanation: row.explanation_vi },
 	].filter((tr) => tr.explanation && String(tr.explanation).trim());
-	if (own.length) return own;
-	return row.practice_translations || [];
 }
 
-async function lessonTranslations(database: any, lessonIds: string[]) {
+export async function lessonTranslations(database: any, lessonIds: string[]) {
 	if (!lessonIds.length) return new Map<string, any[]>();
 	const rows = await database('listening_lessons_translations')
-		.select('listening_lessons_id as lesson_id', 'languages_code', 'explanation', 'tips')
+		.select('listening_lessons_id as lesson_id', 'languages_code', 'title', 'explanation', 'tips')
 		.whereIn('listening_lessons_id', lessonIds);
 	const map = new Map<string, any[]>();
 	for (const { lesson_id, ...tr } of rows) {
@@ -354,49 +290,57 @@ export function registerLessonRoutes(router: any, context: any) {
 	});
 
 	// ── One lesson ────────────────────────────────────────────────────────
-	// Locked lesson: same shape, but no answer, transcript, times or explanation, so the
-	// page can still render its preview (video title, thumbnail) for visitors and SEO.
+	// Card, explanation and lock. The items to answer come with a run (v1/runRoutes.ts).
+	// Locked lesson: no text or explanation, but its preview (video title, thumbnail) for
+	// visitors and SEO, and the Xu price to buy it. A lesson merged into another form answers
+	// { redirect: short_id }.
 	router.get('/listening-lab/lessons/:key', async (req: any, res: any) => {
 		const key = String(req.params.key || '');
 		if (badKey(key)) return res.status(400).json({ success: false, message: 'Invalid lesson key' });
 		try {
 			const g = await loadLessonGraph(req, context);
 			const lesson = g.findLesson(key);
-			if (!lesson) return res.status(404).json({ success: false, message: 'Lesson not found' });
+			if (!lesson) {
+				const moved = await database('listening_lessons as l')
+					.join('listening_lessons as t', 't.id', 'l.redirect_lesson_id')
+					.where(UUID_RE.test(key) ? { 'l.id': key } : { 'l.short_id': key })
+					.first('t.short_id');
+				if (moved) return res.json({ success: true, data: { redirect: moved.short_id } });
+				return res.status(404).json({ success: false, message: 'Lesson not found' });
+			}
 
 			const skill = g.skillOf(lesson);
 			const group = g.groupOf(lesson);
 			const open = !g.isLocked(lesson);
-			const [own, trs, media] = await Promise.all([readClips(database, [lesson.id]), lessonTranslations(database, [lesson.id]), lessonMedia(database, [lesson.id])]);
-			const rows = await withPracticeLessons(database, g, own);
-			// Wrong choices: the other answers of the lesson (per-clip groups), then the other lessons of the skill
-			const others = (g.lessonsBySkill.get(skill.id) || []).filter((l) => l.id !== lesson.id).map((l) => l.text);
-			const answers = group.answer_mode === 'per_clip' ? rows.map((r: any) => answerOf(r, lesson.text, group.answer_mode)) : [];
-			const pool = [...answers, ...others].filter(Boolean) as string[];
-			const clips = rows.map((r: any) => clipOut(r, lesson.text, group.answer_mode, open, r.step === 'more' ? others : pool));
-
-			const steps: { key: StepKey; mode?: string; count?: number }[] = [];
-			for (const key of CLIP_STEPS) {
-				const own = clips.filter((c: any) => c.step === key);
-				if (!own.length) continue;
-				steps.push(key === 'challenge' ? { key, mode: own[0]!.mode || 'speed' } : { key });
-			}
+			const [rows, trs, media, extra] = await Promise.all([
+				readClips(database, [lesson.id]),
+				lessonTranslations(database, [lesson.id]),
+				lessonMedia(database, [lesson.id]),
+				database('listening_lessons').select('explain_clear_url', 'explain_natural_url').where('id', lesson.id).first(),
+			]);
+			const first = rows.find((r: any) => r.role === 'core') || rows[0];
+			const preview = first ? clipOut(first, lesson.text, group.answer_mode, false).video : null;
 
 			return res.json({
 				success: true,
 				data: {
 					locked: !open,
 					premium: g.premium,
+					unlock: !open ? { price: COIN.unlock[lesson.kind || 'pattern'] ?? COIN.unlock.pattern } : null,
 					lesson: {
 						...g.lessonCard(lesson),
 						text: open ? lesson.text : null,
 						translations: open ? trs.get(lesson.id) || [] : [],
 						media: open ? media.get(lesson.id) || null : null,
+						// "Said clearly" and "said naturally", side by side on the explanation screen
+						explain_audio: open && (extra?.explain_clear_url || extra?.explain_natural_url)
+							? { clear: extra.explain_clear_url || null, natural: extra.explain_natural_url || null }
+							: null,
 					},
 					skill: { id: skill.id, name: skill.name, slug: skill.slug, category: skill.category },
 					group: { id: group.id, name: group.name, slug: group.slug, answer_mode: group.answer_mode },
-					steps,
-					clips,
+					preview,
+					pool: rows.length,
 				},
 			});
 		} catch (error) {
@@ -463,164 +407,6 @@ export function registerLessonRoutes(router: any, context: any) {
 		}
 	});
 
-	// body: { completed: boolean, score?: number (0-100), step_results?: object }
-	// A lesson once completed stays completed; replaying it only updates the score.
-	router.post('/listening-lab/lessons/:key/progress', async (req: any, res: any) => {
-		const userId = req.accountability?.user ?? null;
-		const key = String(req.params.key || '');
-		if (badKey(key)) return res.status(400).json({ success: false, message: 'Invalid lesson key' });
-		if (!userId) return res.json({ success: true, data: { saved: false } });
-		try {
-			const lesson = await database('listening_lessons').select('id').where(UUID_RE.test(key) ? { id: key } : { short_id: key }).first();
-			if (!lesson) return res.status(404).json({ success: false, message: 'Lesson not found' });
-
-			const body = req.body || {};
-			// Completed = every step-1 clip answered right (checked by the server), whatever the page says
-			const [hasStep1, open] = await Promise.all([
-				database('listening_clips').where({ lesson_id: lesson.id, step: 'type' }).first('id'),
-				database('listening_clips as c')
-					.where({ 'c.lesson_id': lesson.id, 'c.step': 'type' })
-					.whereNotExists(database('listening_attempts as a').whereRaw('a.clip_id = c.id').where({ 'a.user_id': userId, 'a.is_correct': true }))
-					.count('* as n').first(),
-			]);
-			const completed = !!hasStep1 && Number(open?.n) === 0;
-			const score = Number.isFinite(body.score) ? Math.max(0, Math.min(100, Math.round(body.score))) : null;
-			const stepResults = body.step_results && typeof body.step_results === 'object' ? JSON.stringify(body.step_results).slice(0, 4000) : null;
-
-			const row = (await database.raw(`
-				INSERT INTO listening_progress (user_id, lesson_id, status, step_results, score, completed_at, date_updated)
-				VALUES (?, ?, ?, ?::json, ?, CASE WHEN ? THEN now() END, now())
-				ON CONFLICT (user_id, lesson_id) DO UPDATE SET
-					status = CASE WHEN listening_progress.status = 'completed' OR EXCLUDED.status = 'completed' THEN 'completed' ELSE 'in_progress' END,
-					step_results = COALESCE(EXCLUDED.step_results, listening_progress.step_results),
-					score = COALESCE(EXCLUDED.score, listening_progress.score),
-					completed_at = COALESCE(listening_progress.completed_at, EXCLUDED.completed_at),
-					date_updated = now()
-				RETURNING status
-			`, [userId, lesson.id, completed ? 'completed' : 'in_progress', stepResults, score, completed])).rows?.[0];
-
-			// XP is by lesson (lib/xp.ts lessonXp): +20 the first time (+10 with an answer looked
-			// at), +5 when done again today
-			const won = completed ? await lessonXp(database, userId, lesson.id) : { xp: 0, rewards: [], kind: null };
-			await grantRewards(context, req.schema, userId, won.rewards);
-			const xp = { total: won.xp, kind: won.kind };
-
-			return res.json({ success: true, data: { saved: true, status: row?.status, xp, rewards: won.rewards } });
-		} catch (error) {
-			return fail(res, 'Save progress', error);
-		}
-	});
-
-	// What this learner did in the lesson, so the page resumes where they left it:
-	// { status: 'in_progress' | 'completed' | null, clips: [{ clip_id, tries, correct, revealed, heard }] }
-	// heard: step 2 played in "listen" mode and confirmed (not a typed answer, so not `correct`)
-	router.get('/listening-lab/lessons/:key/attempts', async (req: any, res: any) => {
-		const userId = req.accountability?.user ?? null;
-		const key = String(req.params.key || '');
-		if (badKey(key)) return res.status(400).json({ success: false, message: 'Invalid lesson key' });
-		if (!userId) return res.json({ success: true, data: { status: null, clips: [] } });
-		try {
-			const lesson = await database('listening_lessons').select('id').where(UUID_RE.test(key) ? { id: key } : { short_id: key }).first();
-			if (!lesson) return res.status(404).json({ success: false, message: 'Lesson not found' });
-			const [progress, clips] = await Promise.all([
-				database('listening_progress').select('status').where({ user_id: userId, lesson_id: lesson.id }).first(),
-				database('listening_attempts')
-					.select(
-						'clip_id',
-						database.raw(`COUNT(*) FILTER (WHERE answer NOT IN ('[REVEALED]', '[HEARD]'))::int AS tries`),
-						database.raw('BOOL_OR(is_correct) AS correct'),
-						database.raw(`BOOL_OR(answer = '[REVEALED]') AS revealed`),
-						database.raw(`BOOL_OR(answer = '[HEARD]') AS heard`),
-					)
-					.where({ user_id: userId, lesson_id: lesson.id })
-					.whereNotNull('clip_id')
-					.groupBy('clip_id'),
-			]);
-			return res.json({ success: true, data: { status: progress?.status || null, clips } });
-		} catch (error) {
-			return fail(res, 'Load lesson attempts', error);
-		}
-	});
-
-	// ── Attempts ──────────────────────────────────────────────────────────
-	// body: { clip_id, type: 'check' | 'reveal' | 'listen', answer?, is_correct?, attempt_number?, mode?, anonymous_id? }
-	// listen: a step-2 clip in "listen only" mode, heard and confirmed: saved as '[HEARD]', never right
-	// mode: phrase | sentence | speed (step 3 hard) | sentence_medium | sentence_easy | speed_easy | listen
-	// Logged-in learner: saved (+ the lesson is marked "in progress"). Guest: only counted once
-	// in learners_count. Premium lesson without Premium: 403 PREMIUM_REQUIRED.
-	router.post('/listening-lab/attempts', async (req: any, res: any) => {
-		const userId = req.accountability?.user ?? null;
-		const body = req.body || {};
-		const type = body.type === 'reveal' || body.type === 'listen' ? body.type : 'check';
-		const anonymousId = typeof body.anonymous_id === 'string' && ANON_ID_RE.test(body.anonymous_id) ? body.anonymous_id : null;
-		if (typeof body.clip_id !== 'string' || !UUID_RE.test(body.clip_id)) {
-			return res.status(400).json({ success: false, message: 'Invalid clip_id' });
-		}
-
-		try {
-			const clip = await database('listening_clips as c')
-				.join('listening_lessons as l', 'l.id', 'c.lesson_id')
-				.join('listening_skills as s', 's.id', 'l.skill_id')
-				.join('listening_groups as g', 'g.id', 's.group_id')
-				.select('c.id', 'c.step', 'c.source_video_id', 'c.practice_lesson_id', 'c.answer', 'c.transcript', 'c.challenge_mode',
-					'l.id as lesson_id', 'l.text', 'g.answer_mode', database.raw('(l.is_premium OR s.is_premium OR g.is_premium) AS premium_content'))
-				.where('c.id', body.clip_id)
-				.first();
-			if (!clip) return res.status(404).json({ success: false, message: 'Clip not found' });
-			if (type === 'listen' && clip.step !== 'voice') return res.status(400).json({ success: false, message: 'Only step 2 can be listened to' });
-
-			if (clip.premium_content && !(await isPremiumUser(database, userId, logger))) {
-				return res.status(403).json({ success: false, code: 'PREMIUM_REQUIRED', message: 'Bài này dành cho gói Premium.' });
-			}
-
-			// Right or wrong is the server's call: the page's is_correct is only compared, to spot a
-			// clip whose answer the page and the server see differently
-			const given = String(body.answer ?? '').slice(0, 255);
-			const correct = type === 'check' && !!given.trim() && normalizeAnswer(given) === normalizeAnswer(await clipAnswer(database, clip));
-			if (type === 'check' && body.is_correct === true && !correct) {
-				logger?.warn?.(`[attempts] clip ${clip.id}: the page said right, the server wrong ("${given}")`);
-			}
-
-			let won = { xp: 0, rewards: [] as any[] };
-			if (userId) {
-				const attemptNumber = Number.isInteger(body.attempt_number) && body.attempt_number > 0 ? body.attempt_number : 1;
-				await database('listening_attempts').insert({
-					id: database.raw('gen_random_uuid()'),
-					user_id: userId,
-					clip_id: clip.id,
-					lesson_id: clip.lesson_id,
-					step: clip.step,
-					answer: type === 'reveal' ? '[REVEALED]' : type === 'listen' ? '[HEARD]' : given,
-					is_correct: correct,
-					attempt_number: attemptNumber,
-					listen_count: 1,
-					mode: type === 'listen' ? 'listen' : ATTEMPT_MODES.includes(body.mode) ? body.mode : 'phrase',
-					date_created: database.fn.now(),
-				});
-				await database.raw(`
-					INSERT INTO listening_progress (user_id, lesson_id, status) VALUES (?, ?, 'in_progress')
-					ON CONFLICT (user_id, lesson_id) DO UPDATE SET date_updated = now()
-				`, [userId, clip.lesson_id]);
-				// Missed (wrong or "show answer"): back in the review queue for tomorrow. Step-4 clips
-				// borrowed from another lesson have no video of their own: not reviewable.
-				if (!correct && type !== 'listen' && clip.source_video_id && !clip.practice_lesson_id) {
-					await scheduleReview(database, userId, clip.id, clip.lesson_id).catch((e: any) => logger?.warn?.(`[review] ${String(e)}`));
-				}
-				// A practice day (the streak). XP is by lesson, on its result card (lessonXp)
-				won = await recordPractice(database, userId, { attempts: 1 });
-				await grantRewards(context, req.schema, userId, won.rewards);
-			}
-
-			let counted = false;
-			if (type === 'check' && (userId || anonymousId)) {
-				counted = await registerLearner(database, clip.lesson_id, userId, anonymousId);
-			}
-			return res.status(201).json({ success: true, data: { lesson_id: clip.lesson_id, counted, correct, xp: won.xp, rewards: won.rewards } });
-		} catch (error) {
-			return fail(res, 'Save attempt', error);
-		}
-	});
-
 	router.get('/listening-lab/progress/clips', async (req: any, res: any) => {
 		const userId = req.accountability?.user ?? null;
 		if (!userId) return res.json({ success: true, data: [] });
@@ -653,11 +439,11 @@ export function registerLessonRoutes(router: any, context: any) {
 				SELECT l.id, l.short_id, l.text, l.difficulty, l.learners_count,
 					s.id AS skill_id, s.name AS skill_name, s.slug AS skill_slug,
 					g.id AS group_id, g.name AS group_name, g.slug AS group_slug, g.answer_mode,
-					(SELECT COUNT(*) FROM listening_clips c WHERE c.lesson_id = l.id AND c.step IS NOT NULL)::int AS total_clips,
+					(SELECT COUNT(*) FROM listening_clips c WHERE c.lesson_id = l.id AND c.role IS NOT NULL)::int AS total_clips,
 					(SELECT sv.title FROM listening_clips c JOIN source_videos sv ON sv.id = c.source_video_id
-						WHERE c.lesson_id = l.id ORDER BY (c.step = 'type') DESC, c.sort NULLS LAST LIMIT 1) AS video_title,
+						WHERE c.lesson_id = l.id ORDER BY (c.role = 'core') DESC, c.sort NULLS LAST LIMIT 1) AS video_title,
 					(SELECT sv.thumbnail_url FROM listening_clips c JOIN source_videos sv ON sv.id = c.source_video_id
-						WHERE c.lesson_id = l.id ORDER BY (c.step = 'type') DESC, c.sort NULLS LAST LIMIT 1) AS thumbnail_url,
+						WHERE c.lesson_id = l.id ORDER BY (c.role = 'core') DESC, c.sort NULLS LAST LIMIT 1) AS thumbnail_url,
 					COALESCE(p.status, 'in_progress') AS status,
 					mine.completed_clips, mine.checks, mine.correct_checks, mine.reveals,
 					mine.first_at, GREATEST(mine.last_at, p.date_updated) AS last_at
@@ -762,7 +548,7 @@ export function registerLessonRoutes(router: any, context: any) {
  * Count a learner once per lesson (user or guest cookie id). A guest who signs up later
  * is converted to their user key instead of being counted twice.
  */
-async function registerLearner(database: any, lessonId: string, userId: string | null, anonymousId: string | null): Promise<boolean> {
+export async function registerLearner(database: any, lessonId: string, userId: string | null, anonymousId: string | null): Promise<boolean> {
 	try {
 		return await database.transaction(async (trx: any) => {
 			if (userId) {
