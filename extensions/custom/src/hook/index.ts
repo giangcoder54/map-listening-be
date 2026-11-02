@@ -3,7 +3,7 @@ import { registerCronjob } from './cronjob_check_transactions/cronjob_check_tran
 import { calculateEndDate, activatePremiumForUser, purchaseCycle } from '../utils';
 import { registerSepayRawBody } from './sepayRawBody';
 import { downgradeExpiredPremium } from '../lib/premium';
-import { registerLessonStep1Check } from './lessonStep1Check';
+import { registerLessonReadyCheck } from './lessonReadyCheck';
 import { registerLessonTextCase } from './lessonTextCase';
 import { registerEditorScope } from './editorScope';
 import { registerGoogleAvatar } from './googleAvatar';
@@ -83,7 +83,7 @@ export default defineHook((registerEvents, context) => {
 	});
 
 	// A published lesson must keep a Step 1 clip, else the site hides it
-	registerLessonStep1Check(registerEvents);
+	registerLessonReadyCheck(registerEvents);
 	registerLessonTextCase(registerEvents);
 	// Content editors: own lessons only, never the premium status (see the migration too)
 	registerEditorScope(registerEvents);
