@@ -210,6 +210,8 @@ export async function engagementOf(database: any, userId: string, today = vnDay(
 		freeze_price: COIN.freeze,
 		coins: Number(acc.coins) || 0,
 		coins_cap: COIN.cap,
+		// What Xu are earned and spent on, for the header's Xu explainer
+		coin_rules: { earn: COIN.earn, unlock: COIN.unlock, weekly_unlocks: COIN.weeklyUnlocks, freeze: COIN.freeze, retest: COIN.retest },
 		// Days in a row with the daily goal reached (today counts once reached)
 		goal_days: goalRun,
 		goal_met_today: xpToday >= goal,

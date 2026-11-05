@@ -67,7 +67,23 @@ export type LessonRow = {
 	learners_count: number | null;
 	date_created: string | null;
 	kind?: 'pattern' | 'trap' | 'mixed' | null;
+	/** A review lesson: the lessons it reviews (listening_lessons.review_of) */
+	review_of?: unknown;
 };
+
+/** A review lesson (kind 'mixed', lib/runs.ts drawMixed): items drawn when the team wrote none, lessons it needs at least */
+export const MIXED = {
+	items: 6,
+	minLessons: 2,
+	/** The n-th drawn item is asked as this when the clip allows it: few typed ones */
+	formats: ['choice', 'choice', 'choice', 'bank', 'bank', 'gap'] as const,
+};
+
+/** The lessons a review lesson reviews, whatever the column holds */
+export function reviewOfValue(value: unknown): string[] {
+	const list = typeof value === 'string' ? (() => { try { return JSON.parse(value); } catch { return null; } })() : value;
+	return Array.isArray(list) ? [...new Set(list.filter((x): x is string => typeof x === 'string'))] : [];
+}
 
 const bySort = (a: { sort: number | null; name?: string }, b: { sort: number | null; name?: string }) =>
 	(a.sort ?? 999) - (b.sort ?? 999) || String(a.name || '').localeCompare(String(b.name || ''));
@@ -106,7 +122,7 @@ export async function loadLessonGraph(req: any, context: any) {
 	const [groupRows, skillRows, lessonRows, groupTr, skillTr, clipRows] = await Promise.all([
 		database('listening_groups').select('id', 'name', 'slug', 'sort', 'answer_mode', 'is_premium').where('status', 'published'),
 		database('listening_skills').select('id', 'group_id', 'name', 'slug', 'sort', 'category', 'is_premium').where('status', 'published'),
-		database('listening_lessons').select('id', 'skill_id', 'short_id', 'text', 'difficulty', 'is_premium', 'sort', 'learners_count', 'date_created', 'kind').where('status', 'published'),
+		database('listening_lessons').select('id', 'skill_id', 'short_id', 'text', 'difficulty', 'is_premium', 'sort', 'learners_count', 'date_created', 'kind', 'review_of').where('status', 'published'),
 		database('listening_groups_translations').select('listening_groups_id as owner', 'languages_code', 'description'),
 		database('listening_skills_translations').select('listening_skills_id as owner', 'languages_code', 'description', 'example'),
 		database.raw(`
@@ -148,7 +164,21 @@ export async function loadLessonGraph(req: any, context: any) {
 	for (const row of clipRows?.rows || []) {
 		clipStats.set(row.lesson_id, { total: Number(row.total_clips) || 0, type: Number(row.type_clips) || 0, thumbnail: row.thumbnail || '' });
 	}
-	// A lesson without a clip to type (core or pool) cannot be played: it is not listed anywhere
+	// A lesson without a clip to type (core or pool) cannot be played: it is not listed anywhere.
+	// A review lesson types the clips of the lessons it reviews: it is listed while 2 of them are,
+	// and counts their clips.
+	const typed = new Set(lessons.filter((l) => (clipStats.get(l.id)?.type || 0) > 0).map((l) => l.id));
+	for (const l of lessons) {
+		if (l.kind !== 'mixed') continue;
+		const reviewed = reviewOfValue(l.review_of).filter((id) => id !== l.id && typed.has(id));
+		if (reviewed.length < MIXED.minLessons) continue;
+		const own = clipStats.get(l.id);
+		clipStats.set(l.id, {
+			total: (own?.total || 0) + reviewed.reduce((n, id) => n + (clipStats.get(id)?.type || 0), 0),
+			type: reviewed.reduce((n, id) => n + (clipStats.get(id)?.type || 0), 0),
+			thumbnail: own?.thumbnail || clipStats.get(reviewed[0]!)?.thumbnail || '',
+		});
+	}
 	const playable = lessons.filter((l) => (clipStats.get(l.id)?.type || 0) > 0);
 
 	const lessonsBySkill = new Map<string, LessonRow[]>();
@@ -191,11 +221,35 @@ export async function loadLessonGraph(req: any, context: any) {
 	 * once every lesson before it is done or skipped by a test (its skip-ahead test is always
 	 * there). A lesson already started stays open. Guests keep no progress: nothing is locked.
 	 */
+	/**
+	 * The rules of a group open one after the other too: Linking Words, then H-dropping. A rule
+	 * is passed once every lesson open to this learner is done or skipped by a test (a rule with
+	 * no open lesson, all Premium for a free learner, does not hold the next one back). A rule
+	 * already started stays open. Groups are separate paths: Numbers does not wait for
+	 * Connected Speech. lockedBy: the first rule before it not passed yet.
+	 */
+	const rulePassed = (s: SkillRow) => (lessonsBySkill.get(s.id) || []).every((l) => isLocked(l) || done.has(l.id));
+	const ruleStarted = (s: SkillRow) => (lessonsBySkill.get(s.id) || []).some((l) => done.has(l.id) || started.has(l.id));
+	const lockedBy = new Map<string, SkillRow>();
+	if (userId) {
+		for (const g of groups) {
+			let first: SkillRow | null = null;
+			for (const s of skills) {
+				if (s.group_id !== g.id) continue;
+				if (first && !ruleStarted(s)) lockedBy.set(s.id, first);
+				if (!first && !rulePassed(s)) first = s;
+			}
+		}
+	}
+	const ruleLockedBy = (s: SkillRow) => lockedBy.get(s.id) || null;
+
 	const isOrderLocked = (l: LessonRow) => {
 		if (!userId || done.has(l.id) || started.has(l.id)) return false;
+		if (lockedBy.has(l.skill_id)) return true;
 		for (const x of lessonsBySkill.get(l.skill_id) || []) {
 			if (x.id === l.id) return false;
-			if (!done.has(x.id)) return true;
+			// A Premium lesson a free learner cannot open does not hold the next ones back
+			if (!done.has(x.id) && !isLocked(x)) return true;
 		}
 		return false;
 	};
@@ -215,6 +269,8 @@ export async function loadLessonGraph(req: any, context: any) {
 			unlocked: unlocked.has(l.id),
 			/** An earlier lesson of the rule is not done yet: learn it, or pass this one's skip-ahead test */
 			order_locked: isOrderLocked(l),
+			/** The whole rule waits for an earlier rule of the group (no skip-ahead test then) */
+			rule_locked: lockedBy.has(l.skill_id),
 			kind: l.kind || 'pattern',
 			done: done.has(l.id),
 			tested_out: testedOut.has(l.id),
@@ -240,6 +296,7 @@ export async function loadLessonGraph(req: any, context: any) {
 	const skillSummary = (s: SkillRow) => {
 		const list = lessonsBySkill.get(s.id) || [];
 		const next = nextOf(list);
+		const by = lockedBy.get(s.id);
 		return {
 			id: s.id,
 			group_id: s.group_id,
@@ -250,6 +307,10 @@ export async function loadLessonGraph(req: any, context: any) {
 			translations: s.translations,
 			...counts(list),
 			next: next ? { id: next.id, short_id: next.short_id, number: numberOf(next), locked: isLocked(next) } : null,
+			/** Every open lesson done (signed-in learners only) */
+			passed: !!userId && list.length > 0 && rulePassed(s),
+			/** Opens once this earlier rule of the group is passed */
+			locked_by: by ? { id: by.id, name: by.name, slug: by.slug } : null,
 		};
 	};
 
@@ -275,7 +336,7 @@ export async function loadLessonGraph(req: any, context: any) {
 
 	return {
 		userId, premium, groups, groupById, skills, skillById, lessons: playable, lessonById, lessonsBySkill, clipStats,
-		done, started, testedOut, skillOf, groupOf, isPremiumContent, isLocked, isOrderLocked, numberOf, lessonCard, nextOf, skillSummary, groupSummary, findLesson,
+		done, started, testedOut, skillOf, groupOf, isPremiumContent, isLocked, isOrderLocked, ruleLockedBy, numberOf, lessonCard, nextOf, skillSummary, groupSummary, findLesson,
 	};
 }
 

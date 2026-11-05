@@ -22,14 +22,15 @@
  */
 import { UUID_RE, answerOf, loadLessonGraph, type LessonGraph, type LessonRow } from '../lib/lessons';
 import {
-	LESSON_TEST, MAX_LISTENS, drawLesson, drawReview, drawTest, isRight, passed, summaryOf, weakestForms, withRetry,
-	type PoolClip, type RunItem,
+	LESSON_TEST, MAX_LISTENS, choicesFor, drawLesson, drawMixed, drawReview, drawTest, fitsLesson, fitsMixed, focusFits, isRight, triesFor, passed,
+	practiceOf, reviewOfValue, summaryOf, targetOf,
+	tilesFor, weakestForms, withRetry, type PoolClip, type RunItem,
 } from '../lib/runs';
 import { REVIEW, gradeOf, masteryOf, schedule, cardColumns } from '../lib/review';
 import { COIN, CoinError, buyFreeze, earnCoins, payRetest, unlockLesson, walletOf } from '../lib/coins';
 import { MAX_FREEZES, grantRewards, lessonXp, recordPractice, vnDay, DEFAULT_GOAL } from '../lib/xp';
-import { choicesOf, clipOut, lessonTranslations, readClips, registerLearner } from './lessonRoutes';
-import { normalizeAnswer } from './engagementRoutes';
+import { mixUps } from '../lib/mixups';
+import { clipOut, lessonTranslations, readClips, registerLearner, wrongOf } from './lessonRoutes';
 
 const ANON_ID_RE = /^[A-Za-z0-9-]{16,64}$/;
 const badKey = (key: string) => !key || key.length > 64;
@@ -47,22 +48,21 @@ function learnerOf(req: any) {
 async function poolOf(database: any, g: LessonGraph, lesson: LessonRow) {
 	const rows = await readClips(database, [lesson.id]);
 	const group = g.groupOf(lesson);
-	const others = (g.lessonsBySkill.get(lesson.skill_id) || []).filter((l) => l.id !== lesson.id).map((l) => l.text);
-	const answers = rows.map((r: any) => answerOf(r, lesson.text, group.answer_mode));
-	// Wrong choices: the other phrases of the lesson, then the other forms of the rule
-	const phrases = [...new Set([...answers, ...others].filter(Boolean))] as string[];
-	const wrongFor = (answer: string) => phrases.filter((p) => normalizeAnswer(p) !== normalizeAnswer(answer));
 	const byId = new Map<string, { row: any; clip: PoolClip }>();
-	rows.forEach((r: any, i: number) => {
-		const answer = answers[i]!;
+	rows.forEach((r: any) => {
+		const answer = answerOf(r, lesson.text, group.answer_mode);
+		const focus = String(r.focus_text || '').trim() || null;
+		// The clip's own wrong answers, else ones made from the words heard one for another
+		const own = wrongOf(r);
+		const wrong = own.length ? own : mixUps(targetOf({ answer, focus }));
 		byId.set(r.id, {
 			row: r,
 			clip: {
-				id: r.id, role: r.role, answer,
-				focus: String(r.focus_text || '').trim() || null,
+				id: r.id, role: r.role, answer, focus,
 				difficulty: r.difficulty ?? null,
 				forced: r.answer_format || null,
-				hasChoices: !!choicesOf(r, answer, wrongFor(answer)),
+				hasChoices: wrong.length > 0,
+				wrong,
 			},
 		});
 	});
@@ -70,16 +70,24 @@ async function poolOf(database: any, g: LessonGraph, lesson: LessonRow) {
 		const hit = byId.get(item.clip_id);
 		if (!hit) return null;
 		const { row, clip } = hit;
-		const base = clipOut(row, lesson.text, group.answer_mode, true, wrongFor(clip.answer));
+		const base = clipOut(row, lesson.text, group.answer_mode, true);
+		// A step the team wrote brings its own wrong choices / tiles; else the clip's
+		const wrong = item.wrong?.length ? item.wrong : clip.wrong || [];
+		const choices = item.format === 'choice' ? choicesFor(clip, wrong) : null;
+		// A choice with nothing to choose from (a run drawn when choices were borrowed from other
+		// clips, or wrong choices removed since): typed instead. The check asks for the same words.
+		const format = item.format === 'choice' && !choices ? (focusFits(clip) ? 'gap' : 'type') : item.format;
 		return {
 			index,
 			phase: item.phase,
-			format: item.format,
+			format,
 			result: item.result || null,
+			tries: item.tries || 0,
 			clip: {
 				...base,
-				format: item.format,
-				choices: item.format === 'choice' ? choicesOf(row, clip.answer, wrongFor(clip.answer)) : null,
+				format,
+				choices,
+				tiles: format === 'bank' ? tilesFor(clip, wrong) : null,
 				focus: clip.focus,
 			},
 		};
@@ -104,6 +112,12 @@ async function runOut(database: any, g: LessonGraph, run: any) {
 	const pools = await poolsOf(database, g, items.map((it) => it.lesson_id || run.lesson_id));
 	const lesson = run.lesson_id ? g.lessonById.get(run.lesson_id) : null;
 	const skill = run.skill_id ? g.skillById.get(run.skill_id) : null;
+	// A lesson's practice steps may carry their own question: read live, so an edit shows at once
+	const prompts = new Map<string, string>();
+	if (run.mode === 'learn' && run.lesson_id) {
+		const written = await database('listening_lessons').select('practice').where('id', run.lesson_id).first();
+		for (const s of practiceOf(written?.practice)) if (s.prompt) prompts.set(s.clip_id, s.prompt);
+	}
 	return {
 		id: run.id,
 		mode: run.mode as Mode,
@@ -112,7 +126,13 @@ async function runOut(database: any, g: LessonGraph, run: any) {
 		max_listens: MAX_LISTENS[run.mode] || 3,
 		lesson: lesson ? { short_id: lesson.short_id, number: g.numberOf(lesson) } : null,
 		skill: skill ? { slug: skill.slug, name: skill.name } : null,
-		items: items.map((it, i) => pools.get(it.lesson_id || run.lesson_id)?.payload(it, i) || null).filter(Boolean),
+		items: items.map((it, i) => {
+			const out = pools.get(it.lesson_id || run.lesson_id)?.payload(it, i);
+			// lesson_id: where a "report a problem" on the item is filed (reviews and tests mix lessons)
+			// The question of a practice step, and of its retry (same clip)
+			const prompt = it.phase === 'practice' || it.phase === 'retry' ? prompts.get(it.clip_id) || null : null;
+			return out ? { ...out, lesson_id: it.lesson_id || run.lesson_id, hearts: triesFor(run.mode, out.format), prompt } : null;
+		}).filter(Boolean),
 	};
 }
 
@@ -185,11 +205,35 @@ export function registerRunRoutes(router: any, context: any) {
 			if (g.isLocked(lesson)) {
 				return res.status(403).json({ success: false, code: 'PREMIUM_REQUIRED', price: COIN.unlock[lesson.kind || 'pattern'] ?? COIN.unlock.pattern });
 			}
+			const ruleBy = g.ruleLockedBy(g.skillOf(lesson));
+			if (ruleBy) return res.status(403).json({ success: false, code: 'RULE_LOCKED', by: { name: ruleBy.name, slug: ruleBy.slug } });
 			if (g.isOrderLocked(lesson)) return res.status(403).json({ success: false, code: 'ORDER_LOCKED' });
 			const pool = await poolOf(database, g, lesson);
+			const written = await database('listening_lessons').select('practice', 'review_of').where('id', lesson.id).first();
+			// A review lesson: the pool clips of the lessons it reviews (published ones), mixed
+			const reviewed = lesson.kind === 'mixed' ? reviewOfValue(written?.review_of).filter((id) => id !== lesson.id && g.lessonById.has(id)) : [];
+			if (reviewed.length) {
+				const pools = await poolsOf(database, g, reviewed);
+				const forms = [...pools.values()].map((p) => ({ lessonId: p.lesson.id, clips: p.clips }));
+				const ids = [...pool.byId.keys(), ...forms.flatMap((f) => f.clips.map((c) => c.id))];
+				const has = (clipId: string, lessonId?: string) => (lessonId ? !!pools.get(lessonId)?.byId.has(clipId) : pool.byId.has(clipId));
+				// The steps the team set, those whose clip is still there (unpublished since: left out)
+				const known = new Set(ids);
+				const script = practiceOf(written?.practice).filter((s) => known.has(s.clip_id));
+				// Clips the lessons reviewed use in their practice come last: heard there already
+				const practiced = new Set((await database('listening_lessons').select('practice').whereIn('id', reviewed))
+					.flatMap((r: any) => practiceOf(r.practice).map((s) => s.clip_id)));
+				const run = await openRun(learner, 'learn', { lesson_id: lesson.id, skill_id: lesson.skill_id },
+					async () => drawMixed(forms, pool.clips, await metOf(learner.userId, ids), Math.random, script, practiced),
+					{ restart: !!req.body?.restart, valid: (items) => fitsMixed(items, has, script) });
+				if (!run) return res.status(409).json({ success: false, code: 'EMPTY_LESSON', message: 'This lesson has no clip to play yet' });
+				return res.json({ success: true, data: await runOut(database, g, run) });
+			}
+			const script = practiceOf(written?.practice);
+			// A run left halfway is taken up again, unless the lesson changed since: then it starts over
 			const run = await openRun(learner, 'learn', { lesson_id: lesson.id, skill_id: lesson.skill_id },
-				async () => drawLesson(pool.clips, await metOf(learner.userId, [...pool.byId.keys()])),
-				{ restart: !!req.body?.restart, valid: (items) => items.every((it) => pool.byId.has(it.clip_id)) });
+				async () => drawLesson(pool.clips, await metOf(learner.userId, [...pool.byId.keys()]), Math.random, script),
+				{ restart: !!req.body?.restart, valid: (items) => fitsLesson(items, script, (id) => pool.byId.has(id)) });
 			if (!run) return res.status(409).json({ success: false, code: 'EMPTY_LESSON', message: 'This lesson has no clip to play yet' });
 			return res.json({ success: true, data: await runOut(database, g, run) });
 		} catch (error) {
@@ -208,10 +252,19 @@ export function registerRunRoutes(router: any, context: any) {
 			const lesson = g.findLesson(lessonKey);
 			if (!lesson) return res.status(404).json({ success: false, message: 'Lesson not found' });
 			if (g.isLocked(lesson)) return res.status(403).json({ success: false, code: 'PREMIUM_REQUIRED' });
+			// A lesson's test skips that lesson, not the rules before it
+			const ruleBy = g.ruleLockedBy(g.skillOf(lesson));
+			if (ruleBy) return res.status(403).json({ success: false, code: 'RULE_LOCKED', by: { name: ruleBy.name, slug: ruleBy.slug } });
 			const pool = await poolOf(database, g, lesson);
+			// A review lesson is skipped by a test on the lessons it reviews
+			const written = lesson.kind === 'mixed' ? await database('listening_lessons').select('review_of').where('id', lesson.id).first() : null;
+			const reviewed = reviewOfValue(written?.review_of).filter((id) => id !== lesson.id && g.lessonById.has(id));
+			const pools = reviewed.length ? await poolsOf(database, g, reviewed) : new Map([[lesson.id, pool]]);
+			const forms = [...pools.values()].map((p) => ({ lessonId: p.lesson.id, clips: p.clips }));
+			const ids = forms.flatMap((f) => f.clips.map((c) => c.id));
 			const run = await openRun(learner, 'lesson_test', { lesson_id: lesson.id, skill_id: lesson.skill_id },
-				async () => drawTest([{ lessonId: lesson.id, clips: pool.clips }], LESSON_TEST.size, await metOf(learner.userId, [...pool.byId.keys()])),
-				{ valid: (items) => items.every((it) => pool.byId.has(it.clip_id)) });
+				async () => drawTest(forms, LESSON_TEST.size, await metOf(learner.userId, ids)),
+				{ valid: (items) => items.every((it) => !!pools.get(it.lesson_id || lesson.id)?.byId.has(it.clip_id)) });
 			if (!run) return res.status(409).json({ success: false, code: 'EMPTY_LESSON' });
 			return res.json({ success: true, data: await runOut(database, g, run) });
 		} catch (error) {
@@ -234,6 +287,9 @@ export function registerRunRoutes(router: any, context: any) {
 			// Skipping a rule is Premium; everyone takes the final test once every lesson is done
 			const allDone = open.every((l) => g.done.has(l.id));
 			if (!g.premium && !allDone) return res.status(403).json({ success: false, code: 'FINISH_LESSONS_FIRST' });
+			// Premium skips a rule wherever it is on the path; a free learner's rule waits its turn
+			const ruleBy = g.ruleLockedBy(skill);
+			if (ruleBy && !g.premium) return res.status(403).json({ success: false, code: 'RULE_LOCKED', by: { name: ruleBy.name, slug: ruleBy.slug } });
 
 			const today = vnDay();
 			const active = await database('listening_runs').where({ user_id: learner.userId, mode: 'skill_test', skill_id: skill.id, status: 'active' }).first('id');
@@ -370,32 +426,47 @@ export function registerRunRoutes(router: any, context: any) {
 				const hint = body.hint === true;
 				const correct = !hint && isRight(clip, item.format, given);
 				const listens = Math.max(1, Math.min(20, Math.round(Number(body.listens) || 1)));
-				items[position] = { ...item, result: { correct, answer: given, listens, slow: body.slow === true, hint } };
+				const timeMs = Number.isFinite(body.time_ms) ? Math.max(0, Math.min(3_600_000, Math.round(body.time_ms))) : null;
+				// A wrong typed answer with a heart left: tried again, the answer not shown yet
+				const tries = (Number(item.tries) || 0) + 1;
+				const again = !correct && !hint && tries < triesFor(run.mode, item.format);
+				const attempt = (final: boolean) => learner.userId && trx('listening_attempts').insert({
+					id: trx.raw('gen_random_uuid()'), user_id: learner.userId, clip_id: item.clip_id, lesson_id: lessonId,
+					answer: hint ? '[REVEALED]' : given, is_correct: correct, attempt_number: tries, listen_count: listens,
+					mode: 'phrase', run_id: run.id, phase: item.phase, format: item.format,
+					used_slow: body.slow === true, used_hint: hint && final,
+					time_ms: timeMs,
+					date_created: trx.fn.now(),
+				});
+				if (again) {
+					items[position] = { ...item, tries };
+					await trx('listening_runs').where('id', run.id).update({ items: JSON.stringify(items), date_updated: trx.fn.now() });
+					await attempt(false);
+					return {
+						status: 200 as const, again: true, lessonId: lessonId as string, first: false,
+						data: { correct: false, again: true, hearts: triesFor(run.mode, item.format) - tries, position, total: items.length },
+					};
+				}
+				items[position] = { ...item, tries: tries - 1, result: { correct, answer: given, listens, slow: body.slow === true, hint, time_ms: timeMs } };
 				const before = items.length;
 				// A missed practice item comes back once; tests and reviews count every answer as given
-				if (!correct && run.mode === 'learn') items = withRetry(items, position);
+				if (!correct && run.mode === 'learn') items = withRetry(items, position, focusFits(clip) ? 'gap' : 'type');
 
 				await trx('listening_runs').where('id', run.id).update({
 					items: JSON.stringify(items), position: position + 1, date_updated: trx.fn.now(),
 				});
 				if (learner.userId) {
-					await trx('listening_attempts').insert({
-						id: trx.raw('gen_random_uuid()'), user_id: learner.userId, clip_id: item.clip_id, lesson_id: lessonId,
-						answer: hint ? '[REVEALED]' : given, is_correct: correct, attempt_number: 1, listen_count: listens,
-						mode: 'phrase', run_id: run.id, phase: item.phase, format: item.format,
-						used_slow: body.slow === true, used_hint: hint,
-						time_ms: Number.isFinite(body.time_ms) ? Math.max(0, Math.min(3_600_000, Math.round(body.time_ms))) : null,
-						date_created: trx.fn.now(),
-					});
+					await attempt(true);
 					if (run.mode === 'learn') {
 						await trx.raw(`
 							INSERT INTO listening_progress (user_id, lesson_id, status, last_run_id) VALUES (?, ?, 'in_progress', ?)
 							ON CONFLICT (user_id, lesson_id) DO UPDATE SET last_run_id = EXCLUDED.last_run_id, date_updated = now()
-						`, [learner.userId, lessonId, run.id]);
+						`, [learner.userId, run.lesson_id, run.id]);
 					}
 				}
 				return {
-					status: 200 as const, lessonId: lessonId as string, first: position === 0 && run.mode === 'learn',
+					// The lesson learned (a review lesson's items come from the lessons it reviews)
+					status: 200 as const, again: false, lessonId: (run.mode === 'learn' ? run.lesson_id : lessonId) as string, first: position === 0 && run.mode === 'learn',
 					data: {
 						correct,
 						expected: answer,
@@ -411,6 +482,7 @@ export function registerRunRoutes(router: any, context: any) {
 			if (out.status === 409) return res.status(409).json({ success: false, code: out.code, position: (out as any).position });
 
 			// A practice day (the streak); a learner counted once per lesson
+			if (out.again) return res.json({ success: true, data: out.data });
 			let rewards: any[] = [];
 			if (learner.userId) {
 				const won = await recordPractice(database, learner.userId, { attempts: 1 });
@@ -506,11 +578,14 @@ export function registerRunRoutes(router: any, context: any) {
 								status = 'completed', score = EXCLUDED.score, last_run_id = EXCLUDED.last_run_id,
 								completed_at = COALESCE(listening_progress.completed_at, EXCLUDED.completed_at), date_updated = now()
 						`, [userId, run.lesson_id, summary.total ? Math.round((summary.right / summary.total) * 100) : null, run.id]);
-						// First review of this form tomorrow; a form already in review keeps its schedule
-						await trx.raw(`
-							INSERT INTO listening_review_cards (user_id, lesson_id, due, source) VALUES (?, ?, now() + interval '1 day', 'learned')
-							ON CONFLICT (user_id, lesson_id) DO NOTHING
-						`, [userId, run.lesson_id]);
+						// First review of this form tomorrow; a form already in review keeps its schedule.
+						// A review lesson teaches no form of its own: the forms it mixed keep theirs.
+						if (!items.some((it) => it.lesson_id)) {
+							await trx.raw(`
+								INSERT INTO listening_review_cards (user_id, lesson_id, due, source) VALUES (?, ?, now() + interval '1 day', 'learned')
+								ON CONFLICT (user_id, lesson_id) DO NOTHING
+							`, [userId, run.lesson_id]);
+						}
 						await refreshSkillProgress(trx, userId, run.skill_id);
 					});
 					await addXp(await lessonXp(database, userId, run.lesson_id, summary.hinted, today));
@@ -572,14 +647,13 @@ export function registerRunRoutes(router: any, context: any) {
 			}
 
 			const g = await loadLessonGraph(req, context);
-			// "Listen again to the first one you missed" (lessons); the forms to work on (failed tests)
-			let firstWrong = null;
-			if (mode === 'learn' && summary.first_wrong !== null) {
-				const lesson = g.lessonById.get(run.lesson_id);
-				if (lesson) firstWrong = (await poolOf(database, g, lesson)).payload(items[summary.first_wrong]!, summary.first_wrong);
-			}
+			// How long it took: start to finish, or (a run left and taken up again later) the time
+			// spent answering
+			const wall = Date.now() - new Date(run.started_at).getTime();
+			const timeMs = wall > 0 && wall <= 3_600_000 ? wall : summary.answer_ms;
+			// The forms to work on: a failed test's, or the ones missed in a review lesson
 			let weakest: any[] = [];
-			if ((mode === 'lesson_test' || mode === 'skill_test') && !closed.ok) {
+			if (((mode === 'lesson_test' || mode === 'skill_test') && !closed.ok) || (mode === 'learn' && items.some((it) => it.lesson_id))) {
 				const trs = await lessonTranslations(database, weakestForms(items).map((w) => w.lessonId));
 				weakest = weakestForms(items).slice(0, 3).flatMap((w) => {
 					const l = g.lessonById.get(w.lessonId);
@@ -592,7 +666,7 @@ export function registerRunRoutes(router: any, context: any) {
 			return res.json({
 				success: true,
 				data: {
-					mode, summary, passed: closed.ok, first_wrong: firstWrong, weakest, xp, coins, rewards,
+					mode, summary, time_ms: timeMs, passed: closed.ok, weakest, xp, coins, rewards,
 					skill: skill ? { slug: skill.slug, name: skill.name } : null,
 				},
 			});
