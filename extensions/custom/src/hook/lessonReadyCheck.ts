@@ -27,7 +27,7 @@ export function registerLessonReadyCheck({ filter }: any) {
 			const lesson = await database('listening_lessons').select('status').where('id', key).first();
 			if (lesson?.status === 'published') continue;
 			const ready = await readinessOf(database, key);
-			const missing = ready.checks.find((c) => !c.ok);
+			const missing = ready.checks.find((c) => c.required && !c.ok);
 			if (missing) throw refused(`Not ready to publish: ${missing.text} (${missing.have}/${missing.need}). Save it as a draft until then.`);
 		}
 		return payload;

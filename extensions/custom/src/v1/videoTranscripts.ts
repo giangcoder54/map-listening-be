@@ -6,7 +6,8 @@
  *   POST /youtube/library/add          { url | urls[] }  add videos, no lesson needed (English transcript required)
  *   POST /youtube/transcripts/index    { limit? }  fetch the next videos never fetched yet
  *   GET  /youtube/transcripts/stats    how many library videos have one
- *   GET  /youtube/transcripts/search   ?q=let him   videos where it is said, with the lines
+ *   GET  /youtube/transcripts/search   ?q=let him&scope=all|unused&ids=a,b   videos where it is
+ *                                      said, with the lines; unused videos (in no lesson) first
  *
  * A transcript is [{ text, start, end }] in ms; [] means YouTube has none for the video.
  */
@@ -178,6 +179,16 @@ export function handleVideoTranscripts(router: Router, context: any) {
 		if (adminOnly(req, res)) return;
 		const q = String(req.query.q || '').trim().replace(/\s+/g, ' ');
 		if (q.length < 2) return res.json({ success: true, data: [] });
+		// Filtered here, before the limit: filtering the 40 best afterwards dropped the unused
+		// videos whenever the used ones said the words more often
+		const scope = String(req.query.scope || 'all');
+		const ids = String(req.query.ids || '').split(',').map((x) => x.trim()).filter((x) => /^[0-9a-f-]{36}$/i.test(x));
+		if (req.query.ids !== undefined && !ids.length) return res.json({ success: true, data: [] });
+		const usedSql = `EXISTS (SELECT 1 FROM listening_clips c WHERE c.source_video_id = v.id AND c.lesson_id IS NOT NULL)`;
+		const where = [
+			...(scope === 'unused' ? [`NOT ${usedSql}`] : []),
+			...(ids.length ? [`v.id IN (${ids.map(() => '?').join(', ')})`] : []),
+		];
 		// Whole words, any case: "let him" matches "Let him go", not "outlet himself"
 		const pattern = `\\m${q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/ /g, '\\s+')}\\M`;
 		try {
@@ -185,7 +196,7 @@ export function handleVideoTranscripts(router: Router, context: any) {
 			// joined with the next one, when the next one does not match by itself.
 			const { rows } = await database.raw(
 				`SELECT v.id, v.youtube_video_id, v.title, v.channel_name, v.thumbnail_url,
-					m.lines, m.n
+					m.lines, m.n, ${usedSql} AS used
 				FROM source_videos v
 				CROSS JOIN LATERAL (
 					SELECT json_agg(json_build_object('text', h.text, 'start', h.start, 'end', h."end") ORDER BY h.start) AS lines,
@@ -205,10 +216,10 @@ export function handleVideoTranscripts(router: Router, context: any) {
 							OR (l.next_text IS NOT NULL AND l.next_text !~* ? AND (l.text || ' ' || l.next_text) ~* ?)
 					) h
 				) m
-				WHERE v.transcript IS NOT NULL AND m.n > 0
-				ORDER BY m.n DESC, v.date_created DESC
+				WHERE v.transcript IS NOT NULL AND m.n > 0${where.map((w) => ` AND ${w}`).join('')}
+				ORDER BY ${usedSql} ASC, m.n DESC, v.date_created DESC
 				LIMIT 40`,
-				[pattern, pattern, pattern, pattern, pattern],
+				[pattern, pattern, pattern, pattern, pattern, ...ids],
 			);
 			return res.json({ success: true, data: rows.map((r: any) => ({ ...r, lines: (r.lines || []).slice(0, 6) })) });
 		} catch (error: any) {

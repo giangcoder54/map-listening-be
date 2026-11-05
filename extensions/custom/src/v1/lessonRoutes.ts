@@ -43,11 +43,8 @@ export async function readClips(database: any, lessonIds: string[]) {
 		.orderBy([{ column: 'c.sort', order: 'asc', nulls: 'last' }, { column: 'c.id' }]);
 }
 
-/**
- * @param pool phrases the wrong choices are picked from when the admin set none (other
- *             lessons of the skill, other answers of the lesson)
- */
-export function clipOut(row: any, lessonText: string, mode: ReturnType<LessonGraph['groupOf']>['answer_mode'], open: boolean, pool: string[] = []) {
+/** A clip as the pages play it; `open`: with its answer and transcript (else only the video) */
+export function clipOut(row: any, lessonText: string, mode: ReturnType<LessonGraph['groupOf']>['answer_mode'], open: boolean) {
 	const video = {
 		id: row.video_id,
 		youtube_video_id: row.youtube_video_id,
@@ -55,17 +52,18 @@ export function clipOut(row: any, lessonText: string, mode: ReturnType<LessonGra
 		channel_name: row.channel_name,
 		thumbnail_url: row.thumbnail_url,
 	};
-	const base = { id: row.id, lesson_id: row.lesson_id, role: row.role, sort: row.sort, mode: row.challenge_mode || null, rate: Number(row.playback_rate) || null, video };
+	// A "faster" challenge plays at 1.25x unless the team set its speed
+	const rate = Number(row.playback_rate) || (row.role === 'challenge' && row.challenge_mode === 'speed' ? 1.25 : null);
+	const base = { id: row.id, lesson_id: row.lesson_id, role: row.role, sort: row.sort, mode: row.challenge_mode || null, rate, video };
 	if (!open) return { ...base, answer: null, transcript: null, start_time: null, end_time: null, cues: null, lines: null, format: 'type', choices: null, media: null };
 	const cues = cuesOf(row.cues);
 	const answer = answerOf(row, lessonText, mode);
-	const choices = row.answer_format === 'choice' && answer ? choicesOf(row, answer, pool) : null;
 	return {
 		...base,
 		answer,
-		// 'choice': pick the answer among `choices` instead of typing it
-		format: choices ? 'choice' : 'type',
-		choices,
+		// A run item sets its own format and choices (v1/runRoutes.ts)
+		format: 'type',
+		choices: null,
 		// Image / video of its explanation; null = the lesson's
 		media: mediaOf(row),
 		transcript: row.transcript,
@@ -82,47 +80,11 @@ export function clipOut(row: any, lessonText: string, mode: ReturnType<LessonGra
 
 const normPhrase = (s: string) => s.toLowerCase().replace(/[^a-z0-9' ]+/g, ' ').replace(/\s+/g, ' ').trim();
 
-/** Same order on every load of a clip (resuming must not reshuffle its choices) */
-function seededShuffle<T>(list: T[], seed: string): T[] {
-	let h = 2166136261;
-	for (let i = 0; i < seed.length; i++) h = Math.imul(h ^ seed.charCodeAt(i), 16777619);
-	const next = () => {
-		h = Math.imul(h ^ (h >>> 15), 2246822507);
-		h = Math.imul(h ^ (h >>> 13), 3266489909);
-		return ((h ^= h >>> 16) >>> 0) / 4294967296;
-	};
-	const out = [...list];
-	for (let i = out.length - 1; i > 0; i--) {
-		const j = Math.floor(next() * (i + 1));
-		[out[i], out[j]] = [out[j]!, out[i]!];
-	}
-	return out;
-}
-
-/**
- * Choices of a "pick the answer" clip: the answer and the wrong ones set by the admin, else 3
- * phrases of the pool. Null when there is nothing to put next to the answer.
- */
-export function choicesOf(row: any, answer: string, pool: string[]): string[] | null {
+/** The wrong choices the team wrote for a clip (nothing is borrowed from other clips) */
+export function wrongOf(row: any): string[] {
 	const list = typeof row.choices === 'string' ? safeJson(row.choices) : row.choices;
-	const key = normPhrase(answer);
-	const seen = new Set([key]);
-	const pick = (items: unknown[], max: number) => {
-		const out: string[] = [];
-		for (const item of items) {
-			const text = String(item ?? '').replace(/\s+/g, ' ').trim();
-			const k = normPhrase(text);
-			if (!text || !k || seen.has(k)) continue;
-			seen.add(k);
-			out.push(text);
-			if (out.length >= max) break;
-		}
-		return out;
-	};
-	let wrong = Array.isArray(list) ? pick(list, 5) : [];
-	if (!wrong.length) wrong = pick(seededShuffle(pool, String(row.id)), 3);
-	if (!wrong.length) return null;
-	return seededShuffle([answer, ...wrong], `${row.id}:choices`);
+	if (!Array.isArray(list)) return [];
+	return list.map((item: unknown) => String(item ?? '').replace(/\s+/g, ' ').trim()).filter((text) => normPhrase(text));
 }
 
 /** YouTube video id and start (s) of a link: watch?v=, youtu.be/, embed/, shorts/; ?t=1m30s / &start=90 */
@@ -299,7 +261,7 @@ export function registerLessonRoutes(router: any, context: any) {
 					lessons_done: lessons.filter((l) => g.done.has(l.id)).length,
 					test: {
 						kind: allDone ? 'final' : 'skip',
-						available: open.length > 0 && (allDone || g.premium),
+						available: open.length > 0 && (allDone || g.premium) && (g.premium || !g.ruleLockedBy(skill)),
 						size: Number(settings?.test_size) || 8,
 						pass: Math.round((Number(settings?.pass_ratio) || 0.8) * 100),
 						// A second go the same day costs Xu
@@ -369,7 +331,7 @@ export function registerLessonRoutes(router: any, context: any) {
 							? { clear: extra.explain_clear_url || null, natural: extra.explain_natural_url || null }
 							: null,
 					},
-					skill: { id: skill.id, name: skill.name, slug: skill.slug, category: skill.category },
+					skill: { id: skill.id, name: skill.name, slug: skill.slug, category: skill.category, locked_by: g.skillSummary(skill).locked_by },
 					group: { id: group.id, name: group.name, slug: group.slug, answer_mode: group.answer_mode },
 					preview,
 					pool: rows.length,
