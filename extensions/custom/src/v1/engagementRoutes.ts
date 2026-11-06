@@ -2,7 +2,7 @@
  * Daily goal, XP, streak, leaderboard and spaced review.
  *
  *   GET   /me/engagement          XP today / this week, daily goal, streak, level, freezes,
- *                                 goal days in a row, rewards not shown yet, reviews due
+ *                                 goal days in a row, rewards not shown yet, reviews due, phrases due
  *   POST  /me/rewards/seen        { ids } the rewards were shown to the learner
  *   GET   /me/settings            daily goal, hidden from the leaderboard, learning goal,
  *                                 practice (how steps 2 and 3 are played, lib/lessons.ts PRACTICE)
@@ -68,11 +68,12 @@ export function registerEngagementRoutes(router: any, context: any) {
 		const userId = needUser(req, res);
 		if (!userId) return;
 		try {
-			const [engagement, due] = await Promise.all([
+			const [engagement, due, phrasesDue] = await Promise.all([
 				engagementOf(database, userId),
 				database('listening_reviews').where('user_id', userId).where('due_at', '<=', database.fn.now()).count('* as n').first(),
+				database('phrase_progress').where('user_id', userId).where('due', '<=', database.fn.now()).count('* as n').first(),
 			]);
-			return res.json({ success: true, data: { ...engagement, reviews_due: Number(due?.n) || 0 } });
+			return res.json({ success: true, data: { ...engagement, reviews_due: Number(due?.n) || 0, phrases_due: Number(phrasesDue?.n) || 0 } });
 		} catch (error) {
 			return fail(res, 'Load engagement', error);
 		}
