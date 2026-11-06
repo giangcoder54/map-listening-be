@@ -16,6 +16,7 @@
  * Rules, by lesson whatever its number of clips (the profile explains them: engagement.howXp*):
  *   +20 a lesson finished the first time (step 1 all right), +10 if an answer was looked at,
  *   +5 a lesson already finished, done again (once a day per lesson), +5 a review right.
+ *   Phrase Lab: +20 a phrase learned the first time, +5 a phrase review right (once a day per phrase).
  *   Days are Vietnam days.
  */
 import { activatePremiumForUser } from '../utils';
@@ -25,7 +26,7 @@ import { TZ, vnDay } from './days';
 
 export { TZ, vnDay };
 /** lesson_test: a lesson skipped by its test; skill_test: a rule skipped, or its final test passed */
-export const XP = { lesson: 20, lessonRevealed: 10, replay: 5, review: 5, lessonTest: 10, skillTest: 30 };
+export const XP = { lesson: 20, lessonRevealed: 10, replay: 5, review: 5, lessonTest: 10, skillTest: 30, phrase: 20, phraseReview: 5 };
 /** Streak freezes held at most; they are bought with Xu (lib/coins.ts) */
 export const MAX_FREEZES = 2;
 /** Daily goal reached this many days in a row: REWARD_PREMIUM_DAYS of Premium */
@@ -37,11 +38,11 @@ export const LEVELS = [0, 60, 200, 400, 700, 1100, 1600, 2400];
 export const DEFAULT_GOAL = 40;
 
 /** amount: when the rule's XP depends on how it was won (a lesson with an answer looked at) */
-export type XpRule = { reason: 'lesson' | 'replay' | 'review' | 'lesson_test' | 'skill_test'; dedupe: string; lessonId?: string | null; amount?: number };
+export type XpRule = { reason: 'lesson' | 'replay' | 'review' | 'lesson_test' | 'skill_test' | 'phrase' | 'phrase_review'; dedupe: string; lessonId?: string | null; amount?: number };
 /** key: the user_rewards dedupe key (premium:<day> | freeze:<n>) */
 export type NewReward = { kind: 'premium_day' | 'freeze'; days: number; key: string };
 
-const AMOUNT: Record<XpRule['reason'], number> = { lesson: XP.lesson, replay: XP.replay, review: XP.review, lesson_test: XP.lessonTest, skill_test: XP.skillTest };
+const AMOUNT: Record<XpRule['reason'], number> = { lesson: XP.lesson, replay: XP.replay, review: XP.review, lesson_test: XP.lessonTest, skill_test: XP.skillTest, phrase: XP.phrase, phrase_review: XP.phraseReview };
 
 const addDays = (day: string, n: number) => {
 	const d = new Date(`${day}T00:00:00Z`);

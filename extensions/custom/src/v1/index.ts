@@ -19,6 +19,8 @@ import { registerFeedbackRoutes } from './feedbackRoutes';
 import { registerAdminLessonRoutes } from './adminLessonRoutes';
 import { registerAdminRuleRoutes } from './adminRuleRoutes';
 import { registerEventRoutes } from './eventRoutes';
+import { registerPhraseRoutes } from './phraseRoutes';
+import { registerAdminPhraseRoutes } from './adminPhraseRoutes';
 import { staffRole } from '../lib/staff';
 
 
@@ -267,6 +269,8 @@ export default defineEndpoint((router, context) => {
 	registerAdminLessonRoutes(router, context);
 	registerAdminRuleRoutes(router, context);
 	registerEventRoutes(router, context);
+	registerPhraseRoutes(router, context);
+	registerAdminPhraseRoutes(router, context);
 
 	// =====================================================================
 	// POST /phrase-requests -> gợi ý cụm từ muốn có bài luyện (phải đăng nhập, không lưu ai gửi)
