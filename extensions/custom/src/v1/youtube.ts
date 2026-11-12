@@ -28,7 +28,7 @@ function maskProxy(url?: string): string {
 }
 
 // fetch có gắn proxy dispatcher (nếu có cấu hình). Node fetch chấp nhận option `dispatcher`.
-function proxiedFetch(url: string, init: RequestInit = {}): Promise<Response> {
+export function proxiedFetch(url: string, init: RequestInit = {}): Promise<Response> {
   const opts: any = { ...init };
   if (proxyDispatcher) opts.dispatcher = proxyDispatcher;
   return fetch(url, opts);
@@ -202,20 +202,52 @@ function parseTranscriptXml(xml: string) {
   return items;
 }
 
+/** Which subtitles a transcript came from (source_videos.transcript_kind) */
+export type TranscriptKind = "manual" | "asr" | "none";
+
+/**
+ * The subtitle track to read: one made by a person in the language (en, then en-US, en-GB…),
+ * else YouTube's automatic one. Never a track in another language: an English listening
+ * transcript cannot come from Spanish subtitles, so such a video has none.
+ */
+export function pickCaptionTrack(data: any, lang = "en"): { track: any; kind: TranscriptKind; lang: string | null } {
+  const tracks: any[] = data?.captions?.playerCaptionsTracklistRenderer?.captionTracks ?? [];
+  const inLang = (t: any) => {
+    const code = String(t?.languageCode || "").toLowerCase();
+    return code === lang || code.startsWith(`${lang}-`);
+  };
+  // The exact code first ("en" before "en-GB")
+  const ranked = tracks.filter(inLang).sort((a, b) => Number(b.languageCode === lang) - Number(a.languageCode === lang));
+  const track = ranked.find((t) => t.kind !== "asr") ?? ranked.find((t) => t.kind === "asr");
+  if (!track) return { track: null, kind: "none", lang: null };
+  return { track, kind: track.kind === "asr" ? "asr" : "manual", lang: track.languageCode || lang };
+}
+
+/**
+ * Transcript with where it came from. `kind` is 'none' when the video has no subtitles in the
+ * language; `items` is null when YouTube could not be read (try again later).
+ */
+export async function fetchCaptions(data: any, logger: any, lang = "en"): Promise<{ items: { text: string; start: number; end: number }[] | null; kind: TranscriptKind; lang: string | null }> {
+  const tracks: any[] = data?.captions?.playerCaptionsTracklistRenderer?.captionTracks ?? [];
+  logger.info(
+    `[youtube] caption tracks=${tracks.length} langs=[${tracks.map((t) => `${t.languageCode}${t.kind === "asr" ? "(asr)" : ""}`).join(", ")}]`
+  );
+  const picked = pickCaptionTrack(data, lang);
+  if (!picked.track) return { items: [], kind: "none", lang: null };
+  const items = await downloadTrack(picked.track, logger);
+  return { items, kind: picked.kind, lang: picked.lang };
+}
+
 /**
  * Lấy transcript từ chính response player đã fetch được (dùng lại data, không gọi thêm 1 lần).
  * Request tải phụ đề cũng đi qua proxy.
  */
 export async function fetchTranscriptFromPlayer(data: any, logger: any, lang = "en") {
-  const tracks: any[] = data?.captions?.playerCaptionsTracklistRenderer?.captionTracks ?? [];
-  logger.info(
-    `[youtube] caption tracks=${tracks.length} langs=[${tracks.map((t) => `${t.languageCode}${t.kind === "asr" ? "(asr)" : ""}`).join(", ")}]`
-  );
-  if (!tracks.length) return null;
+  const { items, kind } = await fetchCaptions(data, logger, lang);
+  return kind === "none" ? null : items;
+}
 
-  const officialTrack = tracks.find((t) => t.languageCode === lang && t.kind !== "asr");
-  const autoTrack = tracks.find((t) => t.languageCode === lang && t.kind === "asr");
-  const track = officialTrack ?? autoTrack ?? tracks[0];
+async function downloadTrack(track: any, logger: any) {
   if (!track?.baseUrl) {
     logger.warn(`[youtube] no baseUrl on selected caption track`);
     return null;
@@ -285,14 +317,16 @@ export function handleYoutubeCrawl(router: Router, context: any) {
         return res.status(404).json({ success: false, message: 'Video not found or unavailable.' });
       }
 
-      const transcript = await fetchTranscriptFromPlayer(data, logger, 'en');
-      logger.info(`[youtube/crawl] Transcript result: ${transcript ? transcript.length + ' segments' : 'null'}`);
+      const captions = await fetchCaptions(data, logger, 'en');
+      logger.info(`[youtube/crawl] Transcript result: ${captions.items ? captions.items.length + ' segments' : 'null'} kind=${captions.kind}`);
 
       return res.status(200).json({
         success: true,
         data: {
           video: videoMeta,
-          transcript: transcript || [],
+          transcript: captions.items || [],
+          transcript_kind: captions.kind,
+          transcript_lang: captions.lang,
         },
       });
     } catch (error: any) {

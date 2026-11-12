@@ -7,9 +7,10 @@
  *   pre        2   core + pool, listened to at most 3 times, right or wrong it goes on
  *   (the explanation screen comes here, between pre and voice: the page shows it)
  *   voice      1-2 the core phrase said by other people
- *   practice   4   the steps the team wrote (listening_lessons.practice: 3 pool + 1 trap, each a
- *                  choice, a word bank or a gap); none written: 3 pool + 1 trap drawn, formats
- *                  from easy to hard (choice, bank, gap)
+ *   practice   2-8 the steps the team wrote (listening_lessons.practice: pool and trap clips, as
+ *                  many of each as the team wants, each a choice, a word bank or a gap), in their
+ *                  order or shuffled for each learner (practice_shuffle); none written: 3 pool +
+ *                  1 trap drawn, formats from easy to hard (choice, bank, gap)
  *   challenge  1   fast or long clip
  *   retry          a practice item missed is asked once more, at the very end
  *
@@ -18,16 +19,21 @@
  * Pure functions here; the routes (v1/runRoutes.ts) read and write the rows.
  */
 import { normalizeAnswer } from '../v1/engagementRoutes';
-import { MIXED, reviewOfValue } from './lessons';
+import { MIXED, acceptOf, reviewOfValue } from './lessons';
+import { mistakesOf, type Mistake } from './mistakes';
 
 export const RUN = { pre: 2, voice: 2, practice: 4, challenge: 1, maxListens: 3 };
 /** Skip-ahead of one lesson: a few new phrases, 2 listens, no slow play nor "I can't hear it" */
 export const LESSON_TEST = { size: 4, maxListens: 2 };
 /** Listens per item by run mode */
 export const MAX_LISTENS: Record<string, number> = { learn: RUN.maxListens, review: RUN.maxListens, lesson_test: LESSON_TEST.maxListens, skill_test: LESSON_TEST.maxListens };
-/** Tries (hearts) at a typed item; tests and picked answers (choice, word bank) get one */
+/**
+ * Tries (hearts) at a typed item; tests and picked answers (choice, word bank) get one. So does
+ * the first listen before the explanation ('pre'): a guess, the answer shown at once, no heart lost.
+ */
 export const TRIES = 3;
-export function triesFor(mode: string, format: Format) {
+export function triesFor(mode: string, format: Format, phase?: string) {
+	if (phase === 'pre') return 1;
 	return (mode === 'learn' || mode === 'review') && (format === 'type' || format === 'gap') ? TRIES : 1;
 }
 
@@ -37,7 +43,8 @@ export type Phase = 'pre' | 'voice' | 'practice' | 'retry' | 'challenge' | 'post
 export type Format = 'type' | 'gap' | 'choice' | 'tap' | 'bank';
 export const FORMATS: Format[] = ['type', 'gap', 'choice', 'tap', 'bank'];
 /** time_ms: from the item shown to its last answer (older runs have none) */
-export type ItemResult = { correct: boolean; answer: string; listens: number; slow: boolean; hint: boolean; time_ms?: number | null };
+/** mistake: what a wrong answer says about what was heard (lib/mistakes.ts); trap: the clip is a trap */
+export type ItemResult = { correct: boolean; answer: string; listens: number; slow: boolean; hint: boolean; time_ms?: number | null; mistake?: Mistake | null; trap?: boolean };
 /**
  * lesson_id: the form the clip belongs to (tests of a rule and reviews mix forms)
  * wrong: the wrong choices or extra tiles of a step the team wrote (else the clip's own)
@@ -49,10 +56,15 @@ export type RunItem = { clip_id: string; phase: Phase; format: Format; lesson_id
  * A step of the practice the team wrote (listening_lessons.practice). prompt: the question the
  * learner reads instead of the format's own ("Phân biệt tell them và tell him"), optional
  */
-export type PracticeStep = { clip_id: string; format: 'choice' | 'bank' | 'gap'; wrong: string[]; prompt?: string };
+/** why: the line shown when a wrong choice is picked, by that wrong answer (optional) */
+export type PracticeStep = { clip_id: string; format: 'choice' | 'bank' | 'gap'; wrong: string[]; prompt?: string; why?: Record<string, string> };
 export const PROMPT_MAX = 120;
-/** wrong: least wrong answers a step needs, by format (a choice needs 2+ options in all) */
-export const PRACTICE = { steps: 4, traps: 1, wrong: { choice: 1, bank: 2 }, formats: ['choice', 'bank', 'gap'] as const };
+export const WHY_MAX = 200;
+/**
+ * steps: drawn when none is written; min / max: what the team may write; traps: recommended.
+ * wrong: least wrong answers a step needs, by format (a choice needs 2+ options in all)
+ */
+export const PRACTICE = { steps: 4, min: 2, max: 8, traps: 1, wrong: { choice: 1, bank: 2 }, formats: ['choice', 'bank', 'gap'] as const };
 
 /** The steps of listening_lessons.practice, whatever the column holds */
 export function practiceOf(value: unknown): PracticeStep[] {
@@ -65,7 +77,21 @@ export function practiceOf(value: unknown): PracticeStep[] {
 			format: s.format,
 			wrong: Array.isArray(s.wrong) ? s.wrong.map((w: unknown) => String(w ?? '').replace(/\s+/g, ' ').trim()).filter(Boolean) : [],
 			...(promptOf(s.prompt) ? { prompt: promptOf(s.prompt) } : {}),
-		}));
+			...(whyOf(s.why) ? { why: whyOf(s.why)! } : {}),
+		}))
+		.slice(0, PRACTICE.max);
+}
+
+/** A step's lines for its wrong answers: one line each, cut to WHY_MAX; null when none */
+export function whyOf(value: unknown): Record<string, string> | null {
+	if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+	const out: Record<string, string> = {};
+	for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+		const key = String(k).replace(/\s+/g, ' ').trim();
+		const line = typeof v === 'string' ? v.replace(/\s+/g, ' ').trim().slice(0, WHY_MAX) : '';
+		if (key && line) out[key] = line;
+	}
+	return Object.keys(out).length ? out : null;
 }
 
 /** A step's question, one line, cut to PROMPT_MAX ('' = none) */
@@ -86,7 +112,11 @@ export type PoolClip = {
 	hasChoices: boolean;
 	/** Those wrong choices */
 	wrong?: string[];
+	/** Other spellings also right when typed (listening_clips.accept_also), e.g. "needa" */
+	accept?: string[];
 };
+
+export { acceptOf };
 
 const words = (s: string) => normalizeAnswer(s).split(' ').filter(Boolean);
 
@@ -192,7 +222,7 @@ function shuffle<T>(list: T[], rand: () => number): T[] {
  * `script`: the practice the team wrote; its clips are kept out of pre. Without one, practice
  * is drawn; it may reuse pre clips when the pool has nothing left.
  */
-export function drawLesson(pool: PoolClip[], met: Set<string> = new Set(), rand: () => number = Math.random, script: PracticeStep[] = []): RunItem[] {
+export function drawLesson(pool: PoolClip[], met: Set<string> = new Set(), rand: () => number = Math.random, script: PracticeStep[] = [], opts: { shuffle?: boolean } = {}): RunItem[] {
 	const fresh = (role: PoolClip['role']) =>
 		shuffle(pool.filter((c) => c.role === role), rand).sort((a, b) => Number(met.has(a.id)) - Number(met.has(b.id)));
 	const used = new Set<string>();
@@ -223,8 +253,10 @@ export function drawLesson(pool: PoolClip[], met: Set<string> = new Set(), rand:
 	if (steps.length) {
 		practiceItems = steps.map((s, n) => {
 			const c = byId.get(s.clip_id)!;
-			return { clip_id: c.id, phase: 'practice', format: stepFormat(c, s, n), ...(s.wrong.length ? { wrong: s.wrong } : {}), result: null };
+			return { clip_id: c.id, phase: 'practice', format: stepFormat(c, s, n), ...(s.wrong.length ? { wrong: s.wrong } : {}), result: null } as RunItem;
 		});
+		// A new order for each learner, so a trap is not always in the same place
+		if (opts.shuffle) practiceItems = shuffle(practiceItems, rand);
 	} else {
 		let practice = take(pooled, RUN.practice - 1);
 		if (practice.length < 2) practice = [...practice, ...shuffle(pre.filter((c) => !practice.includes(c)), rand)].slice(0, RUN.practice - 1);
@@ -247,14 +279,16 @@ export function drawLesson(pool: PoolClip[], met: Set<string> = new Set(), rand:
  * its practice is the one written (same clips, same wrong answers), or a drawn one when none
  * is written. Else the learner starts again on the lesson as the team left it.
  */
-export function fitsLesson(items: RunItem[], script: PracticeStep[], has: (clipId: string) => boolean): boolean {
+export function fitsLesson(items: RunItem[], script: PracticeStep[], has: (clipId: string) => boolean, shuffled = false): boolean {
 	if (!items.every((it) => has(it.clip_id))) return false;
 	const count = (phase: Phase) => items.filter((it) => it.phase === phase).length;
-	if (count('pre') > RUN.pre || count('post') > 0 || count('practice') > RUN.practice) return false;
+	if (count('pre') > RUN.pre || count('post') > 0 || count('practice') > PRACTICE.max) return false;
 	const key = (clipId: string, wrong?: string[]) => `${clipId}:${(wrong || []).join('|')}`;
 	const practice = items.filter((it) => it.phase === 'practice').map((it) => key(it.clip_id, it.wrong));
 	const steps = script.filter((s) => has(s.clip_id)).map((s) => key(s.clip_id, s.wrong));
 	if (!steps.length) return items.every((it) => !it.wrong);
+	// Shuffled: the same steps, in any order
+	if (shuffled) return [...practice].sort().join(',') === [...steps].sort().join(',');
 	return practice.join(',') === steps.join(',');
 }
 
@@ -270,7 +304,7 @@ const DIFFICULTY_CYCLE = [1, 2, 2, 1, 3];
  * clips of the given forms (one form: a lesson's skip-ahead; every form of a rule: the
  * rule's test). The rules every draw keeps:
  *   - the forms take turns, so each one is asked about (as evenly as `size` allows)
- *   - at least one trap when the forms have one
+ *   - `traps` traps when the forms have them (a lesson's trap_draw, 1 by default; 0 = none)
  *   - difficulties mixed (DIFFICULTY_CYCLE), clips the learner has not met first
  * Items are typed (the whole phrase, or the part with the rule for a long sentence).
  */
@@ -279,9 +313,10 @@ export function drawTest(
 	size: number,
 	met: Set<string> = new Set(),
 	rand: () => number = Math.random,
+	traps = 1,
 ): RunItem[] {
 	const queues = shuffle(forms, rand)
-		.map((f) => ({ lessonId: f.lessonId, left: freshFirst(f.clips.filter((c) => c.role === 'pool' || c.role === 'trap'), met, rand) }))
+		.map((f) => ({ lessonId: f.lessonId, left: freshFirst(f.clips.filter((c) => c.role === 'pool' || (c.role === 'trap' && traps > 0)), met, rand) }))
 		.filter((q) => q.left.length);
 	const picked: { lessonId: string; clip: PoolClip }[] = [];
 	// Not met comes first, then the difficulty wanted among those
@@ -297,15 +332,17 @@ export function drawTest(
 		if (!q.left.length) continue;
 		picked.push({ lessonId: q.lessonId, clip: takeFrom(q, DIFFICULTY_CYCLE[picked.length % DIFFICULTY_CYCLE.length]!) });
 	}
-	// A trap that did not come up in turn replaces a pick of the same form, so the forms stay even
-	if (picked.length && !picked.some((p) => p.clip.role === 'trap')) {
+	// Traps that did not come up in turn replace pool picks, of the same form first, so the forms stay even
+	const wanted = Math.min(traps, picked.length);
+	while (picked.filter((p) => p.clip.role === 'trap').length < wanted) {
 		const q = queues.find((x) => x.left.some((c) => c.role === 'trap'));
-		if (q) {
-			const trap = q.left.splice(q.left.findIndex((c) => c.role === 'trap'), 1)[0]!;
-			let at = picked.map((p) => p.lessonId).lastIndexOf(q.lessonId);
-			if (at < 0) at = picked.length - 1;
-			picked[at] = { lessonId: q.lessonId, clip: trap };
-		}
+		if (!q) break;
+		const pools = picked.map((p, i) => ({ p, i })).filter((x) => x.p.clip.role !== 'trap');
+		if (!pools.length) break;
+		const trap = q.left.splice(q.left.findIndex((c) => c.role === 'trap'), 1)[0]!;
+		const same = pools.filter((x) => x.p.lessonId === q.lessonId);
+		const from = same.length ? same : pools;
+		picked[from[from.length - 1]!.i] = { lessonId: q.lessonId, clip: trap };
 	}
 	return shuffle(picked, rand).map((p) => ({ clip_id: p.clip.id, lesson_id: p.lessonId, phase: 'test', format: formatFor(p.clip, 'test'), result: null }));
 }
@@ -437,12 +474,15 @@ export function weakestForms(items: RunItem[]) {
 	return [...miss.entries()].sort((a, b) => b[1] - a[1]).map(([lessonId, missed]) => ({ lessonId, missed }));
 }
 
-/** Right or wrong, by format: the phrase, or only the part with the rule (gap, tap, choice, bank) */
+/**
+ * Right or wrong, by format: the phrase, or only the part with the rule (gap, tap, choice, bank).
+ * A typed answer (type, gap) is also right when it is one of the clip's other spellings.
+ */
 export function isRight(c: PoolClip, format: Format, given: string) {
 	const g = normalizeAnswer(given);
 	if (!g) return false;
-	if (format === 'type') return g === normalizeAnswer(c.answer);
-	return g === normalizeAnswer(targetOf(c));
+	if (g === normalizeAnswer(format === 'type' ? c.answer : targetOf(c))) return true;
+	return (format === 'type' || format === 'gap') && (c.accept || []).some((a) => normalizeAnswer(a) === g);
 }
 
 /**
@@ -472,6 +512,10 @@ export function summaryOf(items: RunItem[]) {
 		perfect: taught.length > 0 && taught.every((it) => it.result?.correct && !it.result.hint),
 		/** An answer looked at ("I can't hear it") */
 		hinted: answered.some((it) => it.result!.hint),
+		/** Traps answered, and how many right */
+		traps: { total: answered.filter((it) => it.result!.trap).length, right: answered.filter((it) => it.result!.trap && it.result!.correct).length },
+		/** What the wrong answers were, by kind, most first (lib/mistakes.ts) */
+		mistakes: mistakesOf(answered),
 		finished: items.length > 0 && items.every((it) => it.result),
 	};
 }

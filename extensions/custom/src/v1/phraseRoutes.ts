@@ -5,6 +5,8 @@
  *   GET  /phrases/types/:slug           one type and its phrases (my level, locked)
  *   GET  /phrases/lesson/:slug          everything a lesson shows; 403 PREMIUM_REQUIRED | DAILY_LIMIT
  *   POST /phrases/lesson/:slug/finish   { self_rating } -> level 1, first review date, XP
+ *   POST /phrases/lesson/:slug/roleplay { answer, input } -> AI: verdict, feedback, corrected
+ *                                       400 MISSING_PHRASE (no AI call) | 429 AI_LIMIT | 503 AI_DOWN
  *   GET  /phrases/review/due            today's review session (mode chosen by level)
  *   POST /phrases/review/:phraseId      { mode, correct?, self_rating?, ms, clip_id?, situation_index? }
  *   GET  /me/phrases                    my phrase bank: phrases per level, reflex speed per week
@@ -12,6 +14,9 @@
 import { Rating } from 'ts-fsrs';
 import { UUID_RE } from '../lib/lessons';
 import { grantRewards, recordPractice, vnDay } from '../lib/xp';
+import { aiConfigured } from '../lib/ai';
+import { clipTranscripts } from '../lib/clipTranscript';
+import { MAX_ANSWER, gradeReply, roleplayOf, translationFor, usesPhrase } from '../lib/roleplay';
 import {
 	REVIEW_SESSION, SELF_RATING, TZ, daysUntil, jsonList, levelAfter, loadPhraseCatalog, modeFor, pickSituation,
 	pickTranslation, ratingOf, schedule, cardColumns, todayKey, type ReviewMode, type SelfRating,
@@ -129,16 +134,25 @@ export function registerPhraseRoutes(router: any, context: any) {
 				return res.status(403).json({ success: false, code: 'DAILY_LIMIT', data: { ...base, new_limit: c.newLimit } });
 			}
 
-			const [trRows, clips] = await Promise.all([
+			const [trRows, clips, rp] = await Promise.all([
 				database('phrases_translations').select('*').where('phrases_id', phrase.id),
 				database('phrase_clips as c')
 					.leftJoin('source_videos as sv', 'sv.id', 'c.source_video_id')
-					.select('c.id', 'c.youtube_video_id', 'c.start_time', 'c.end_time', 'c.line_text', 'c.context', 'sv.title as video_title')
+					.select('c.id', 'c.youtube_video_id', 'c.source_video_id', 'c.start_time', 'c.end_time', 'c.line_text', 'c.context', 'sv.title as video_title')
 					.where({ 'c.phrase_id': phrase.id, 'c.status': 'published' })
 					.orderByRaw('c.sort ASC NULLS LAST, c.date_created ASC'),
+				database('phrases').select('roleplay').where('id', phrase.id).first(),
 			]);
 			const tr = pickTranslation(trRows, locale) || ({} as any);
 			const clipLimit = c.premium ? clips.length : c.cfg.phraseFreeClips;
+			// The words of each clip shown, with a line or two of context before the phrase
+			const shown = clips.slice(0, clipLimit);
+			const cuts = await clipTranscripts(
+				database,
+				shown.map((clip: any) => ({ id: clip.id, source_video_id: clip.source_video_id, start: Number(clip.start_time), end: Number(clip.end_time) })),
+				locale.slice(0, 2) || 'vi',
+				phrase.text,
+			).catch(() => new Map());
 			const list = (c.byType.get(phrase.type_id) || []);
 			const index = list.findIndex((p) => p.id === phrase.id);
 			const next = list.slice(index + 1).find((p) => !c.progress.has(p.id)) || null;
@@ -160,7 +174,10 @@ export function registerPhraseRoutes(router: any, context: any) {
 					replies: jsonList(tr.replies),
 					// The lesson's reflex step uses the first situation; reviews use the others first
 					situation: jsonList(tr.situations)[0] || null,
-					clips: clips.slice(0, clipLimit).map((clip: any) => ({
+					// Step 4: dialogue to answer, suggestions shown after the answer
+					roleplay: roleplayOf(rp?.roleplay, translationFor(trRows, locale), phrase.text, tr),
+					ai_check: aiConfigured(),
+					clips: shown.map((clip: any) => ({
 						id: clip.id,
 						youtube_video_id: clip.youtube_video_id,
 						start: Number(clip.start_time),
@@ -168,6 +185,9 @@ export function registerPhraseRoutes(router: any, context: any) {
 						line_text: clip.line_text || '',
 						context: clip.context || '',
 						video_title: clip.video_title || '',
+						lead_start: cuts.get(clip.id)?.lead_start ?? Math.max(0, Number(clip.start_time) - 2),
+						end_play: cuts.get(clip.id)?.end ?? Number(clip.end_time) + 0.4,
+						lines: cuts.get(clip.id)?.lines ?? [],
 					})),
 					more_clips: Math.max(0, clips.length - clipLimit),
 					level: learned?.level ?? 0,
@@ -213,6 +233,57 @@ export function registerPhraseRoutes(router: any, context: any) {
 			return res.json({ success: true, data: { level: 1, next_in_days: daysUntil(card.due), xp: won.xp, again: false } });
 		} catch (error) {
 			return fail(res, 'Finish lesson', error);
+		}
+	});
+
+	// ── Lesson step 4: role-play answer checked by AI ─────────────────────
+	router.post('/phrases/lesson/:slug/roleplay', async (req: any, res: any) => {
+		const userId = needUser(req, res);
+		if (!userId) return;
+		const answer = String(req.body?.answer || '').replace(/\s+/g, ' ').trim();
+		const input = req.body?.input === 'voice' ? 'voice' : 'text';
+		if (!answer || answer.length > MAX_ANSWER) return res.status(400).json({ success: false, message: 'Invalid answer' });
+		try {
+			const c = await loadPhraseCatalog(req, context);
+			const phrase = c.phrases.find((p: any) => p.slug === String(req.params.slug));
+			if (!phrase) return res.status(404).json({ success: false, message: 'Not found' });
+			if (c.isLocked(phrase)) return res.status(403).json({ success: false, code: 'PREMIUM_REQUIRED' });
+			// The phrase must be in the answer: said here, no AI call spent
+			if (!usesPhrase(answer, phrase.text)) return res.status(400).json({ success: false, code: 'MISSING_PHRASE' });
+			if (!aiConfigured()) return res.status(503).json({ success: false, code: 'AI_DOWN' });
+
+			const limit = c.premium ? c.cfg.phraseAiChecksPremium : c.cfg.phraseAiChecksFree;
+			const used = await database('phrase_roleplay_checks')
+				.where('user_id', userId)
+				.whereRaw(`(date_created AT TIME ZONE '${TZ}')::date = (now() AT TIME ZONE '${TZ}')::date`)
+				.count('* as n').first();
+			if ((Number(used?.n) || 0) >= limit) {
+				return res.status(429).json({ success: false, code: 'AI_LIMIT', data: { limit, premium: c.premium } });
+			}
+
+			const locale = localeOf(req);
+			const [trRows, base] = await Promise.all([
+				database('phrases_translations').select('*').where('phrases_id', phrase.id),
+				database('phrases').select('roleplay').where('id', phrase.id).first(),
+			]);
+			const tr = pickTranslation(trRows, locale) || ({} as any);
+			const roleplay = roleplayOf(base?.roleplay, translationFor(trRows, locale), phrase.text, tr);
+			const started = Date.now();
+			const result = await gradeReply({ phrase: phrase.text, meaning: tr.meaning || '', roleplay, answer, locale }, logger);
+			await database('phrase_roleplay_checks').insert({
+				user_id: userId,
+				phrase_id: phrase.id,
+				answer,
+				input,
+				verdict: result?.verdict ?? null,
+				feedback: result?.feedback ?? null,
+				corrected: result?.corrected ?? null,
+				ms: Date.now() - started,
+			});
+			if (!result) return res.status(503).json({ success: false, code: 'AI_DOWN' });
+			return res.json({ success: true, data: { ...result, left: Math.max(0, limit - (Number(used?.n) || 0) - 1) } });
+		} catch (error) {
+			return fail(res, 'Check role-play', error);
 		}
 	});
 

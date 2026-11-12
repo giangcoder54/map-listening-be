@@ -13,7 +13,8 @@ import { vnDay } from './days';
 
 export const COIN = {
 	cap: 500,
-	earn: { lesson: 10, perfect: 5, goal: 10, review: 3 },
+	/** trap: a trap clip answered right in a lesson or a review, once per clip a day (v1/runRoutes.ts) */
+	earn: { lesson: 10, perfect: 5, goal: 10, review: 3, trap: 3 },
 	/** Unlock a lesson for good, by lesson kind */
 	unlock: { pattern: 150, trap: 150, mixed: 250 } as Record<string, number>,
 	weeklyUnlocks: 2,
@@ -22,7 +23,7 @@ export const COIN = {
 	retest: 30,
 };
 
-export type CoinReason = 'lesson' | 'perfect' | 'goal' | 'streak' | 'review' | 'ad' | 'unlock' | 'premium_day' | 'freeze' | 'retest' | 'refund' | 'admin';
+export type CoinReason = 'lesson' | 'perfect' | 'goal' | 'streak' | 'review' | 'ad' | 'unlock' | 'premium_day' | 'freeze' | 'retest' | 'refund' | 'admin' | 'trap';
 export class CoinError extends Error {
 	constructor(public code: 'NOT_ENOUGH' | 'WEEKLY_LIMIT' | 'ALREADY' | 'MAX_FREEZES' | 'NOT_LOCKED') { super(code); }
 }

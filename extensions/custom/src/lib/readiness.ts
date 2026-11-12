@@ -8,7 +8,7 @@
  *   core 1, voice 1, challenge 1, trap 1, pool 7 (3 for practice + 4 for the tests; 9 is better)
  *   every pool clip has its [bracketed] answer (what the learner has to hear: gaps, choices,
  *   word banks, highlights), or an answer of its own
- *   the practice: 4 steps, 1 of them a trap, each choice with 2+ options, each word bank with 2 wrong words
+ *   the practice: 2-8 steps (a trap among them recommended), each choice with 2+ options, each word bank with 2 wrong words
  *   an explanation, and both explanation sounds ("said clearly" / "said naturally")
  * Only core, voice, pool, challenge, the wrong answers of the practice and the explanation
  * hold publishing back; the rest are shown as recommended.
@@ -83,8 +83,8 @@ export async function readinessOf(db: any, lessonId: string): Promise<Readiness>
 		{ key: 'challenge', ok: counts.challenge >= READY.challenge, have: counts.challenge, need: READY.challenge, text: 'At least 1 challenge clip' },
 		{ key: 'trap', ok: counts.trap >= READY.trap, have: counts.trap, need: READY.trap, text: 'At least 1 trap clip (where the rule does not apply)' },
 		{ key: 'marked', ok: pool.length > 0 && marked === pool.length, have: marked, need: pool.length, text: 'Every pool clip has its [bracketed] answer' },
-		{ key: 'practice', ok: steps.length === PRACTICE.steps, have: steps.length, need: PRACTICE.steps, text: `Practice: ${PRACTICE.steps} steps on pool or trap clips` },
-		{ key: 'practiceTrap', ok: trapSteps >= PRACTICE.traps, have: trapSteps, need: PRACTICE.traps, text: 'Practice: 1 step on a trap clip' },
+		{ key: 'practice', ok: steps.length >= PRACTICE.min && steps.length <= PRACTICE.max, have: steps.length, need: PRACTICE.min, text: `Practice: ${PRACTICE.min}-${PRACTICE.max} steps on pool or trap clips` },
+		{ key: 'practiceTrap', ok: trapSteps >= PRACTICE.traps, have: trapSteps, need: PRACTICE.traps, text: 'Practice: at least 1 step on a trap clip (recommended)' },
 		{ key: 'practiceSteps', ok: steps.length > 0 && goodSteps === steps.length, have: goodSteps, need: steps.length, text: `Practice: every choice has ${PRACTICE.wrong.choice + 1}+ options, every word bank ${PRACTICE.wrong.bank} wrong words` },
 		{ key: 'explanation', ok: explained, have: Number(explained), need: 1, text: 'An explanation' },
 		{ key: 'audio', ok: audio === 2, have: audio, need: 2, text: 'Both sounds: said clearly and said naturally' },

@@ -5,14 +5,18 @@
  *   POST /youtube/transcript           { youtube_video_id | url, refresh? }  stored one, else from YouTube
  *   POST /youtube/library/add          { url | urls[] }  add videos, no lesson needed (English transcript required)
  *   POST /youtube/transcripts/index    { limit? }  fetch the next videos never fetched yet
+ *   POST /youtube/transcripts/kinds    { limit? }  fill transcript_kind / _lang of videos fetched
+ *                                      before those were kept (the transcript stays as it is)
  *   GET  /youtube/transcripts/stats    how many library videos have one
  *   GET  /youtube/transcripts/search   ?q=let him&scope=all|unused&ids=a,b   videos where it is
  *                                      said, with the lines; unused videos (in no lesson) first
  *
  * A transcript is [{ text, start, end }] in ms; [] means YouTube has none for the video.
+ * transcript_kind says which subtitles it came from: 'manual' (made by a person), 'asr'
+ * (YouTube's automatic ones), 'none' (no English subtitles); NULL = not known.
  */
 import type { Router } from 'express';
-import { extractVideoId, fetchPlayer, fetchTranscriptFromPlayer, getVideoMeta } from './youtube';
+import { extractVideoId, fetchCaptions, fetchPlayer, getVideoMeta, pickCaptionTrack } from './youtube';
 import { isStaff } from '../lib/staff';
 
 type Line = { text: string; start: number; end: number };
@@ -28,9 +32,15 @@ async function fromYouTube(videoId: string, logger: any) {
 	const { data } = await fetchPlayer(videoId, logger);
 	const meta = data ? getVideoMeta(data, videoId) : null;
 	if (!meta) return null;
-	const transcript = ((await fetchTranscriptFromPlayer(data, logger, 'en')) || []) as Line[];
-	return { meta, transcript };
+	const captions = await fetchCaptions(data, logger, 'en');
+	const transcript = (captions.items || []) as Line[];
+	// The track could not be downloaded: which subtitles it has is still known, but nothing is kept
+	const kind = captions.items ? captions.kind : null;
+	return { meta, transcript, kind, lang: kind ? captions.lang : null };
 }
+
+/** Columns that say where a fetched transcript came from */
+const kindOf = (yt: { kind: string | null; lang: string | null }) => ({ transcript_kind: yt.kind, transcript_lang: yt.lang });
 
 const VIDEO_FIELDS = ['id', 'youtube_video_id', 'title', 'channel_name', 'thumbnail_url'];
 
@@ -44,29 +54,30 @@ export function handleVideoTranscripts(router: Router, context: any) {
 			const videoId = String(body.youtube_video_id || '') || extractVideoId(String(body.url || ''));
 			if (!videoId || !/^[\w-]{11}$/.test(videoId)) return res.status(400).json({ success: false, message: 'Invalid YouTube URL.' });
 
-			const row = await database('source_videos').select([...VIDEO_FIELDS, 'transcript', 'transcript_updated_at']).where('youtube_video_id', videoId).first();
+			const row = await database('source_videos').select([...VIDEO_FIELDS, 'transcript', 'transcript_updated_at', 'transcript_kind', 'transcript_lang']).where('youtube_video_id', videoId).first();
 			if (row?.transcript && !body.refresh) {
-				const { transcript, transcript_updated_at, ...video } = row;
-				return res.json({ success: true, data: { video, transcript, stored: true, fetched_at: transcript_updated_at } });
+				const { transcript, transcript_updated_at, transcript_kind, transcript_lang, ...video } = row;
+				return res.json({ success: true, data: { video, transcript, transcript_kind, transcript_lang, stored: true, fetched_at: transcript_updated_at } });
 			}
 
 			const yt = await fromYouTube(videoId, logger);
 			if (!yt) {
 				if (row) {
-					const { transcript, transcript_updated_at, ...video } = row;
-					return res.json({ success: true, data: { video, transcript: transcript || [], stored: !!transcript, fetched_at: transcript_updated_at, warning: 'YouTube could not be read.' } });
+					const { transcript, transcript_updated_at, transcript_kind, transcript_lang, ...video } = row;
+					return res.json({ success: true, data: { video, transcript: transcript || [], transcript_kind, transcript_lang, stored: !!transcript, fetched_at: transcript_updated_at, warning: 'YouTube could not be read.' } });
 				}
 				return res.status(404).json({ success: false, message: 'Video not found or unavailable.' });
 			}
 			const now = new Date();
 			if (row) {
-				await database('source_videos').where('id', row.id).update({ transcript: JSON.stringify(yt.transcript), transcript_updated_at: now });
+				await database('source_videos').where('id', row.id).update({ transcript: JSON.stringify(yt.transcript), transcript_updated_at: now, ...kindOf(yt) });
 			}
 			return res.json({
 				success: true,
 				data: {
 					video: { id: row?.id || null, ...yt.meta },
 					transcript: yt.transcript,
+					...kindOf(yt),
 					stored: !!row,
 					fetched_at: now,
 				},
@@ -121,8 +132,8 @@ export function handleVideoTranscripts(router: Router, context: any) {
 				const { duration, ...meta } = yt.meta;
 				let id = row?.id;
 				// Already in the library but never fetched: only its transcript is missing
-				if (id) await database('source_videos').where('id', id).update({ transcript: JSON.stringify(yt.transcript), transcript_updated_at: now });
-				else id = await videos.createOne({ ...meta, transcript: yt.transcript, transcript_updated_at: now });
+				if (id) await database('source_videos').where('id', id).update({ transcript: JSON.stringify(yt.transcript), transcript_updated_at: now, ...kindOf(yt) });
+				else id = await videos.createOne({ ...meta, transcript: yt.transcript, transcript_updated_at: now, ...kindOf(yt) });
 				results.push({
 					input,
 					status: row ? 'transcript_added' : 'added',
@@ -137,6 +148,31 @@ export function handleVideoTranscripts(router: Router, context: any) {
 		return res.json({ success: true, data: results });
 	});
 
+	// Videos fetched before transcript_kind was kept: read which subtitles they have, without
+	// downloading or changing the transcript (clips are timed on its lines). A few per call.
+	router.post('/youtube/transcripts/kinds', async (req: any, res: any) => {
+		if (adminOnly(req, res)) return;
+		const limit = Math.min(20, Math.max(1, Number(req.body?.limit) || 10));
+		const rows = await database('source_videos').select('id', 'youtube_video_id')
+			.whereNull('transcript_kind').whereNotNull('transcript_updated_at').orderBy('date_created', 'desc').limit(limit);
+		let done = 0;
+		let failed = 0;
+		for (const row of rows) {
+			try {
+				const { data } = await fetchPlayer(row.youtube_video_id, logger);
+				if (!data?.videoDetails) { failed++; continue; }
+				const picked = pickCaptionTrack(data, 'en');
+				await database('source_videos').where('id', row.id).update({ transcript_kind: picked.kind, transcript_lang: picked.lang });
+				done++;
+			} catch (e: any) {
+				failed++;
+				logger.warn(`[youtube/transcripts/kinds] ${row.youtube_video_id}: ${e?.message}`);
+			}
+		}
+		const left = await database('source_videos').whereNull('transcript_kind').whereNotNull('transcript_updated_at').count('* as n').first();
+		return res.json({ success: true, data: { done, failed, remaining: Number(left?.n) || 0 } });
+	});
+
 	router.get('/youtube/transcripts/stats', async (req: any, res: any) => {
 		if (adminOnly(req, res)) return;
 		const row = await database('source_videos')
@@ -144,6 +180,9 @@ export function handleVideoTranscripts(router: Router, context: any) {
 				database.raw('COUNT(*)::int AS total'),
 				database.raw('COUNT(*) FILTER (WHERE transcript_updated_at IS NOT NULL)::int AS fetched'),
 				database.raw("COUNT(*) FILTER (WHERE jsonb_array_length(COALESCE(transcript, '[]'::jsonb)) > 0)::int AS with_transcript"),
+				database.raw("COUNT(*) FILTER (WHERE transcript_kind = 'manual')::int AS manual"),
+				database.raw("COUNT(*) FILTER (WHERE transcript_kind = 'asr')::int AS asr"),
+				database.raw("COUNT(*) FILTER (WHERE transcript_updated_at IS NOT NULL AND transcript_kind IS NULL)::int AS kind_unknown"),
 			)
 			.first();
 		return res.json({ success: true, data: row });
@@ -163,6 +202,7 @@ export function handleVideoTranscripts(router: Router, context: any) {
 				await database('source_videos').where('id', row.id).update({
 					transcript: JSON.stringify(yt?.transcript || []),
 					transcript_updated_at: new Date(),
+					...(yt ? kindOf(yt) : {}),
 				});
 				if (yt?.transcript.length) ok++;
 				else failed++;
