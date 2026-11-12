@@ -54,6 +54,9 @@ export const growthConfig = () => ({
 	phraseFreeNewPerDay: num('phrase_free_new_per_day', 'PHRASE_FREE_NEW_PER_DAY', 3, 0, 100),
 	phraseFreePerType: num('phrase_free_per_type', 'PHRASE_FREE_PER_TYPE', 3, 0, 1000),
 	phraseFreeClips: num('phrase_free_clips', 'PHRASE_FREE_CLIPS', 2, 1, 50),
+	/** Phrase Lab role-play: AI checks a day (free / Premium); only a guard against abuse (~4 VND a check) */
+	phraseAiChecksFree: num('phrase_ai_checks_free', 'PHRASE_AI_CHECKS_FREE', 200, 0, 10000),
+	phraseAiChecksPremium: num('phrase_ai_checks_premium', 'PHRASE_AI_CHECKS_PREMIUM', 200, 0, 10000),
 });
 
 /** Site origin for links shown to users (invite link...) */

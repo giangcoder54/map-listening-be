@@ -240,6 +240,12 @@ export function registerLessonRoutes(router: any, context: any) {
 			if (!skill) return res.status(404).json({ success: false, message: 'Skill not found' });
 			const group = g.groupById.get(skill.group_id)!;
 			const lessons = g.lessonsBySkill.get(skill.id) || [];
+			// Each lesson is named on the path by the title of its explanation screen
+			// ("to đọc nhẹ thành “tơ”"): it names the rule, not the answer, so it shows before the lesson is done
+			const trs = await lessonTranslations(database, lessons.map((l) => l.id));
+			const titlesOf = (id: string) => (trs.get(id) || [])
+				.filter((tr: any) => String(tr.title ?? '').trim())
+				.map((tr: any) => ({ languages_code: tr.languages_code, title: String(tr.title).trim() }));
 			// The learner on this rule: learning / mastered / tested out, the bar that fades without
 			// review, and the rule's test (skip it: Premium; final test: once every open lesson is done)
 			let standing: any = null;
@@ -274,7 +280,7 @@ export function registerLessonRoutes(router: any, context: any) {
 				data: {
 					premium: g.premium,
 					skill: { ...g.skillSummary(skill), group: { id: group.id, name: group.name, slug: group.slug, answer_mode: group.answer_mode } },
-					lessons: lessons.map(g.lessonCard),
+					lessons: lessons.map((l) => ({ ...g.lessonCard(l), titles: titlesOf(l.id) })),
 					standing,
 				},
 			});

@@ -13,7 +13,7 @@
  *
  * XP, streak, freezes and rewards: lib/xp.ts (rules, the ledger, the reads). Days are Vietnam days.
  */
-import { PRACTICE, UUID_RE, answerOf, practicePrefsOf } from '../lib/lessons';
+import { PRACTICE, UUID_RE, acceptOf, answerOf, practicePrefsOf } from '../lib/lessons';
 import { isPremiumUser } from '../lib/premium';
 import { DEFAULT_GOAL, TZ, XP, engagementOf, grantRewards, recordPractice } from '../lib/xp';
 
@@ -25,9 +25,24 @@ export const LEARNING_GOALS = ['exam', 'movies', 'work', 'general', 'other'];
 /** How well they understand spoken English, in their own view: one answer (2026-10-30_listening_level.sql) */
 export const LISTENING_LEVELS = ['beginner', 'elementary', 'intermediate', 'advanced'];
 
-/** Same normalisation as the lesson player (listening-lab/[id].vue) */
+const ONES = ['zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten', 'eleven', 'twelve',
+	'thirteen', 'fourteen', 'fifteen', 'sixteen', 'seventeen', 'eighteen', 'nineteen'];
+const TENS = ['', '', 'twenty', 'thirty', 'forty', 'fifty', 'sixty', 'seventy', 'eighty', 'ninety'];
+/** 0–99 in words ("2" → "two", "21" → "twenty one"); bigger numbers stay digits */
+const numberWords = (n: number) => (n < 20 ? ONES[n]! : TENS[Math.floor(n / 10)]! + (n % 10 ? ` ${ONES[n % 10]}` : ''));
+
+/**
+ * How typed answers are compared: case, punctuation and curly quotes do not count, a hyphen
+ * splits words ("twenty-one" = "twenty one") and a small number typed in digits is its words
+ * ("2" = "two"): the learner heard it right either way.
+ */
 export const normalizeAnswer = (text: string) =>
-	String(text || '').toLowerCase().replace(/[^\w\s']/g, '').replace(/\s+/g, ' ').trim();
+	String(text || '').toLowerCase()
+		.replace(/[’‘`]/g, "'")
+		.replace(/[-–—/]/g, ' ')
+		.replace(/[^\w\s']/g, '')
+		.replace(/\b\d{1,2}\b/g, (d) => numberWords(Number(d)))
+		.replace(/\s+/g, ' ').trim();
 
 const periodStart = (unit: 'week' | 'month') => `date_trunc('${unit}', now() AT TIME ZONE '${TZ}')::date`;
 
@@ -189,7 +204,14 @@ export function registerEngagementRoutes(router: any, context: any) {
 				cached = { at: Date.now(), rows: (sums.rows || []).map((r: any) => ({ user_id: r.user_id, xp: Number(r.xp) || 0 })) };
 				leaderboardCache.set(unit, cached);
 			}
-			const ranked = cached.rows;
+			let ranked = cached.rows;
+			// The learner's own XP fresh (a lesson just finished is not in the 2-minute cache yet)
+			if (userId) {
+				const own = await database.raw(`SELECT coalesce(sum(xp), 0)::int AS xp FROM user_daily_stats WHERE user_id = ? AND day >= ${periodStart(unit)}`, [userId]);
+				const xp = Number(own.rows?.[0]?.xp) || 0;
+				ranked = ranked.filter((r) => r.user_id !== userId);
+				if (xp > 0) ranked = [...ranked, { user_id: userId, xp }].sort((a, b) => b.xp - a.xp);
+			}
 			const ids = ranked.map((r: any) => r.user_id);
 			const users = ids.length
 				? await database('directus_users').select('id', 'first_name', 'last_name', 'avatar', 'avatar_url', 'leaderboard_hidden', 'status').whereIn('id', ids)
@@ -212,10 +234,23 @@ export function registerEngagementRoutes(router: any, context: any) {
 				};
 			});
 			const mine = rows.find((r: any) => r.me) || null;
+			/**
+			 * ?gained=N (the end of a lesson): where the learner stood before those N XP (null: not on
+			 * the board yet), and the rows around them now: one above, the ones just passed below
+			 */
+			const gained = Math.max(0, Math.floor(Number(req.query.gained) || 0));
+			let prevRank: number | null | undefined;
+			let around: typeof rows | undefined;
+			if (mine && req.query.gained !== undefined) {
+				const before = mine.xp - gained;
+				prevRank = before > 0 ? 1 + rows.filter((r: any) => !r.me && r.xp > before).length : null;
+				const at = mine.rank - 1;
+				around = rows.slice(Math.max(0, at - 1), at + 5);
+			}
 			const ends = await database.raw(`SELECT (date_trunc('${unit}', now() AT TIME ZONE '${TZ}') + interval '1 ${unit}') AT TIME ZONE '${TZ}' AS ends_at`);
 			return res.json({
 				success: true,
-				data: { period: unit, ends_at: ends.rows?.[0]?.ends_at, top: rows.slice(0, 50), me: mine, learners: rows.length },
+				data: { period: unit, ends_at: ends.rows?.[0]?.ends_at, top: rows.slice(0, 50), me: mine, learners: rows.length, prev_rank: prevRank, around },
 			});
 		} catch (error) {
 			return fail(res, 'Load leaderboard', error);
@@ -291,7 +326,7 @@ export function registerEngagementRoutes(router: any, context: any) {
 				.join('listening_lessons as l', 'l.id', 'c.lesson_id')
 				.join('listening_skills as s', 's.id', 'l.skill_id')
 				.join('listening_groups as g', 'g.id', 's.group_id')
-				.select('r.id', 'r.box', 'c.id as clip_id', 'c.step', 'c.challenge_mode', 'c.answer', 'c.transcript', 'l.id as lesson_id', 'l.text', 'g.answer_mode',
+				.select('r.id', 'r.box', 'c.id as clip_id', 'c.step', 'c.challenge_mode', 'c.answer', 'c.accept_also', 'c.transcript', 'l.id as lesson_id', 'l.text', 'g.answer_mode',
 					database.raw('(l.is_premium OR s.is_premium OR g.is_premium) AS premium_content'))
 				.where({ 'r.user_id': userId, 'r.clip_id': clipId })
 				.first();
@@ -300,7 +335,8 @@ export function registerEngagementRoutes(router: any, context: any) {
 				return res.status(403).json({ success: false, code: 'PREMIUM_REQUIRED' });
 			}
 			const answer = answerOf(r, r.text, r.answer_mode === 'per_clip' ? 'per_clip' : 'one_answer');
-			const correct = !reveal && normalizeAnswer(given) === normalizeAnswer(answer);
+			const correct = !reveal && !!normalizeAnswer(given)
+				&& [answer, ...acceptOf(r.accept_also)].some((a) => normalizeAnswer(a) === normalizeAnswer(given));
 
 			let box = r.box;
 			let mastered = false;

@@ -90,23 +90,24 @@ const bySort = (a: { sort: number | null; name?: string }, b: { sort: number | n
 
 export const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+/** listening_clips.accept_also ("needa | neeta", or one per line): other spellings also right when typed */
+export const acceptOf = (raw: unknown): string[] =>
+	String(raw ?? '').split(/[|\n]/).map((s) => s.replace(/\s+/g, ' ').trim()).filter(Boolean);
+
 /**
- * The answer of a clip: its own `answer`; else the [bracketed] part for per-clip groups,
- * step 4 "more practice" (other phrases: "let him go" in a "tell him" lesson) and a "whole
- * sentence" challenge (lines outside the brackets are context, heard but not typed); else
- * the lesson text.
+ * The answer of a clip: its own `answer`; else the [bracketed] part of its transcript, whatever
+ * its role: the blank the learner fills is that bracket, and it often differs from the lesson's
+ * name ("me and you" in a "You and me" lesson, "you'd be" in "I'd be", "a hundred grand" in
+ * "Big Money"); else (no bracket) the lesson text. `mode` is kept for the callers.
  */
 export function answerOf(
 	clip: { answer?: string | null; transcript?: string | null; step?: string | null; role?: string | null; challenge_mode?: string | null },
 	lessonText: string,
-	mode: AnswerMode,
+	_mode: AnswerMode,
 ) {
 	if (clip.answer && clip.answer.trim()) return clip.answer.trim();
-	const otherPhrase = clip.step === 'more' || (clip.step !== 'type' && (clip.role === 'pool' || clip.role === 'trap'));
-	if (mode === 'per_clip' || otherPhrase || (clip.step === 'challenge' && clip.challenge_mode === 'sentence')) {
-		const m = String(clip.transcript || '').match(/\[([^\]]+)\]/);
-		if (m?.[1]) return m[1].replace(/\s+/g, ' ').trim();
-	}
+	const m = String(clip.transcript || '').match(/\[([^\]]+)\]/);
+	if (m?.[1]) return m[1].replace(/\s+/g, ' ').trim();
 	return lessonText;
 }
 

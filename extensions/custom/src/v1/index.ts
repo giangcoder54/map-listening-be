@@ -4,6 +4,7 @@ import { handleSepayWebhook } from './sepay';
 import { handlePolar } from './polar';
 import { handleYoutubeCrawl } from './youtube';
 import { handleVideoTranscripts } from './videoTranscripts';
+import { handleYoutubeChannel } from './youtubeChannel';
 import { ensurePaymentSchema } from '../lib/paymentSchema';
 import { registerLessonRoutes } from './lessonRoutes';
 import { registerRunRoutes } from './runRoutes';
@@ -17,6 +18,7 @@ import { registerAdminGrowthRoutes } from './adminGrowthRoutes';
 import { registerAdminDashboardRoutes } from './adminDashboardRoutes';
 import { registerFeedbackRoutes } from './feedbackRoutes';
 import { registerAdminLessonRoutes } from './adminLessonRoutes';
+import { registerAdminVietsubRoutes } from './adminVietsubRoutes';
 import { registerAdminRuleRoutes } from './adminRuleRoutes';
 import { registerEventRoutes } from './eventRoutes';
 import { registerPhraseRoutes } from './phraseRoutes';
@@ -74,6 +76,7 @@ export default defineEndpoint((router, context) => {
 
 	handleYoutubeCrawl(router, context);
 	handleVideoTranscripts(router, context);
+	handleYoutubeChannel(router, context);
 
 	router.post('/register', async (req, res) => {
 		try {
@@ -82,8 +85,16 @@ export default defineEndpoint((router, context) => {
 			if (!email || !password) {
 				return res.status(400).json({
 					success: false,
+					code: 'MISSING_FIELDS',
 					error: 'Email and password are required',
 				});
+			}
+			// A malformed address used to reach Directus and come back as a 500 "server error"
+			if (typeof email !== 'string' || email.length > 254 || !/^[^\s@]+@[^\s@.]+(\.[^\s@.]+)*\.[a-z]{2,}$/i.test(email.trim())) {
+				return res.status(400).json({ success: false, code: 'INVALID_EMAIL', error: 'Invalid email address' });
+			}
+			if (typeof password !== 'string' || password.length < 6) {
+				return res.status(400).json({ success: false, code: 'WEAK_PASSWORD', error: 'Password must be at least 6 characters' });
 			}
 
 			const { UsersService } = context.services;
@@ -103,6 +114,7 @@ export default defineEndpoint((router, context) => {
 			if (existingUsers && existingUsers.length > 0) {
 				return res.status(409).json({
 					success: false,
+					code: 'EMAIL_EXISTS',
 					error: 'Email already exists',
 				});
 			}
@@ -152,6 +164,17 @@ export default defineEndpoint((router, context) => {
 				return res.status(400).json({
 					success: false,
 					error: 'Invalid verification URL',
+				});
+			}
+
+			// Directus refused the payload (an address it does not accept, a password policy)
+			const directusCode = error?.code || error?.errors?.[0]?.extensions?.code;
+			if (directusCode === 'FAILED_VALIDATION' || directusCode === 'INVALID_PAYLOAD' || error?.status === 400) {
+				const field = String(error?.extensions?.field || error?.errors?.[0]?.extensions?.field || error?.message || '');
+				return res.status(400).json({
+					success: false,
+					code: /password/i.test(field) ? 'WEAK_PASSWORD' : 'INVALID_EMAIL',
+					error: 'Invalid registration details',
 				});
 			}
 
@@ -267,6 +290,7 @@ export default defineEndpoint((router, context) => {
 	registerAdminDashboardRoutes(router, context);
 	registerFeedbackRoutes(router, context);
 	registerAdminLessonRoutes(router, context);
+	registerAdminVietsubRoutes(router, context);
 	registerAdminRuleRoutes(router, context);
 	registerEventRoutes(router, context);
 	registerPhraseRoutes(router, context);

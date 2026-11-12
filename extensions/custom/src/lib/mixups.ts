@@ -19,11 +19,33 @@ export const MIXED_UP: Record<string, string[]> = {
 
 const clean = (w: string) => w.toLowerCase().replace(/[^a-z']/g, '');
 
-/** Wrong answers for a phrase: its last mixed-up word swapped (none when it has no such word) */
+/**
+ * A pronoun with an ending ("he'll"): the same pronoun bare and with its other endings
+ * ("he", "he's", "he'd"). These are fair wrong answers: they fit the sentence as well, so only
+ * the ending heard tells them apart. Mirrors contractionMixUps in the site's utils/adminLessons.ts.
+ */
+const ENDINGS_OF: Record<string, string[]> = {
+	i: ["'m", "'d", "'ll", "'ve"],
+	you: ["'re", "'d", "'ll", "'ve"], we: ["'re", "'d", "'ll", "'ve"], they: ["'re", "'d", "'ll", "'ve"],
+	he: ["'s", "'d", "'ll"], she: ["'s", "'d", "'ll"], it: ["'s", "'d", "'ll"], that: ["'s", "'d", "'ll"],
+	there: ["'s", "'d", "'ll"], who: ["'s", "'d", "'ll"], what: ["'s", "'d", "'ll"], where: ["'s", "'d", "'ll"],
+};
+export function contractionMixUps(word: string): string[] | null {
+	const m = word.replace(/[’‘]/g, "'").match(/^([A-Za-z]+)('(?:ll|d|s|re|ve|m))$/);
+	if (!m) return null;
+	const [, base, ending] = m as unknown as [string, string, string];
+	const others = ENDINGS_OF[base.toLowerCase()];
+	if (!others) return null;
+	return [base, ...others.filter((e) => e !== ending.toLowerCase()).map((e) => base + e)].slice(0, 3);
+}
+
+/** Wrong answers for a phrase: a pronoun's other endings, else its last mixed-up word swapped (none when it has no such word) */
 export function mixUps(target: string): string[] {
 	const words = target.replace(/\s+/g, ' ').trim().split(' ').filter(Boolean);
-	let at = -1;
-	words.forEach((w, i) => { if (MIXED_UP[clean(w)]) at = i; });
-	if (at < 0) return [];
-	return MIXED_UP[clean(words[at]!)]!.map((alt) => words.map((w, i) => (i === at ? alt : w)).join(' '));
+	// The last word that has mix-ups: a pronoun with an ending, or a small word of MIXED_UP
+	for (let i = words.length - 1; i >= 0; i--) {
+		const alts = contractionMixUps(words[i]!.replace(/[^A-Za-z'’]/g, '')) || MIXED_UP[clean(words[i]!)];
+		if (alts) return alts.map((alt) => words.map((w, k) => (k === i ? alt : w)).join(' '));
+	}
+	return [];
 }

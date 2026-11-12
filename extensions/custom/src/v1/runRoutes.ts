@@ -22,7 +22,7 @@
  */
 import { UUID_RE, answerOf, loadLessonGraph, type LessonGraph, type LessonRow } from '../lib/lessons';
 import {
-	LESSON_TEST, MAX_LISTENS, choicesFor, drawLesson, drawMixed, drawReview, drawTest, fitsLesson, fitsMixed, focusFits, isRight, triesFor, passed,
+	LESSON_TEST, MAX_LISTENS, acceptOf, choicesFor, drawLesson, drawMixed, drawReview, drawTest, fitsLesson, fitsMixed, focusFits, isRight, triesFor, passed,
 	practiceOf, reviewOfValue, summaryOf, targetOf,
 	tilesFor, weakestForms, withRetry, type PoolClip, type RunItem,
 } from '../lib/runs';
@@ -30,6 +30,9 @@ import { REVIEW, gradeOf, masteryOf, schedule, cardColumns } from '../lib/review
 import { COIN, CoinError, buyFreeze, earnCoins, payRetest, unlockLesson, walletOf } from '../lib/coins';
 import { MAX_FREEZES, grantRewards, lessonXp, recordPractice, vnDay, DEFAULT_GOAL } from '../lib/xp';
 import { mixUps } from '../lib/mixups';
+import { mistakeOf, type Mistake } from '../lib/mistakes';
+import { normalizeAnswer } from './engagementRoutes';
+import { subsOf } from '../lib/subs';
 import { clipOut, lessonTranslations, readClips, registerLearner, wrongOf } from './lessonRoutes';
 
 const ANON_ID_RE = /^[A-Za-z0-9-]{16,64}$/;
@@ -106,6 +109,38 @@ async function poolsOf(database: any, g: LessonGraph, lessonIds: string[]) {
 	return out;
 }
 
+/**
+ * A clip to hear next to the one just answered, from the same lesson: after a trap, the rule
+ * itself (the core clip first); after a missed item, one of the lesson's traps. Hearing the two
+ * one after the other shows the difference better than any words. null when there is none,
+ * and never a clip the run still has to ask (`upcoming`).
+ */
+async function contrastOf(database: any, clipRow: any, trap: boolean, upcoming: string[] = []) {
+	const row = await database('listening_clips as c')
+		.join('source_videos as sv', 'sv.id', 'c.source_video_id')
+		.select('c.id', 'c.role', 'c.transcript', 'c.start_time', 'c.end_time', 'c.playback_rate', 'sv.youtube_video_id', 'sv.thumbnail_url')
+		.where({ 'c.lesson_id': clipRow.lesson_id, 'c.status': 'published' })
+		.whereIn('c.role', trap ? ['core', 'pool'] : ['trap'])
+		.whereNot('c.id', clipRow.id)
+		// A clip still to come in this run would be heard, and read, before it is asked
+		.whereNotIn('c.id', upcoming)
+		.whereNotNull('c.start_time').whereNotNull('c.end_time').whereNotNull('sv.youtube_video_id')
+		.orderByRaw(`CASE c.role WHEN 'core' THEN 0 ELSE 1 END, random()`)
+		.first();
+	if (!row) return null;
+	const transcript = String(row.transcript || '').replace(/\s+/g, ' ').trim();
+	return {
+		id: row.id,
+		trap: row.role === 'trap',
+		/** The line said, the part with the rule in [brackets] */
+		transcript: transcript || null,
+		start_time: Number(row.start_time),
+		end_time: Number(row.end_time),
+		rate: Number(row.playback_rate) || null,
+		video: { youtube_video_id: row.youtube_video_id, thumbnail_url: row.thumbnail_url },
+	};
+}
+
 /** The run as the page plays it. Every item keeps its index, whatever the page skips. */
 async function runOut(database: any, g: LessonGraph, run: any) {
 	const items: RunItem[] = run.items || [];
@@ -131,7 +166,7 @@ async function runOut(database: any, g: LessonGraph, run: any) {
 			// lesson_id: where a "report a problem" on the item is filed (reviews and tests mix lessons)
 			// The question of a practice step, and of its retry (same clip)
 			const prompt = it.phase === 'practice' || it.phase === 'retry' ? prompts.get(it.clip_id) || null : null;
-			return out ? { ...out, lesson_id: it.lesson_id || run.lesson_id, hearts: triesFor(run.mode, out.format), prompt } : null;
+			return out ? { ...out, lesson_id: it.lesson_id || run.lesson_id, hearts: triesFor(run.mode, out.format, it.phase), prompt } : null;
 		}).filter(Boolean),
 	};
 }
@@ -209,7 +244,7 @@ export function registerRunRoutes(router: any, context: any) {
 			if (ruleBy) return res.status(403).json({ success: false, code: 'RULE_LOCKED', by: { name: ruleBy.name, slug: ruleBy.slug } });
 			if (g.isOrderLocked(lesson)) return res.status(403).json({ success: false, code: 'ORDER_LOCKED' });
 			const pool = await poolOf(database, g, lesson);
-			const written = await database('listening_lessons').select('practice', 'review_of').where('id', lesson.id).first();
+			const written = await database('listening_lessons').select('practice', 'review_of', 'practice_shuffle').where('id', lesson.id).first();
 			// A review lesson: the pool clips of the lessons it reviews (published ones), mixed
 			const reviewed = lesson.kind === 'mixed' ? reviewOfValue(written?.review_of).filter((id) => id !== lesson.id && g.lessonById.has(id)) : [];
 			if (reviewed.length) {
@@ -230,10 +265,11 @@ export function registerRunRoutes(router: any, context: any) {
 				return res.json({ success: true, data: await runOut(database, g, run) });
 			}
 			const script = practiceOf(written?.practice);
+			const shuffled = !!written?.practice_shuffle;
 			// A run left halfway is taken up again, unless the lesson changed since: then it starts over
 			const run = await openRun(learner, 'learn', { lesson_id: lesson.id, skill_id: lesson.skill_id },
-				async () => drawLesson(pool.clips, await metOf(learner.userId, [...pool.byId.keys()]), Math.random, script),
-				{ restart: !!req.body?.restart, valid: (items) => fitsLesson(items, script, (id) => pool.byId.has(id)) });
+				async () => drawLesson(pool.clips, await metOf(learner.userId, [...pool.byId.keys()]), Math.random, script, { shuffle: shuffled }),
+				{ restart: !!req.body?.restart, valid: (items) => fitsLesson(items, script, (id) => pool.byId.has(id), shuffled) });
 			if (!run) return res.status(409).json({ success: false, code: 'EMPTY_LESSON', message: 'This lesson has no clip to play yet' });
 			return res.json({ success: true, data: await runOut(database, g, run) });
 		} catch (error) {
@@ -257,13 +293,15 @@ export function registerRunRoutes(router: any, context: any) {
 			if (ruleBy) return res.status(403).json({ success: false, code: 'RULE_LOCKED', by: { name: ruleBy.name, slug: ruleBy.slug } });
 			const pool = await poolOf(database, g, lesson);
 			// A review lesson is skipped by a test on the lessons it reviews
-			const written = lesson.kind === 'mixed' ? await database('listening_lessons').select('review_of').where('id', lesson.id).first() : null;
-			const reviewed = reviewOfValue(written?.review_of).filter((id) => id !== lesson.id && g.lessonById.has(id));
+			const written = await database('listening_lessons').select('review_of', 'trap_draw').where('id', lesson.id).first();
+			const reviewed = lesson.kind === 'mixed' ? reviewOfValue(written?.review_of).filter((id) => id !== lesson.id && g.lessonById.has(id)) : [];
 			const pools = reviewed.length ? await poolsOf(database, g, reviewed) : new Map([[lesson.id, pool]]);
 			const forms = [...pools.values()].map((p) => ({ lessonId: p.lesson.id, clips: p.clips }));
 			const ids = forms.flatMap((f) => f.clips.map((c) => c.id));
+			// The traps the team wants in this lesson's test (trap_draw, 1 by default)
+			const traps = written?.trap_draw == null ? 1 : Math.max(0, Math.min(3, Number(written.trap_draw) || 0));
 			const run = await openRun(learner, 'lesson_test', { lesson_id: lesson.id, skill_id: lesson.skill_id },
-				async () => drawTest(forms, LESSON_TEST.size, await metOf(learner.userId, ids)),
+				async () => drawTest(forms, LESSON_TEST.size, await metOf(learner.userId, ids), Math.random, traps),
 				{ valid: (items) => items.every((it) => !!pools.get(it.lesson_id || lesson.id)?.byId.has(it.clip_id)) });
 			if (!run) return res.status(409).json({ success: false, code: 'EMPTY_LESSON' });
 			return res.json({ success: true, data: await runOut(database, g, run) });
@@ -421,15 +459,27 @@ export function registerRunRoutes(router: any, context: any) {
 				const clip: PoolClip = {
 					id: clipRow.id, role: clipRow.role, answer, focus: String(clipRow.focus_text || '').trim() || null,
 					difficulty: clipRow.difficulty, forced: clipRow.answer_format, hasChoices: true,
+					accept: acceptOf(clipRow.accept_also),
 				};
 				const given = String(body.answer ?? '').slice(0, 255);
 				const hint = body.hint === true;
 				const correct = !hint && isRight(clip, item.format, given);
+				const trap = clipRow.role === 'trap';
+				// What a wrong answer says about what was heard; a line the team wrote for that wrong choice wins
+				let mistake: Mistake | null = null;
+				if (!correct && !hint) {
+					let why: Record<string, string> = {};
+					if (run.mode === 'learn' && run.lesson_id && (item.phase === 'practice' || item.phase === 'retry')) {
+						const written = await trx('listening_lessons').select('practice').where('id', run.lesson_id).first();
+						why = practiceOf(written?.practice).find((s) => s.clip_id === item.clip_id)?.why || {};
+					}
+					mistake = mistakeOf(item.format === 'type' ? answer : targetOf(clip), given, why);
+				}
 				const listens = Math.max(1, Math.min(20, Math.round(Number(body.listens) || 1)));
 				const timeMs = Number.isFinite(body.time_ms) ? Math.max(0, Math.min(3_600_000, Math.round(body.time_ms))) : null;
 				// A wrong typed answer with a heart left: tried again, the answer not shown yet
 				const tries = (Number(item.tries) || 0) + 1;
-				const again = !correct && !hint && tries < triesFor(run.mode, item.format);
+				const again = !correct && !hint && tries < triesFor(run.mode, item.format, item.phase);
 				const attempt = (final: boolean) => learner.userId && trx('listening_attempts').insert({
 					id: trx.raw('gen_random_uuid()'), user_id: learner.userId, clip_id: item.clip_id, lesson_id: lessonId,
 					answer: hint ? '[REVEALED]' : given, is_correct: correct, attempt_number: tries, listen_count: listens,
@@ -444,10 +494,10 @@ export function registerRunRoutes(router: any, context: any) {
 					await attempt(false);
 					return {
 						status: 200 as const, again: true, lessonId: lessonId as string, first: false,
-						data: { correct: false, again: true, hearts: triesFor(run.mode, item.format) - tries, position, total: items.length },
+						data: { correct: false, again: true, hearts: triesFor(run.mode, item.format, item.phase) - tries, position, total: items.length, mistake },
 					};
 				}
-				items[position] = { ...item, tries: tries - 1, result: { correct, answer: given, listens, slow: body.slow === true, hint, time_ms: timeMs } };
+				items[position] = { ...item, tries: tries - 1, result: { correct, answer: given, listens, slow: body.slow === true, hint, time_ms: timeMs, mistake, trap } };
 				const before = items.length;
 				// A missed practice item comes back once; tests and reviews count every answer as given
 				if (!correct && run.mode === 'learn') items = withRetry(items, position, focusFits(clip) ? 'gap' : 'type');
@@ -467,10 +517,21 @@ export function registerRunRoutes(router: any, context: any) {
 				return {
 					// The lesson learned (a review lesson's items come from the lessons it reviews)
 					status: 200 as const, again: false, lessonId: (run.mode === 'learn' ? run.lesson_id : lessonId) as string, first: position === 0 && run.mode === 'learn',
+					mode: run.mode as Mode, clipRow, clipLessonId: lessonId as string,
+					upcoming: items.filter((it, i) => i > position && !it.result).map((it) => it.clip_id),
+					// A miss about the rule (the focus words): another word misheard is not what a trap shows
+					aboutRule: !mistake || !clip.focus || (() => {
+						const focus = new Set(normalizeAnswer(clip.focus!).split(' '));
+						return `${mistake.heard} ${mistake.said}`.split(/\s+/).some((w) => w && focus.has(normalizeAnswer(w)));
+					})(),
 					data: {
 						correct,
 						expected: answer,
 						focus: clip.focus,
+						trap,
+						// Why the rule does not apply here: shown once a trap is answered
+						trap_reason: trap ? { vi: String(clipRow.trap_reason_vi || '').trim() || null, en: String(clipRow.trap_reason_en || '').trim() || null } : null,
+						mistake,
 						position: position + 1,
 						total: items.length,
 						retry_added: items.length > before,
@@ -490,7 +551,22 @@ export function registerRunRoutes(router: any, context: any) {
 				await grantRewards(context, req.schema, learner.userId, won.rewards);
 			}
 			if (out.first && learner.key) await registerLearner(database, out.lessonId, learner.userId, learner.anonymousId).catch(() => false);
-			return res.json({ success: true, data: { ...out.data, rewards } });
+			// A trap answered right in a lesson or a review: Xu at once, once per clip a day
+			const coins = { added: 0, balance: null as number | null };
+			const learning = out.mode === 'learn' || out.mode === 'review';
+			if (learner.userId && learning && out.data.trap && out.data.correct) {
+				const today = vnDay();
+				const r = await earnCoins(database, learner.userId, { reason: 'trap', amount: COIN.earn.trap, dedupe: `trap:${out.clipRow.id}:${today}`, lessonId: out.clipLessonId }, today);
+				coins.added = r.added;
+				coins.balance = r.coins;
+			}
+			// Another clip of the lesson to hear next to this one: a trap after a missed rule, the rule after a trap
+			const contrast = learning && (out.data.trap || (!out.data.correct && out.aboutRule))
+				? await contrastOf(database, out.clipRow, out.data.trap, out.upcoming)
+				: null;
+			// What the clip's lines mean, in the page's language (body.locale): shown now it is answered
+			const subs = await subsOf(database, out.clipRow.id, body.locale).catch(() => null);
+			return res.json({ success: true, data: { ...out.data, rewards, coins, contrast, subs } });
 		} catch (error) {
 			return fail(res, 'Answer', error);
 		}
@@ -637,6 +713,11 @@ export function registerRunRoutes(router: any, context: any) {
 						if (it.result?.correct) await addXp(await recordPractice(database, userId, { xp: { reason: 'review', dedupe: `review:${run.id}:${i}` } }, today), 'review');
 					}
 					await earn('review', COIN.earn.review, `review:${run.id}`);
+				}
+				// Xu won on traps during this run (given at once, when answered): counted in the run's total
+				if (mode === 'learn' || mode === 'review') {
+					const won = await database('coin_events').where({ user_id: userId, reason: 'trap' }).where('created_at', '>=', run.started_at).sum('amount as n').first();
+					coins.added += Number(won?.n) || 0;
 				}
 				// Today's goal reached: a coin bonus once a day
 				const [day, user] = await Promise.all([
