@@ -1,6 +1,7 @@
 import type { Router } from 'express';
 import { ProxyAgent } from 'undici';
 import { isStaff } from '../lib/staff';
+import { sentenceLines } from '../lib/sentenceLines';
 
 const INNERTUBE_API_KEY = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
 const INNERTUBE_PLAYER_URL = `https://www.youtube.com/youtubei/v1/player?key=${INNERTUBE_API_KEY}&prettyPrint=false`;
@@ -234,7 +235,7 @@ export async function fetchCaptions(data: any, logger: any, lang = "en"): Promis
   );
   const picked = pickCaptionTrack(data, lang);
   if (!picked.track) return { items: [], kind: "none", lang: null };
-  const items = await downloadTrack(picked.track, logger);
+  const items = await downloadTrack(picked.track, logger, picked.kind === "manual" ? "manual" : "asr");
   return { items, kind: picked.kind, lang: picked.lang };
 }
 
@@ -247,14 +248,21 @@ export async function fetchTranscriptFromPlayer(data: any, logger: any, lang = "
   return kind === "none" ? null : items;
 }
 
-async function downloadTrack(track: any, logger: any) {
+/**
+ * The track as transcript lines: sentence lines (see lib/sentenceLines) when they can be made,
+ * else YouTube's cues as they are.
+ */
+async function downloadTrack(track: any, logger: any, kind: "manual" | "asr") {
   if (!track?.baseUrl) {
     logger.warn(`[youtube] no baseUrl on selected caption track`);
     return null;
   }
 
   try {
-    const res = await proxiedFetch(track.baseUrl, { headers: { "User-Agent": WEB_USER_AGENT } });
+    // srv3: the format with a time for every word of an automatic track
+    const url = new URL(track.baseUrl);
+    url.searchParams.set("fmt", "srv3");
+    const res = await proxiedFetch(url.toString(), { headers: { "User-Agent": WEB_USER_AGENT } });
     if (!res.ok) {
       logger.warn(`[youtube] transcript fetch HTTP ${res.status} ${res.statusText}`);
       return null;
@@ -262,6 +270,15 @@ async function downloadTrack(track: any, logger: any) {
     const xml = await res.text();
     const items = parseTranscriptXml(xml);
     logger.info(`[youtube] transcript parsed ${items.length} segments (lang=${track.languageCode})`);
+    if (!items.length) return items;
+    const lines = await sentenceLines(xml, kind, logger).catch((e) => {
+      logger.warn(`[youtube] sentence lines failed: ${e?.message}`);
+      return null;
+    });
+    if (lines?.length) {
+      logger.info(`[youtube] ${items.length} cues -> ${lines.length} sentence lines (${kind})`);
+      return lines;
+    }
     return items;
   } catch (e: any) {
     logger.error(`[youtube] transcript fetch error: ${e?.message}`);
