@@ -206,7 +206,7 @@ export function registerFeedbackRoutes(router: any, context: any) {
 				if (status) qb.where('a.status', status);
 				return qb;
 			};
-			const [rows, total, counts, clips, goals, goalOthers, levels, goalLevels] = await Promise.all([
+			const [rows, total, counts, clips, goals, goalOthers, levels, goalLevels, sources, sourceOthers] = await Promise.all([
 				filtered()
 					.join('listening_lessons as l', 'l.id', 'a.lesson_id')
 					.leftJoin('listening_clips as c', 'c.id', 'a.clip_id')
@@ -267,6 +267,18 @@ export function registerFeedbackRoutes(router: any, context: any) {
 					WHERE jsonb_typeof(learning_goals) = 'array' AND listening_level IS NOT NULL
 					GROUP BY g, listening_level
 				`),
+				// Where they first heard of us, one each (2026-11-13_heard_from.sql)
+				kind !== 'result' ? Promise.resolve([]) : database('directus_users')
+					.whereNotNull('heard_from')
+					.groupBy('heard_from')
+					.select('heard_from as source')
+					.count('* as n'),
+				kind !== 'result' ? Promise.resolve([]) : database('directus_users')
+					.where('heard_from', 'other')
+					.whereNotNull('heard_from_other')
+					.select('heard_from_other as text', 'heard_from_at as date', 'email')
+					.orderBy('heard_from_at', 'desc')
+					.limit(30),
 			]);
 			const byQuestion: Record<string, Record<string, number>> = {};
 			for (const c of counts as any[]) (byQuestion[c.question] ||= {})[c.answer] = Number(c.n) || 0;
@@ -276,7 +288,9 @@ export function registerFeedbackRoutes(router: any, context: any) {
 					kind, rows, total: Number(total?.n) || 0, counts: byQuestion, clips,
 					user_goals: Object.fromEntries(((goals as any).rows || []).map((g: any) => [g.goal, Number(g.n) || 0])),
 					goal_others: goalOthers,
-					user_levels: Object.fromEntries((levels as any[]).map((l) => [l.level, Number(l.n) || 0])),
+					user_sources: Object.fromEntries((sources as any[]).map((s) => [s.source, Number(s.n) || 0])),
+						source_others: sourceOthers,
+						user_levels: Object.fromEntries((levels as any[]).map((l) => [l.level, Number(l.n) || 0])),
 					/** { goal: { level: n } } */
 					user_goal_levels: ((goalLevels as any).rows || []).reduce((acc: Record<string, Record<string, number>>, r: any) => {
 						(acc[r.goal] ||= {})[r.level] = Number(r.n) || 0;

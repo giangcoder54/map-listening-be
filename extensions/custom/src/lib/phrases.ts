@@ -118,9 +118,13 @@ export function ratingOf(mode: ReviewMode, answer: { correct?: boolean; self_rat
 	return Rating.Good;
 }
 
-/** How a phrase is reviewed at a level */
-export function modeFor(level: number, opts: { hasClip: boolean; situations: number; reps: number }): ReviewMode {
+/**
+ * How a phrase is reviewed at a level. Idioms are learnt to be understood, not said: never
+ * reflex; past level 2 they keep coming back as "choose" (meaning, or which idiom fits).
+ */
+export function modeFor(level: number, opts: { hasClip: boolean; situations: number; reps: number; idiom?: boolean }): ReviewMode {
 	if (level <= 1) return 'choose';
+	if (opts.idiom) return level === 2 && opts.hasClip ? 'next_line' : 'choose';
 	if (level === 2) return opts.hasClip ? 'next_line' : 'choose';
 	if (!opts.situations) return opts.hasClip ? 'next_line' : 'choose';
 	// Can use: mostly reflex, now and then the film line again, for variety
@@ -131,8 +135,14 @@ export function modeFor(level: number, opts: { hasClip: boolean; situations: num
 export type ReflexDay = { day: string; situation: number };
 
 /** Level after an answer, and the reflex days kept for level 4 */
-export function levelAfter(level: number, mode: ReviewMode, grade: Grade, reflexDays: ReflexDay[], situation: number | null, today: string) {
+export function levelAfter(level: number, mode: ReviewMode, grade: Grade, reflexDays: ReflexDay[], situation: number | null, today: string, idiom = false) {
 	if (grade === Rating.Again) return { level: Math.max(1, level - 1), reflexDays };
+	// Idioms: understood right on 2 different days at level 3 = can use (no speaking asked)
+	if (idiom && level === 3 && mode === 'choose') {
+		const days = [...reflexDays.filter((d) => d.day !== today), { day: today, situation: 0 }].slice(-10);
+		return { level: new Set(days.map((d) => d.day)).size >= 2 ? 4 : 3, reflexDays: days };
+	}
+	if (idiom && level === 2 && mode === 'choose') return { level: 3, reflexDays };
 	if (level === 1 && mode === 'choose') return { level: 2, reflexDays };
 	if (level === 2 && mode === 'next_line') return { level: 3, reflexDays };
 	if (level === 3 && mode === 'reflex') {
@@ -169,10 +179,10 @@ export async function loadPhraseCatalog(req: any, context: any) {
 	const userId: string | null = req.accountability?.user ?? null;
 	const cfg = growthConfig();
 
-	const [types, typeTr, phrases, phraseTr, clipStats] = await Promise.all([
-		database('phrase_types').select('id', 'name', 'slug', 'sort', 'icon', 'is_premium').where('status', 'published').orderBy([{ column: 'sort', order: 'asc' }, 'name']),
+	const [types, typeTr, phrases, phraseTr, clipStats, links] = await Promise.all([
+		database('phrase_types').select('id', 'name', 'slug', 'sort', 'icon', 'is_premium', 'track').where('status', 'published').orderBy([{ column: 'sort', order: 'asc' }, 'name']),
 		database('phrase_types_translations').select('phrase_types_id as owner', 'languages_code', 'name', 'description'),
-		database('phrases').select('id', 'type_id', 'slug', 'text', 'text_linked', 'ipa', 'kind', 'is_premium', 'sort', 'learners_count', 'date_created').where('status', 'published'),
+		database('phrases').select('id', 'type_id', 'slug', 'text', 'text_linked', 'ipa', 'kind', 'is_premium', 'sort', 'learners_count', 'date_created', 'cefr', 'freq_tier').where('status', 'published'),
 		database('phrases_translations').select('phrases_id as owner', 'languages_code', 'meaning'),
 		database.raw(`
 			SELECT c.phrase_id, COUNT(*)::int AS clips,
@@ -183,6 +193,7 @@ export async function loadPhraseCatalog(req: any, context: any) {
 			WHERE c.status = 'published'
 			GROUP BY c.phrase_id
 		`),
+		database('phrase_type_links').select('phrase_id', 'type_id', 'sort', 'usage_vi', 'usage_en').catch(() => []),
 	]);
 
 	const group = (rows: any[]) => {
@@ -200,12 +211,36 @@ export async function loadPhraseCatalog(req: any, context: any) {
 
 	const typeById = new Map<string, any>(types.map((t: any) => [t.id, { ...t, translations: typeTrById.get(t.id) || [] }]));
 	const playable = phrases.filter((p: any) => typeById.has(p.type_id) && (clipsById.get(p.id)?.clips || 0) > 0);
+	const playableById = new Map<string, any>(playable.map((p: any) => [p.id, p]));
+	/**
+	 * Each type's path: its own phrases plus the ones linked in from another type, the most common
+	 * first (freq_tier, unset = 2), then by sort. Rare phrases (tier 4) stay out of every path.
+	 */
 	const byType = new Map<string, any[]>();
+	const rank = new Map<string, number>();
+	/** "phraseId:typeId" -> how the phrase is used in that linked type ({ vi, en }) */
+	const linkUsage = new Map<string, { vi: string; en: string }>();
 	for (const t of types) byType.set(t.id, []);
-	for (const p of playable) byType.get(p.type_id)!.push(p);
-	for (const list of byType.values()) {
-		list.sort((a, b) => (a.sort ?? 999) - (b.sort ?? 999) || String(a.date_created).localeCompare(String(b.date_created)) || a.id.localeCompare(b.id));
+	const place = (p: any, typeId: string, sort: number | null) => {
+		if (p.freq_tier === 4 || !byType.has(typeId) || byType.get(typeId)!.includes(p)) return;
+		byType.get(typeId)!.push(p);
+		rank.set(`${p.id}:${typeId}`, sort ?? 999);
+	};
+	for (const p of playable) place(p, p.type_id, p.sort);
+	for (const l of links) {
+		const p = playableById.get(l.phrase_id);
+		if (!p) continue;
+		place(p, l.type_id, l.sort ?? 500);
+		linkUsage.set(`${p.id}:${l.type_id}`, { vi: l.usage_vi || '', en: l.usage_en || '' });
 	}
+	for (const [typeId, list] of byType) {
+		list.sort((a, b) => (a.freq_tier ?? 2) - (b.freq_tier ?? 2)
+			|| rank.get(`${a.id}:${typeId}`)! - rank.get(`${b.id}:${typeId}`)!
+			|| String(a.date_created).localeCompare(String(b.date_created)) || a.id.localeCompare(b.id));
+	}
+	/** Every type a phrase is in, its home type first */
+	const typesOf = (p: any) => [p.type_id, ...links.filter((l: any) => l.phrase_id === p.id && l.type_id !== p.type_id).map((l: any) => l.type_id)]
+		.filter((id) => typeById.has(id));
 
 	const progress = new Map<string, any>();
 	let newToday = 0;
@@ -218,19 +253,26 @@ export async function loadPhraseCatalog(req: any, context: any) {
 		}
 	}
 	const premium = userId ? await isPremiumUser(database, userId, logger) : false;
+	/** Phrases bought with Xu: open for good, their AI checks included (lib/coins.ts unlockPhrase) */
+	const bought = new Set<string>(userId ? (await database('phrase_unlocks').where('user_id', userId).select('phrase_id').catch(() => [])).map((r: any) => r.phrase_id) : []);
 
-	const numberOf = (p: any) => (byType.get(p.type_id) || []).findIndex((x) => x.id === p.id) + 1;
-	/** Premium content: the phrase or its type is premium, or it is past the free ones of its type */
-	const isPremiumContent = (p: any) => !!(p.is_premium || typeById.get(p.type_id)?.is_premium || numberOf(p) > cfg.phraseFreePerType);
+	/** Place in a type's path (default: its home type); 0 = not in that path */
+	const numberOf = (p: any, typeId: string = p.type_id) => (byType.get(typeId) || []).findIndex((x) => x.id === p.id) + 1;
+	/**
+	 * Premium content: the phrase or its home type is premium, it is rare (tier 4), or it is past
+	 * the free ones of its home type. Decided by the home type only, so a phrase is locked or open
+	 * the same in every type it is in.
+	 */
+	const isPremiumContent = (p: any) => !!(p.is_premium || typeById.get(p.type_id)?.is_premium || p.freq_tier === 4 || numberOf(p) > cfg.phraseFreePerType);
 	/** Learned phrases stay open (they were open when learned) */
-	const isLocked = (p: any) => !premium && !progress.has(p.id) && isPremiumContent(p);
+	const isLocked = (p: any) => !premium && !progress.has(p.id) && !bought.has(p.id) && isPremiumContent(p);
 	const newLimit = premium ? null : cfg.phraseFreeNewPerDay;
 	/** A new phrase can be started today */
 	const canStartNew = () => newLimit === null || newToday < newLimit;
 
 	return {
 		userId, premium, cfg, types: [...typeById.values()], typeById, phrases: playable, byType, phraseTrById, clipsById,
-		progress, newToday, newLimit, numberOf, isPremiumContent, isLocked, canStartNew,
+		progress, bought, newToday, newLimit, numberOf, isPremiumContent, isLocked, canStartNew, typesOf, linkUsage,
 	};
 }
 

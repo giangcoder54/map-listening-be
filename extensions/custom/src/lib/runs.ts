@@ -34,7 +34,7 @@ export const MAX_LISTENS: Record<string, number> = { learn: RUN.maxListens, revi
 export const TRIES = 3;
 export function triesFor(mode: string, format: Format, phase?: string) {
 	if (phase === 'pre') return 1;
-	return (mode === 'learn' || mode === 'review') && (format === 'type' || format === 'gap') ? TRIES : 1;
+	return (mode === 'learn' || mode === 'review' || mode === 'bank') && (format === 'type' || format === 'gap') ? TRIES : 1;
 }
 
 /** 'post' (a final check of 2 new phrases) is no longer drawn: only older runs have it */

@@ -15,6 +15,7 @@ import { Rating } from 'ts-fsrs';
 import { UUID_RE } from '../lib/lessons';
 import { grantRewards, recordPractice, vnDay } from '../lib/xp';
 import { aiConfigured } from '../lib/ai';
+import { COIN, CoinError, payAiCheck, refundAiCheck, unlockPhrase } from '../lib/coins';
 import { clipTranscripts } from '../lib/clipTranscript';
 import { MAX_ANSWER, gradeReply, roleplayOf, translationFor, usesPhrase } from '../lib/roleplay';
 import {
@@ -50,7 +51,12 @@ export function registerPhraseRoutes(router: any, context: any) {
 
 	const typeCard = (t: any, locale: string) => {
 		const tr = pickTranslation(t.translations, locale);
-		return { id: t.id, slug: t.slug, icon: t.icon, is_premium: !!t.is_premium, name: tr?.name || t.name, description: tr?.description || '' };
+		return { id: t.id, slug: t.slug, icon: t.icon, is_premium: !!t.is_premium, track: t.track || 'phrase', name: tr?.name || t.name, description: tr?.description || '' };
+	};
+	/** How a phrase is used in a type it is linked into (empty in its home type) */
+	const usageIn = (c: any, p: any, typeId: string, locale: string) => {
+		const u = c.linkUsage.get(`${p.id}:${typeId}`);
+		return u ? (locale.startsWith('en') ? u.en : u.vi) || '' : '';
 	};
 
 	// ── Types ─────────────────────────────────────────────────────────────
@@ -96,9 +102,12 @@ export function registerPhraseRoutes(router: any, context: any) {
 			const phrases = (c.byType.get(type.id) || []).map((p: any) => ({
 				id: p.id,
 				slug: p.slug,
-				number: c.numberOf(p),
+				number: c.numberOf(p, type.id),
 				text: p.text,
 				meaning: pickTranslation(c.phraseTrById.get(p.id), locale)?.meaning || '',
+				usage_here: usageIn(c, p, type.id, locale),
+				cefr: p.cefr || null,
+				freq_tier: p.freq_tier ?? null,
 				level: c.progress.get(p.id)?.level ?? 0,
 				is_premium: c.isPremiumContent(p),
 				locked: c.isLocked(p),
@@ -125,11 +134,14 @@ export function registerPhraseRoutes(router: any, context: any) {
 			const c = await loadPhraseCatalog(req, context);
 			const phrase = c.phrases.find((p: any) => p.slug === String(req.params.slug));
 			if (!phrase) return res.status(404).json({ success: false, message: 'Not found' });
-			const type = c.typeById.get(phrase.type_id);
+			// The type the learner came from (?type=slug), when the phrase is in it; else its home type
+			const asked = c.types.find((t: any) => t.slug === String(req.query?.type || ''));
+			const typeIds = c.typesOf(phrase);
+			const type = asked && typeIds.includes(asked.id) ? asked : c.typeById.get(phrase.type_id);
 			const locale = localeOf(req);
 			const learned = c.progress.get(phrase.id) || null;
 			const base = { slug: phrase.slug, text: phrase.text, type: typeCard(type, locale) };
-			if (c.isLocked(phrase)) return res.status(403).json({ success: false, code: 'PREMIUM_REQUIRED', data: base });
+			if (c.isLocked(phrase)) return res.status(403).json({ success: false, code: 'PREMIUM_REQUIRED', price: COIN.phrase, data: base });
 			if (c.userId && !learned && !c.canStartNew()) {
 				return res.status(403).json({ success: false, code: 'DAILY_LIMIT', data: { ...base, new_limit: c.newLimit } });
 			}
@@ -153,7 +165,7 @@ export function registerPhraseRoutes(router: any, context: any) {
 				locale.slice(0, 2) || 'vi',
 				phrase.text,
 			).catch(() => new Map());
-			const list = (c.byType.get(phrase.type_id) || []);
+			const list = (c.byType.get(type.id) || []);
 			const index = list.findIndex((p) => p.id === phrase.id);
 			const next = list.slice(index + 1).find((p) => !c.progress.has(p.id)) || null;
 
@@ -162,7 +174,7 @@ export function registerPhraseRoutes(router: any, context: any) {
 				data: {
 					...base,
 					id: phrase.id,
-					number: c.numberOf(phrase),
+					number: c.numberOf(phrase, type.id),
 					total_in_type: list.length,
 					text_linked: phrase.text_linked || phrase.text,
 					ipa: phrase.ipa || '',
@@ -170,6 +182,14 @@ export function registerPhraseRoutes(router: any, context: any) {
 					meaning: tr.meaning || '',
 					usage: tr.usage || '',
 					avoid: tr.avoid || '',
+					usage_here: usageIn(c, phrase, type.id, locale),
+					cefr: phrase.cefr || null,
+					freq_tier: phrase.freq_tier ?? null,
+					examples: jsonList(tr.examples).filter((e: any) => e && (e.a || e.b)).slice(0, 3),
+					parts: jsonList(tr.parts).filter((x: any) => x?.text).slice(0, 6),
+					origin: tr.origin || '',
+					wrong_meanings: jsonList(tr.wrong_meanings).slice(0, 3),
+					also_in: typeIds.filter((id) => id !== type.id).map((id) => typeCard(c.typeById.get(id), locale)),
 					similar: jsonList(tr.similar_phrases),
 					replies: jsonList(tr.replies),
 					// The lesson's reflex step uses the first situation; reviews use the others first
@@ -214,7 +234,7 @@ export function registerPhraseRoutes(router: any, context: any) {
 				// Done again: no new card, no XP
 				return res.json({ success: true, data: { level: existing.level, next_in_days: daysUntil(existing.due), xp: 0, again: true } });
 			}
-			if (c.isLocked(phrase)) return res.status(403).json({ success: false, code: 'PREMIUM_REQUIRED' });
+			if (c.isLocked(phrase)) return res.status(403).json({ success: false, code: 'PREMIUM_REQUIRED', price: COIN.phrase });
 			if (!c.canStartNew()) return res.status(403).json({ success: false, code: 'DAILY_LIMIT', data: { new_limit: c.newLimit } });
 
 			const grade = SELF_RATING[self];
@@ -237,6 +257,22 @@ export function registerPhraseRoutes(router: any, context: any) {
 	});
 
 	// ── Lesson step 4: role-play answer checked by AI ─────────────────────
+	router.post('/phrases/lesson/:slug/unlock', async (req: any, res: any) => {
+		const userId = needUser(req, res);
+		if (!userId) return;
+		try {
+			const c = await loadPhraseCatalog(req, context);
+			const phrase = c.phrases.find((p: any) => p.slug === String(req.params.slug));
+			if (!phrase) return res.status(404).json({ success: false, message: 'Not found' });
+			if (!c.isLocked(phrase)) return res.status(409).json({ success: false, code: 'NOT_LOCKED' });
+			const paid = await unlockPhrase(database, userId, phrase.id);
+			return res.json({ success: true, data: { price: paid.price, coins: paid.coins } });
+		} catch (error) {
+			if (error instanceof CoinError) return res.status(error.code === 'NOT_ENOUGH' ? 402 : 409).json({ success: false, code: error.code });
+			return fail(res, 'Unlock phrase', error);
+		}
+	});
+
 	router.post('/phrases/lesson/:slug/roleplay', async (req: any, res: any) => {
 		const userId = needUser(req, res);
 		if (!userId) return;
@@ -247,18 +283,34 @@ export function registerPhraseRoutes(router: any, context: any) {
 			const c = await loadPhraseCatalog(req, context);
 			const phrase = c.phrases.find((p: any) => p.slug === String(req.params.slug));
 			if (!phrase) return res.status(404).json({ success: false, message: 'Not found' });
-			if (c.isLocked(phrase)) return res.status(403).json({ success: false, code: 'PREMIUM_REQUIRED' });
+			if (c.isLocked(phrase)) return res.status(403).json({ success: false, code: 'PREMIUM_REQUIRED', price: COIN.phrase });
 			// The phrase must be in the answer: said here, no AI call spent
 			if (!usesPhrase(answer, phrase.text)) return res.status(400).json({ success: false, code: 'MISSING_PHRASE' });
 			if (!aiConfigured()) return res.status(503).json({ success: false, code: 'AI_DOWN' });
 
-			const limit = c.premium ? c.cfg.phraseAiChecksPremium : c.cfg.phraseAiChecksFree;
+			const sameDay = `(date_created AT TIME ZONE '${TZ}')::date = (now() AT TIME ZONE '${TZ}')::date`;
+			// Premium or a phrase bought with Xu: the checks are in the price, a number a day per phrase
+			const covered = c.premium || c.bought.has(phrase.id);
 			const used = await database('phrase_roleplay_checks')
-				.where('user_id', userId)
-				.whereRaw(`(date_created AT TIME ZONE '${TZ}')::date = (now() AT TIME ZONE '${TZ}')::date`)
+				.where(covered ? { user_id: userId, phrase_id: phrase.id } : { user_id: userId, paid: false })
+				.whereRaw(sameDay)
 				.count('* as n').first();
-			if ((Number(used?.n) || 0) >= limit) {
+			const limit = covered ? COIN.aiPerPhrasePerDay : COIN.aiFreePerDay;
+			const usedN = Number(used?.n) || 0;
+			if (covered && usedN >= limit) {
 				return res.status(429).json({ success: false, code: 'AI_LIMIT', data: { limit, premium: c.premium } });
+			}
+			// A free phrase beyond the free checks of the day costs Xu, paid before the AI is called
+			const mustPay = !covered && usedN >= limit;
+			const payKey = `${phrase.id}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
+			let coins: number | null = null;
+			if (mustPay) {
+				try {
+					coins = (await payAiCheck(database, userId, payKey)).coins;
+				} catch (e) {
+					if (e instanceof CoinError) return res.status(402).json({ success: false, code: 'NOT_ENOUGH', data: { price: COIN.aiCheck } });
+					throw e;
+				}
 			}
 
 			const locale = localeOf(req);
@@ -269,8 +321,12 @@ export function registerPhraseRoutes(router: any, context: any) {
 			const tr = pickTranslation(trRows, locale) || ({} as any);
 			const roleplay = roleplayOf(base?.roleplay, translationFor(trRows, locale), phrase.text, tr);
 			const started = Date.now();
-			const result = await gradeReply({ phrase: phrase.text, meaning: tr.meaning || '', roleplay, answer, locale }, logger);
+			const result = await gradeReply({ phrase: phrase.text, meaning: tr.meaning || '', roleplay, answer, locale }, logger).catch(async (e: any) => {
+				if (mustPay) await refundAiCheck(database, userId, payKey);
+				throw e;
+			});
 			await database('phrase_roleplay_checks').insert({
+				paid: mustPay && !!result,
 				user_id: userId,
 				phrase_id: phrase.id,
 				answer,
@@ -280,8 +336,11 @@ export function registerPhraseRoutes(router: any, context: any) {
 				corrected: result?.corrected ?? null,
 				ms: Date.now() - started,
 			});
-			if (!result) return res.status(503).json({ success: false, code: 'AI_DOWN' });
-			return res.json({ success: true, data: { ...result, left: Math.max(0, limit - (Number(used?.n) || 0) - 1) } });
+			if (!result) {
+				if (mustPay) await refundAiCheck(database, userId, payKey);
+				return res.status(503).json({ success: false, code: 'AI_DOWN' });
+			}
+			return res.json({ success: true, data: { ...result, left: mustPay ? 0 : Math.max(0, limit - usedN - 1), cost: mustPay ? COIN.aiCheck : 0, coins, covered } });
 		} catch (error) {
 			return fail(res, 'Check role-play', error);
 		}
@@ -296,7 +355,8 @@ export function registerPhraseRoutes(router: any, context: any) {
 			const locale = localeOf(req);
 			const due = await database('phrase_progress as pp')
 				.join('phrases as p', 'p.id', 'pp.phrase_id')
-				.select('pp.*', 'p.text', 'p.type_id', 'p.text_linked')
+				.leftJoin('phrase_types as pt', 'pt.id', 'p.type_id')
+				.select('pp.*', 'p.text', 'p.type_id', 'p.text_linked', 'pt.track')
 				.where('pp.user_id', userId)
 				.where('p.status', 'published')
 				.where('pp.due', '<=', database.fn.now())
@@ -354,7 +414,7 @@ export function registerPhraseRoutes(router: any, context: any) {
 				const situations = jsonList(tr.situations).filter((s: any) => typeof s === 'string' && s.trim());
 				const ownClips = clipsOf(row.phrase_id);
 				const reflexDays = jsonList(row.reflex_days);
-				const mode = modeFor(row.level, { hasClip: ownClips.length > 0, situations: situations.length, reps: row.reps });
+				const mode = modeFor(row.level, { hasClip: ownClips.length > 0, situations: situations.length, reps: row.reps, idiom: row.track === 'idiom' });
 				const base = {
 					phrase_id: row.phrase_id,
 					mode,
@@ -437,7 +497,8 @@ export function registerPhraseRoutes(router: any, context: any) {
 			const grade = ratingOf(mode, { correct: body.correct === true, self_rating: self, ms });
 			const correct = grade !== Rating.Again;
 			const today = todayKey();
-			const next = levelAfter(row.level, mode, grade, jsonList(row.reflex_days), mode === 'reflex' ? situationIndex : null, today);
+			const track = (await database('phrases as p').leftJoin('phrase_types as pt', 'pt.id', 'p.type_id').where('p.id', phraseId).first('pt.track'))?.track;
+			const next = levelAfter(row.level, mode, grade, jsonList(row.reflex_days), mode === 'reflex' ? situationIndex : null, today, track === 'idiom');
 			const card = schedule(row, grade);
 			await database('phrase_progress').where('id', row.id).update({
 				level: next.level,

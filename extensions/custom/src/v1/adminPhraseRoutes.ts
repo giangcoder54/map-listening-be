@@ -3,7 +3,8 @@
  *
  *   GET    /admin/phrases                ?type=<uuid> &status=draft|published &q= &page= &limit=
  *   GET    /admin/phrases/:id            phrase + translations + clips
- *   PATCH  /admin/phrases/:id            { type_id?, text?, text_linked?, ipa?, kind?, status?, is_premium?, sort?,
+ *   PATCH  /admin/phrases/:id            { type_id?, text?, text_linked?, ipa?, kind?, status?, is_premium?, sort?, cefr?, freq_tier?,
+ *                                          links?: [{ type_id, usage_vi?, usage_en?, sort? }],
  *                                          translations?: { [languages_code]: { meaning, usage, avoid, similar, replies, wrong_meanings, situations } } }
  *   DELETE /admin/phrases/:id
  *   POST   /admin/phrases/import         { youtube_video_id, publish?, items: [...] } (from /admin/phrases/import)
@@ -48,6 +49,15 @@ function translationPatch(input: any) {
 	if (input.replies !== undefined) out.replies = JSON.stringify(strings(input.replies, 200, 6));
 	if (input.wrong_meanings !== undefined) out.wrong_meanings = JSON.stringify(strings(input.wrong_meanings, 300, 4));
 	if (input.situations !== undefined) out.situations = JSON.stringify(strings(input.situations, 500, 8));
+	if (input.examples !== undefined) {
+		out.examples = JSON.stringify(jsonList(input.examples)
+			.map((e: any) => ({ a: str(e?.a, 300), b: str(e?.b, 300), a_tr: str(e?.a_tr, 300), b_tr: str(e?.b_tr, 300) }))
+			.filter((e) => e.a || e.b).slice(0, 3));
+	}
+	if (input.parts !== undefined) {
+		out.parts = JSON.stringify(jsonList(input.parts).map((x: any) => ({ text: str(x?.text, 80), literal: str(x?.literal, 120) })).filter((x) => x.text).slice(0, 6));
+	}
+	if (input.origin !== undefined) out.origin = str(input.origin, 600) || null;
 	return out;
 }
 
@@ -150,7 +160,9 @@ export function registerAdminPhraseRoutes(router: any, context: any) {
 				translations: Object.fromEntries(translations.map((t: any) => [t.languages_code, {
 					meaning: t.meaning || '', usage: t.usage || '', avoid: t.avoid || '',
 					similar: jsonList(t.similar_phrases), replies: jsonList(t.replies), wrong_meanings: jsonList(t.wrong_meanings), situations: jsonList(t.situations),
+					examples: jsonList(t.examples), parts: jsonList(t.parts), origin: t.origin || '',
 				}])),
+				links: await database('phrase_type_links').where('phrase_id', id).select('type_id', 'sort', 'usage_vi', 'usage_en').catch(() => []),
 				clips: clips.map((c: any) => ({ ...c, start_time: Number(c.start_time), end_time: Number(c.end_time) })),
 			},
 		});
@@ -191,9 +203,31 @@ export function registerAdminPhraseRoutes(router: any, context: any) {
 		}
 		if (body.is_premium !== undefined) patch.is_premium = body.is_premium === true;
 		if (body.sort !== undefined) patch.sort = body.sort === null || body.sort === '' ? null : Math.round(Number(body.sort)) || 0;
+		if (body.cefr !== undefined) {
+			if (body.cefr !== null && body.cefr !== '' && !['A1', 'A2', 'B1', 'B2', 'C1', 'C2'].includes(body.cefr)) return res.status(400).json({ success: false, message: 'Invalid CEFR' });
+			patch.cefr = body.cefr || null;
+		}
+		if (body.freq_tier !== undefined) {
+			const tier = body.freq_tier === null || body.freq_tier === '' ? null : Number(body.freq_tier);
+			if (tier !== null && ![1, 2, 3, 4].includes(tier)) return res.status(400).json({ success: false, message: 'Invalid tier' });
+			patch.freq_tier = tier;
+		}
+		/** links: [{ type_id, usage_vi?, usage_en?, sort? }], the other types the phrase is in (replaces them) */
+		const links = Array.isArray(body.links)
+			? body.links.filter((l: any) => UUID_RE.test(String(l?.type_id)) && l.type_id !== (patch.type_id || phrase.type_id)).slice(0, 6)
+			: null;
 
 		await database.transaction(async (trx: any) => {
 			if (Object.keys(patch).length) await trx('phrases').where('id', id).update({ ...patch, date_updated: trx.fn.now() });
+			if (links) {
+				await trx('phrase_type_links').where('phrase_id', id).delete();
+				const known = new Set(await trx('phrase_types').whereIn('id', links.map((l: any) => l.type_id)).pluck('id'));
+				const rows = links.filter((l: any) => known.has(l.type_id)).map((l: any) => ({
+					phrase_id: id, type_id: l.type_id, usage_vi: str(l.usage_vi, 500) || null, usage_en: str(l.usage_en, 500) || null,
+					sort: l.sort === undefined || l.sort === null || l.sort === '' ? null : Math.round(Number(l.sort)) || 0,
+				}));
+				if (rows.length) await trx('phrase_type_links').insert(rows);
+			}
 			const langs = await trx('languages').pluck('code');
 			for (const [lang, input] of Object.entries(body.translations || {})) {
 				if (!langs.includes(lang)) continue;

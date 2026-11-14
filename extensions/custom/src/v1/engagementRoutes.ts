@@ -24,6 +24,8 @@ export const REVIEW_INTERVALS = [1, 3, 7, 14, 30];
 export const LEARNING_GOALS = ['exam', 'movies', 'work', 'general', 'other'];
 /** How well they understand spoken English, in their own view: one answer (2026-10-30_listening_level.sql) */
 export const LISTENING_LEVELS = ['beginner', 'elementary', 'intermediate', 'advanced'];
+/** Where they first heard of us: one answer (2026-11-13_heard_from.sql) */
+export const HEARD_FROM = ['facebook', 'tiktok', 'youtube', 'threads', 'google', 'friend', 'other'];
 
 const ONES = ['zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten', 'eleven', 'twelve',
 	'thirteen', 'fourteen', 'fifteen', 'sixteen', 'seventeen', 'eighteen', 'nineteen'];
@@ -111,7 +113,7 @@ export function registerEngagementRoutes(router: any, context: any) {
 		const userId = needUser(req, res);
 		if (!userId) return;
 		try {
-			const row = await database('directus_users').select('daily_goal', 'leaderboard_hidden', 'learning_goals', 'listening_level', 'practice_prefs').where('id', userId).first();
+			const row = await database('directus_users').select('daily_goal', 'leaderboard_hidden', 'learning_goals', 'listening_level', 'heard_from', 'practice_prefs').where('id', userId).first();
 			return res.json({
 				success: true,
 				data: {
@@ -119,6 +121,7 @@ export function registerEngagementRoutes(router: any, context: any) {
 					leaderboard_hidden: !!row?.leaderboard_hidden,
 					learning_goals: Array.isArray(row?.learning_goals) ? row.learning_goals : null,
 					listening_level: row?.listening_level || null,
+					heard_from: row?.heard_from || null,
 					/** null: never set, the page keeps what this browser has */
 					practice: row?.practice_prefs ? practicePrefsOf(row.practice_prefs) : null,
 				},
@@ -172,6 +175,18 @@ export function registerEngagementRoutes(router: any, context: any) {
 			}
 			goals = { ...goals, listening_level: String(body.listening_level), listening_level_at: new Date().toISOString() };
 		}
+		if (body.heard_from !== undefined) {
+			if (!HEARD_FROM.includes(String(body.heard_from))) {
+				return res.status(400).json({ success: false, message: 'Invalid source' });
+			}
+			const from = String(body.heard_from);
+			goals = {
+				...goals,
+				heard_from: from,
+				heard_from_other: from === 'other' && typeof body.heard_from_other === 'string' ? body.heard_from_other.trim().slice(0, 500) || null : null,
+				heard_from_at: new Date().toISOString(),
+			};
+		}
 		if (!Object.keys(patch).length && !goals) return res.status(400).json({ success: false, message: 'Nothing to update' });
 		try {
 			if (Object.keys(patch).length) await database('directus_users').where('id', userId).update(patch);
@@ -183,7 +198,7 @@ export function registerEngagementRoutes(router: any, context: any) {
 			}
 			return res.json({
 				success: true,
-				data: goals ? { ...patch, learning_goals: goals.learning_goals, listening_level: goals.listening_level } : patch,
+				data: goals ? { ...patch, learning_goals: goals.learning_goals, listening_level: goals.listening_level, heard_from: goals.heard_from } : patch,
 			});
 		} catch (error) {
 			return fail(res, 'Save settings', error);

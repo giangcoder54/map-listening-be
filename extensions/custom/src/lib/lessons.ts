@@ -123,7 +123,9 @@ export async function loadLessonGraph(req: any, context: any) {
 	const [groupRows, skillRows, lessonRows, groupTr, skillTr, clipRows] = await Promise.all([
 		database('listening_groups').select('id', 'name', 'slug', 'sort', 'answer_mode', 'is_premium').where('status', 'published'),
 		database('listening_skills').select('id', 'group_id', 'name', 'slug', 'sort', 'category', 'is_premium').where('status', 'published'),
-		database('listening_lessons').select('id', 'skill_id', 'short_id', 'text', 'difficulty', 'is_premium', 'sort', 'learners_count', 'date_created', 'kind', 'review_of').where('status', 'published'),
+		database('listening_lessons').select('id', 'skill_id', 'short_id', 'text', 'difficulty', 'is_premium', 'sort', 'learners_count', 'date_created', 'kind', 'review_of').where('status', 'published')
+			// Weekly challenge rounds (lib/challenges.ts) are lessons too, never on the path
+			.whereRaw(`coalesce(kind, 'pattern') <> 'challenge'`),
 		database('listening_groups_translations').select('listening_groups_id as owner', 'languages_code', 'description'),
 		database('listening_skills_translations').select('listening_skills_id as owner', 'languages_code', 'description', 'example'),
 		database.raw(`
@@ -309,7 +311,7 @@ export async function loadLessonGraph(req: any, context: any) {
 			...counts(list),
 			next: next ? { id: next.id, short_id: next.short_id, number: numberOf(next), locked: isLocked(next) } : null,
 			/** Every open lesson done (signed-in learners only) */
-			passed: !!userId && list.length > 0 && rulePassed(s),
+			passed: !!userId && list.length > 0 && list.every((l) => done.has(l.id)),
 			/** Opens once this earlier rule of the group is passed */
 			locked_by: by ? { id: by.id, name: by.name, slug: by.slug } : null,
 		};

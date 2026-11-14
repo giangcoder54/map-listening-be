@@ -92,6 +92,16 @@ function runOf(days: { day: string; ok: boolean }[], today: string) {
 	return n;
 }
 
+/** Days in a row with the daily goal reached, today included once reached (what the streak Xu go by) */
+export async function goalRunOf(database: any, userId: string, today = vnDay()) {
+	const [days, user] = await Promise.all([
+		database('user_daily_stats').select('day', 'xp', 'goal').where('user_id', userId).where('day', '>', addDays(today, -400)).orderBy('day', 'desc'),
+		database('directus_users').select('daily_goal').where('id', userId).first(),
+	]);
+	const goal = Number(user?.daily_goal) || DEFAULT_GOAL;
+	return runOf(days.map((d: any) => ({ day: dayOf(d.day), ok: d.xp >= (dayOf(d.day) === today ? goal : d.goal) })), today);
+}
+
 /**
  * A practice by a signed-in learner: `attempts` answers (0 for the lesson bonus) and, when a
  * rule gives some, its XP. Returns the XP actually won (0 for a repeat) and new rewards.
@@ -210,9 +220,8 @@ export async function engagementOf(database: any, userId: string, today = vnDay(
 		max_freezes: MAX_FREEZES,
 		freeze_price: COIN.freeze,
 		coins: Number(acc.coins) || 0,
-		coins_cap: COIN.cap,
 		// What Xu are earned and spent on, for the header's Xu explainer
-		coin_rules: { earn: COIN.earn, unlock: COIN.unlock, weekly_unlocks: COIN.weeklyUnlocks, freeze: COIN.freeze, retest: COIN.retest },
+		coin_rules: { earn: COIN.earn, unlock: COIN.unlock, phrase: COIN.phrase, ai_check: COIN.aiCheck, streak_day: COIN.streakDay, streak_milestone: COIN.streakMilestone, freeze: COIN.freeze, retest: COIN.retest },
 		// Days in a row with the daily goal reached (today counts once reached)
 		goal_days: goalRun,
 		goal_met_today: xpToday >= goal,

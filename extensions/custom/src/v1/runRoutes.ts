@@ -27,17 +27,21 @@ import {
 	tilesFor, weakestForms, withRetry, type PoolClip, type RunItem,
 } from '../lib/runs';
 import { REVIEW, gradeOf, masteryOf, schedule, cardColumns } from '../lib/review';
-import { COIN, CoinError, buyFreeze, earnCoins, payRetest, unlockLesson, walletOf } from '../lib/coins';
-import { MAX_FREEZES, grantRewards, lessonXp, recordPractice, vnDay, DEFAULT_GOAL } from '../lib/xp';
+import { COIN, CoinError, buyFreeze, earnCoins, payRetest, streakDayXu, unlockLesson, walletOf, type CoinReason } from '../lib/coins';
+import { MAX_FREEZES, goalRunOf, grantRewards, lessonXp, recordPractice, vnDay, DEFAULT_GOAL } from '../lib/xp';
 import { mixUps } from '../lib/mixups';
 import { mistakeOf, type Mistake } from '../lib/mistakes';
 import { normalizeAnswer } from './engagementRoutes';
 import { subsOf } from '../lib/subs';
+import { CHALLENGE, beatsOf, cachedItemStats, challengeItems, lastClosedWeek, loadChallenges, priceOf, scoreOf, stateOf, withLessons, type ChallengeRow } from '../lib/challenges';
+import { unlockBankVideo, unlockChallenge } from '../lib/coins';
+import { BANK, bankFormat, bankPrice, bankWrong, loadBankItems, type BankItem } from '../lib/bank';
+import { isPremiumUser } from '../lib/premium';
 import { clipOut, lessonTranslations, readClips, registerLearner, wrongOf } from './lessonRoutes';
 
 const ANON_ID_RE = /^[A-Za-z0-9-]{16,64}$/;
 const badKey = (key: string) => !key || key.length > 64;
-type Mode = 'learn' | 'lesson_test' | 'skill_test' | 'review';
+type Mode = 'learn' | 'lesson_test' | 'skill_test' | 'review' | 'challenge' | 'bank';
 
 function learnerOf(req: any) {
 	const userId: string | null = req.accountability?.user ?? null;
@@ -48,16 +52,17 @@ function learnerOf(req: any) {
 }
 
 /** A lesson's clips as drawing sees them, and the payload the page plays */
-async function poolOf(database: any, g: LessonGraph, lesson: LessonRow) {
+async function poolOf(database: any, g: LessonGraph, lesson: LessonRow, answerMode?: 'per_clip' | 'one_answer', fallbackWrong: (target: string) => string[] = mixUps) {
 	const rows = await readClips(database, [lesson.id]);
-	const group = g.groupOf(lesson);
+	// A challenge round is not on the path (not in the graph): its group's answer mode is passed in
+	const group = answerMode ? { answer_mode: answerMode } : g.groupOf(lesson);
 	const byId = new Map<string, { row: any; clip: PoolClip }>();
 	rows.forEach((r: any) => {
 		const answer = answerOf(r, lesson.text, group.answer_mode);
 		const focus = String(r.focus_text || '').trim() || null;
 		// The clip's own wrong answers, else ones made from the words heard one for another
 		const own = wrongOf(r);
-		const wrong = own.length ? own : mixUps(targetOf({ answer, focus }));
+		const wrong = own.length ? own : fallbackWrong(targetOf({ answer, focus }));
 		byId.set(r.id, {
 			row: r,
 			clip: {
@@ -141,10 +146,60 @@ async function contrastOf(database: any, clipRow: any, trap: boolean, upcoming: 
 	};
 }
 
+/** A challenge round's lesson, read directly (it is off the path), and its group's answer mode */
+async function challengeLessonOf(database: any, lessonId: string) {
+	const row = await database('listening_lessons as l')
+		.join('listening_skills as s', 's.id', 'l.skill_id')
+		.join('listening_groups as gr', 'gr.id', 's.group_id')
+		.select('l.id', 'l.skill_id', 'l.short_id', 'l.text', 'l.difficulty', 'l.is_premium', 'l.sort', 'l.kind', 'gr.answer_mode')
+		.where('l.id', lessonId).first();
+	if (!row) return null;
+	const { answer_mode, ...lesson } = row;
+	return { lesson: lesson as LessonRow, answerMode: (answer_mode === 'per_clip' ? 'per_clip' : 'one_answer') as 'per_clip' | 'one_answer' };
+}
+
+/**
+ * Pools of the lessons the items of a challenge or a bank run come from (their clips may be
+ * from any lesson, a past challenge's included, so the path's graph is not used)
+ */
+async function pickedPools(database: any, g: LessonGraph, items: RunItem[], fallbackLessonId?: string | null) {
+	const out = new Map<string, Pool>();
+	for (const id of new Set(items.map((it) => it.lesson_id || fallbackLessonId).filter(Boolean) as string[])) {
+		const found = await challengeLessonOf(database, id);
+		if (found) out.set(id, await poolOf(database, g, found.lesson, found.answerMode, bankWrong));
+	}
+	return out;
+}
+
+/** Every item of a finished challenge or bank run, now with its answer; `pct`: how many others got it right */
+function reviewOfRun(items: RunItem[], pools: Map<string, Pool>, fallbackLessonId: string | null, stats: Record<string, number> = {}) {
+	return items.flatMap((it, i) => {
+		const pool = pools.get(it.lesson_id || fallbackLessonId || '');
+		const shown = pool?.payload(it, i);
+		const hit = pool?.byId.get(it.clip_id);
+		if (!shown || !hit) return [];
+		return [{
+			index: i, format: it.format, correct: !!it.result?.correct, given: it.result?.answer ?? '',
+			expected: it.format === 'type' ? hit.clip.answer : targetOf(hit.clip),
+			pct: stats[it.clip_id] ?? null, clip: shown.clip,
+		}];
+	});
+}
+
 /** The run as the page plays it. Every item keeps its index, whatever the page skips. */
 async function runOut(database: any, g: LessonGraph, run: any) {
 	const items: RunItem[] = run.items || [];
-	const pools = await poolsOf(database, g, items.map((it) => it.lesson_id || run.lesson_id));
+	let pools: Map<string, Pool>;
+	let challenge: ChallengeRow | null = null;
+	let video: { short_id: string; title: string } | null = null;
+	if (run.mode === 'challenge' || run.mode === 'bank') {
+		pools = await pickedPools(database, g, items, run.lesson_id);
+		if (run.mode === 'challenge') challenge = run.challenge_id ? (await loadChallenges(database, { id: run.challenge_id }))[0] || null : null;
+		else {
+			const p = run.practice_id ? await database('practice_videos').select('short_id', 'title').where('id', run.practice_id).first() : null;
+			video = p ? { short_id: p.short_id, title: p.title } : null;
+		}
+	} else pools = await poolsOf(database, g, items.map((it) => it.lesson_id || run.lesson_id));
 	const lesson = run.lesson_id ? g.lessonById.get(run.lesson_id) : null;
 	const skill = run.skill_id ? g.skillById.get(run.skill_id) : null;
 	// A lesson's practice steps may carry their own question: read live, so an edit shows at once
@@ -158,7 +213,9 @@ async function runOut(database: any, g: LessonGraph, run: any) {
 		mode: run.mode as Mode,
 		status: run.status,
 		position: Number(run.position) || 0,
-		max_listens: MAX_LISTENS[run.mode] || 3,
+		max_listens: challenge ? challenge.max_listens : MAX_LISTENS[run.mode] || 3,
+		bank: video,
+		challenge: challenge ? { short_id: challenge.short_id, week: challenge.week, title: { vi: challenge.title_vi, en: challenge.title_en } } : null,
 		lesson: lesson ? { short_id: lesson.short_id, number: g.numberOf(lesson) } : null,
 		skill: skill ? { slug: skill.slug, name: skill.name } : null,
 		items: items.map((it, i) => {
@@ -166,6 +223,12 @@ async function runOut(database: any, g: LessonGraph, run: any) {
 			// lesson_id: where a "report a problem" on the item is filed (reviews and tests mix lessons)
 			// The question of a practice step, and of its retry (same clip)
 			const prompt = it.phase === 'practice' || it.phase === 'retry' ? prompts.get(it.clip_id) || null : null;
+			// A challenge keeps right / wrong for the end
+			if (out && run.mode === 'challenge' && run.status === 'active') {
+				if (out.result) out.result = { answered: true } as any;
+				// The explanations and "sounds like" give the answers away: sent with the result
+				Object.assign(out.clip, { translations: null, sounds_like: null });
+			}
 			return out ? { ...out, lesson_id: it.lesson_id || run.lesson_id, hearts: triesFor(run.mode, out.format, it.phase), prompt } : null;
 		}).filter(Boolean),
 	};
@@ -178,7 +241,7 @@ export function registerRunRoutes(router: any, context: any) {
 		return res.status(500).json({ success: false, message: 'Server error' });
 	};
 	const coinFail = (res: any, e: CoinError) => {
-		const status = e.code === 'NOT_ENOUGH' || e.code === 'WEEKLY_LIMIT' || e.code === 'MAX_FREEZES' ? 402 : 409;
+		const status = e.code === 'NOT_ENOUGH' || e.code === 'MAX_FREEZES' ? 402 : 409;
 		return res.status(status).json({ success: false, code: e.code });
 	};
 
@@ -207,12 +270,13 @@ export function registerRunRoutes(router: any, context: any) {
 		mode: Mode,
 		where: { lesson_id?: string | null; skill_id?: string | null },
 		draw: () => RunItem[] | Promise<RunItem[]>,
-		opts: { restart?: boolean; valid?: (items: RunItem[]) => boolean } = {},
+		opts: { restart?: boolean; valid?: (items: RunItem[]) => boolean; extra?: Record<string, unknown>; match?: Record<string, unknown> } = {},
 	) {
 		return database.transaction(async (trx: any) => {
 			const q = trx('listening_runs').where({ learner_key: learner.key, mode, status: 'active' });
 			if (where.lesson_id !== undefined) q.where('lesson_id', where.lesson_id);
 			if (where.skill_id !== undefined) q.where('skill_id', where.skill_id);
+			if (opts.match) q.where(opts.match);
 			const active = await q.orderBy('started_at', 'desc').forUpdate().first();
 			const stale = active && opts.valid && !opts.valid(active.items || []);
 			if (active && !opts.restart && !stale) return active;
@@ -221,7 +285,7 @@ export function registerRunRoutes(router: any, context: any) {
 			if (!items.length) return null;
 			const [row] = await trx('listening_runs').insert({
 				user_id: learner.userId, learner_key: learner.key, mode,
-				skill_id: where.skill_id ?? null, lesson_id: where.lesson_id ?? null, items: JSON.stringify(items),
+				skill_id: where.skill_id ?? null, lesson_id: where.lesson_id ?? null, items: JSON.stringify(items), ...(opts.extra || {}),
 			}).returning('*');
 			return row;
 		});
@@ -544,6 +608,14 @@ export function registerRunRoutes(router: any, context: any) {
 
 			// A practice day (the streak); a learner counted once per lesson
 			if (out.again) return res.json({ success: true, data: out.data });
+			// A challenge says nothing until the end: right or wrong shows on the result screen
+			if (out.mode === 'challenge') {
+				if (learner.userId) {
+					const won = await recordPractice(database, learner.userId, { attempts: 1 });
+					await grantRewards(context, req.schema, learner.userId, won.rewards);
+				}
+				return res.json({ success: true, data: { hidden: true, position: out.data.position, total: out.data.total, done: out.data.done } });
+			}
 			let rewards: any[] = [];
 			if (learner.userId) {
 				const won = await recordPractice(database, learner.userId, { attempts: 1 });
@@ -556,7 +628,9 @@ export function registerRunRoutes(router: any, context: any) {
 			const learning = out.mode === 'learn' || out.mode === 'review';
 			if (learner.userId && learning && out.data.trap && out.data.correct) {
 				const today = vnDay();
-				const r = await earnCoins(database, learner.userId, { reason: 'trap', amount: COIN.earn.trap, dedupe: `trap:${out.clipRow.id}:${today}`, lessonId: out.clipLessonId }, today);
+				// The first time ever pays most; the same clip again, once a day, pays a little
+				let r = await earnCoins(database, learner.userId, { reason: 'trap', amount: COIN.earn.trap, dedupe: `trap:${out.clipRow.id}`, lessonId: out.clipLessonId }, today);
+				if (!r.wanted) r = await earnCoins(database, learner.userId, { reason: 'trap', amount: COIN.earn.trapAgain, dedupe: `trap:${out.clipRow.id}:${today}`, lessonId: out.clipLessonId }, today);
 				coins.added = r.added;
 				coins.balance = r.coins;
 			}
@@ -615,6 +689,10 @@ export function registerRunRoutes(router: any, context: any) {
 					const s = await trx('listening_skills').select('pass_ratio').where('id', run.skill_id).first();
 					ok = passed(run.items, Number(s?.pass_ratio) || 0.8);
 				}
+				if (run.mode === 'challenge') {
+					const c = await trx('listening_challenges').select('pass_score').where('id', run.challenge_id).first();
+					ok = scoreOf(run.items || [], Number(c?.pass_score) || 7).passed;
+				}
 				const first = run.status === 'active';
 				if (first) await trx('listening_runs').where('id', run.id).update({ status: 'finished', passed: ok, finished_at: trx.fn.now(), date_updated: trx.fn.now() });
 				return { status: 200 as const, run, summary, first, ok: first ? ok : !!run.passed };
@@ -623,6 +701,8 @@ export function registerRunRoutes(router: any, context: any) {
 			if (closed.status === 409) return res.status(409).json({ success: false, code: closed.code });
 			const { run, summary } = closed;
 			const mode = run.mode as Mode;
+			if (mode === 'challenge') return res.json({ success: true, data: await finishChallenge(req, learner, run, closed.first) });
+			if (mode === 'bank') return res.json({ success: true, data: await finishBank(req, learner, run, closed.first) });
 			const items: RunItem[] = run.items || [];
 
 			const xp = { total: 0, kind: null as string | null };
@@ -630,12 +710,13 @@ export function registerRunRoutes(router: any, context: any) {
 			let rewards: any[] = [];
 			const userId = learner.userId;
 			const today = vnDay();
-			const earn = async (reason: 'lesson' | 'perfect' | 'goal' | 'review', amount: number, dedupe: string, lessonId: string | null = null) => {
-				if (!userId) return;
+			const earn = async (reason: CoinReason, amount: number, dedupe: string, lessonId: string | null = null) => {
+				if (!userId || amount <= 0) return null;
 				const r = await earnCoins(database, userId, { reason, amount, dedupe, lessonId }, today);
 				coins.added += r.added;
 				if (r.wanted > r.added) coins.missed += r.wanted - r.added;
 				coins.balance = r.coins;
+				return r;
 			};
 			const addXp = async (won: { xp: number; rewards: any[]; kind?: string | null }, kind: string | null = null) => {
 				xp.total += won.xp;
@@ -665,8 +746,17 @@ export function registerRunRoutes(router: any, context: any) {
 						await refreshSkillProgress(trx, userId, run.skill_id);
 					});
 					await addXp(await lessonXp(database, userId, run.lesson_id, summary.hinted, today));
-					await earn('lesson', COIN.earn.lesson, `lesson:${run.lesson_id}`, run.lesson_id);
-					if (summary.perfect) await earn('perfect', COIN.earn.perfect, `perfect:${run.lesson_id}`, run.lesson_id);
+					// Free lessons pay more than Premium ones: free is where Xu are earned
+					const graph = await loadLessonGraph(req, context);
+					const lessonRow = graph.lessonById.get(run.lesson_id);
+					const paid = !!lessonRow && graph.isPremiumContent(lessonRow);
+					const first = await earn('lesson', paid ? COIN.earn.lessonPremium : COIN.earn.lesson, `lesson:${run.lesson_id}`, run.lesson_id);
+					if (summary.perfect) await earn('perfect', paid ? COIN.earn.perfectPremium : COIN.earn.perfect, `perfect:${run.lesson_id}`, run.lesson_id);
+					// A lesson done again still pays, much less: the first go of the day, then a little for each
+					if (first && !first.wanted) {
+						const again = await earn('replay', COIN.earn.replay, `replay:${run.lesson_id}:${today}`, run.lesson_id);
+						if (again && !again.wanted) await earn('replay', COIN.earn.replayLater, `replay:${run.lesson_id}:${today}:${run.id}`, run.lesson_id);
+					}
 				} else if (mode === 'lesson_test' && closed.ok) {
 					await database.transaction(async (trx: any) => {
 						await testOut(trx, userId, run.lesson_id, run.id);
@@ -683,6 +773,7 @@ export function registerRunRoutes(router: any, context: any) {
 						await refreshSkillProgress(trx, userId, run.skill_id, { status: learnedAll ? 'mastered' : 'tested_out', mastered_at: new Date().toISOString(), last_test_run_id: run.id });
 					});
 					await addXp(await recordPractice(database, userId, { xp: { reason: 'skill_test', dedupe: `skill_test:${run.skill_id}` } }, today), 'skill_test');
+					await earn('skill_test', COIN.earn.skillTest, `skill_test:${run.skill_id}`);
 				} else if (mode === 'review') {
 					const answered = items.filter((it) => it.result && it.lesson_id);
 					const skills = new Set<string>();
@@ -724,7 +815,13 @@ export function registerRunRoutes(router: any, context: any) {
 					database('user_daily_stats').select('xp').where({ user_id: userId, day: today }).first(),
 					database('directus_users').select('daily_goal').where('id', userId).first(),
 				]);
-				if ((Number(day?.xp) || 0) >= (Number(user?.daily_goal) || DEFAULT_GOAL)) await earn('goal', COIN.earn.goal, `goal:${today}`);
+				if ((Number(day?.xp) || 0) >= (Number(user?.daily_goal) || DEFAULT_GOAL)) {
+					// Xu for the day, more the longer the run of goal days; a bonus at 7, 30, 100, 365 (once ever)
+					const run = await goalRunOf(database, userId, today);
+					await earn('goal', streakDayXu(run), `goal:${today}`);
+					const bonus = COIN.streakMilestone[run];
+					if (bonus) await earn('streak_milestone', bonus, `streak_milestone:${run}`);
+				}
 			}
 
 			const g = await loadLessonGraph(req, context);
@@ -755,6 +852,307 @@ export function registerRunRoutes(router: any, context: any) {
 			return fail(res, 'Finish run', error);
 		}
 	});
+
+	// ── Weekly challenge (lib/challenges.ts) ──────────────────────────────
+	type Card = ReturnType<typeof cardOf>;
+	/** One round as the pages show it, for this learner */
+	function cardOf(c: ChallengeRow, ctx: {
+		now: number; lastClosed: string | null; all: ChallengeRow[]; userId: string | null; premium: boolean;
+		unlocked: Set<string>; results: any[]; runs: any[];
+	}) {
+		const state = stateOf(c, ctx.now);
+		const passedRuns = new Set(ctx.runs.filter((r) => r.status === 'finished' && r.passed).map((r) => r.challenge_id));
+		const price = ctx.premium || ctx.unlocked.has(c.lesson_id) ? 0 : priceOf(c, ctx.lastClosed, ctx.now);
+		let blocked: null | 'SCHEDULED' | 'LOGIN_REQUIRED' = null;
+		if (state === 'scheduled') blocked = 'SCHEDULED';
+		else if (price > 0 && !ctx.userId) blocked = 'LOGIN_REQUIRED';
+		const mine = ctx.results.find((r) => r.challenge_id === c.id);
+		const participants = Number(c.participants) || 0;
+		return {
+			id: c.id, short_id: c.short_id, week: c.week, title: { vi: c.title_vi, en: c.title_en },
+			state, starts_at: c.starts_at, ends_at: c.ends_at, total: c.total, pass_score: c.pass_score, max_listens: c.max_listens,
+			participants, passed_count: Number(c.passed_count) || 0,
+			pass_rate: participants ? Math.round(((Number(c.passed_count) || 0) * 100) / participants) : null,
+			/** Xu to open it now (0: open), and whether Premium covers it */
+			price, premium: ctx.premium, blocked,
+			/** The official go (while it was live) */
+			my: mine ? { score: Number(mine.score), total: Number(mine.total), passed: !!mine.passed } : null,
+			passed_any: passedRuns.has(c.id),
+			played: ctx.runs.some((r) => r.challenge_id === c.id && r.status === 'finished'),
+			resume: ctx.runs.some((r) => r.challenge_id === c.id && r.status === 'active'),
+		};
+	}
+	async function cardsFor(req: any, rows: ChallengeRow[], all?: ChallengeRow[]): Promise<Card[]> {
+		if (!rows.length) return [];
+		const learner = learnerOf(req);
+		const now = Date.now();
+		const everything = all || await loadChallenges(database);
+		const weeks = new Set(rows.map((r) => r.week));
+		const ids = [...new Set([...rows.map((r) => r.id), ...everything.filter((r) => weeks.has(r.week)).map((r) => r.id)])];
+		const [premium, unlocks, results, runs] = await Promise.all([
+			learner.userId ? isPremiumUser(database, learner.userId) : false,
+			learner.userId ? database('listening_unlocks').select('lesson_id').where('user_id', learner.userId).whereIn('lesson_id', rows.map((r) => r.lesson_id)) : [],
+			learner.key ? database('listening_challenge_results').select('challenge_id', 'score', 'total', 'passed').where('learner_key', learner.key).whereIn('challenge_id', ids) : [],
+			learner.key ? database('listening_runs').select('challenge_id', 'status', 'passed').where({ learner_key: learner.key, mode: 'challenge' }).whereIn('challenge_id', ids) : [],
+		]);
+		const ctx = { now, lastClosed: lastClosedWeek(everything, now), all: everything, userId: learner.userId, premium, unlocked: new Set<string>(unlocks.map((u: any) => u.lesson_id)), results, runs };
+		return rows.map((c) => cardOf(c, ctx));
+	}
+
+	/** This week's rounds and every week before, newest first; guests send ?anonymous_id */
+	router.get('/listening-lab/challenges', async (req: any, res: any) => {
+		try {
+			const all = (await loadChallenges(database)).filter((c) => stateOf(c) !== 'scheduled');
+			const cards = await cardsFor(req, all, all);
+			const weeks: { week: string; state: string; starts_at: any; ends_at: any; rounds: Card[] }[] = [];
+			for (const card of cards) {
+				let w = weeks.find((x) => x.week === card.week);
+				if (!w) weeks.push(w = { week: card.week, state: card.state, starts_at: card.starts_at, ends_at: card.ends_at, rounds: [] });
+				w.rounds.push(card);
+			}
+			const current = weeks.find((w) => w.state === 'live') || null;
+			return res.json({ success: true, data: { current, past: weeks.filter((w) => w !== current) } });
+		} catch (error) {
+			return fail(res, 'Challenges', error);
+		}
+	});
+
+	router.get('/listening-lab/challenges/:key', async (req: any, res: any) => {
+		const key = String(req.params.key || '');
+		if (badKey(key)) return res.status(400).json({ success: false, message: 'Invalid challenge' });
+		try {
+			const [c] = await loadChallenges(database, { shortId: key });
+			if (!c) return res.status(404).json({ success: false, message: 'Challenge not found' });
+			const [card] = await cardsFor(req, [c]);
+			return res.json({ success: true, data: card });
+		} catch (error) {
+			return fail(res, 'Challenge', error);
+		}
+	});
+
+	/** Start or resume a round. A price to pay: 402 PRICE, then again with { pay: true } */
+	router.post('/listening-lab/challenges/:key/runs', async (req: any, res: any) => {
+		const key = String(req.params.key || '');
+		if (badKey(key)) return res.status(400).json({ success: false, message: 'Invalid challenge' });
+		const learner = learnerOf(req);
+		if (!learner.key) return res.status(400).json({ success: false, message: 'anonymous_id needed' });
+		try {
+			const [c] = await loadChallenges(database, { shortId: key });
+			if (!c) return res.status(404).json({ success: false, message: 'Challenge not found' });
+			const [card] = await cardsFor(req, [c]);
+			if (card!.blocked) return res.status(403).json({ success: false, code: card!.blocked });
+			if (card!.price > 0) {
+				if (!req.body?.pay) return res.status(402).json({ success: false, code: 'PRICE', price: card!.price });
+				await unlockChallenge(database, learner.userId!, c.lesson_id, card!.price);
+			}
+			const written = await database('listening_lessons').select('practice').where('id', c.lesson_id).first();
+			const items = await withLessons(database, challengeItems(written?.practice));
+			const order = items.map((it) => it.clip_id).join();
+			const run = await openRun(learner, 'challenge', { lesson_id: c.lesson_id, skill_id: null }, () => items,
+				{ restart: !!req.body?.restart, extra: { challenge_id: c.id }, valid: (its) => its.map((it) => it.clip_id).join() === order });
+			if (!run) return res.status(409).json({ success: false, code: 'EMPTY_LESSON' });
+			const g = await loadLessonGraph(req, context);
+			return res.json({ success: true, data: await runOut(database, g, run) });
+		} catch (error) {
+			if (error instanceof CoinError) return coinFail(res, error);
+			return fail(res, 'Start challenge', error);
+		}
+	});
+
+	/**
+	 * The end of a round: the score; the official go (first one finished while live) is counted
+	 * and wins Xu when passed. Then every item with what was said, the right answer and how many
+	 * people got it right.
+	 */
+	async function finishChallenge(req: any, learner: ReturnType<typeof learnerOf>, run: any, first: boolean) {
+		const [c] = await loadChallenges(database, { id: run.challenge_id });
+		const items: RunItem[] = run.items || [];
+		const { score, total, passed: ok } = scoreOf(items, Number(c?.pass_score) || 7);
+		let official = false;
+		const coins = { added: 0, balance: null as number | null };
+		if (c && first && learner.key && stateOf(c) === 'live') {
+			official = await database.transaction(async (trx: any) => {
+				const inserted = await trx('listening_challenge_results')
+					.insert({ challenge_id: c.id, learner_key: learner.key, user_id: learner.userId, run_id: run.id, score, total, passed: ok })
+					.onConflict(['challenge_id', 'learner_key']).ignore().returning('challenge_id');
+				if (!inserted.length) return false;
+				await trx('listening_challenges').where('id', c.id).update({
+					participants: trx.raw('participants + 1'), passed_count: trx.raw('passed_count + ?', [ok ? 1 : 0]),
+				});
+				return true;
+			});
+			if (official && ok && learner.userId) {
+				const won = await earnCoins(database, learner.userId, { reason: 'challenge', amount: CHALLENGE.earn.pass, dedupe: `challenge:${c.id}`, lessonId: c.lesson_id });
+				coins.added += won.added;
+				coins.balance = won.coins;
+				if (score === total) {
+					const extra = await earnCoins(database, learner.userId, { reason: 'challenge', amount: CHALLENGE.earn.perfect, dedupe: `challenge_perfect:${c.id}`, lessonId: c.lesson_id });
+					coins.added += extra.added;
+					coins.balance = extra.coins;
+				}
+			}
+		}
+		const fresh = c ? (await loadChallenges(database, { id: c.id }))[0] || null : null;
+		const stats: Record<string, number> = fresh ? await cachedItemStats(database, fresh) : {};
+		const card = fresh ? (await cardsFor(req, [fresh]))[0] || null : null;
+		const beats = fresh && card?.my ? await beatsOf(database, fresh.id, card.my.score, card.participants) : null;
+		const review = reviewOfRun(items, await pickedPools(database, null as any, items, run.lesson_id), run.lesson_id, stats);
+		return { mode: 'challenge' as const, score, total, passed: ok, official, beats, coins, challenge: card, review };
+	}
+
+	// ── Practice bank (lib/bank.ts) ───────────────────────────────────────
+	/** What this learner may open, has done and others did, for a set of sentences */
+	async function bankCtx(req: any, clipIds: string[]) {
+		const learner = learnerOf(req);
+		const [premium, unlocks, mine, others, active] = await Promise.all([
+			learner.userId ? isPremiumUser(database, learner.userId) : false,
+			learner.userId ? database('practice_video_unlocks').select('practice_id').where('user_id', learner.userId) : [],
+			learner.userId && clipIds.length ? database('practice_clip_progress').select('clip_id').where({ user_id: learner.userId, right_once: true }).whereIn('clip_id', clipIds) : [],
+			clipIds.length ? database('practice_clip_progress').select('clip_id').count('* as n').whereIn('clip_id', clipIds).groupBy('clip_id') : [],
+			learner.key && clipIds.length ? database('listening_runs').select('clip_id').where({ learner_key: learner.key, mode: 'bank', status: 'active' }).whereIn('clip_id', clipIds) : [],
+		]);
+		return {
+			userId: learner.userId, premium,
+			unlocked: new Set<string>(unlocks.map((u: any) => u.practice_id)),
+			done: new Set<string>(mine.map((m: any) => m.clip_id)),
+			learners: new Map<string, number>(others.map((o: any) => [o.clip_id, Number(o.n)])),
+			active: new Set<string>(active.map((r: any) => r.clip_id)),
+		};
+	}
+	type BankCtx = Awaited<ReturnType<typeof bankCtx>>;
+
+	/** One sentence as a card, for this learner */
+	function bankCardOf(it: BankItem, ctx: BankCtx) {
+		const locked = it.is_premium && !ctx.premium && !ctx.unlocked.has(it.practice_id);
+		return {
+			id: it.id, n: it.n,
+			video: { short_id: it.video_short_id, title: it.video_title },
+			rule: { slug: it.skill_slug, name: it.skill_name },
+			difficulty: it.difficulty,
+			is_premium: it.is_premium, locked,
+			/** Xu to open its video now (0: open): all the video's sentences open together */
+			price: locked ? bankPrice(it) : 0, premium: ctx.premium,
+			blocked: locked && !ctx.userId ? ('LOGIN_REQUIRED' as const) : null,
+			done: ctx.done.has(it.id),
+			learners: ctx.learners.get(it.id) || 0,
+			resume: ctx.active.has(it.id),
+		};
+	}
+
+	/**
+	 * The bank, a page at a time: ?page=1&limit=24 and the filters rule (a rule's slug), level (1-3),
+	 * show (free | todo). Order is the bank's own (videos, then as said), with `n` as the number.
+	 */
+	router.get('/listening-lab/practice', async (req: any, res: any) => {
+		try {
+			const all = await loadBankItems(database);
+			const ctx = await bankCtx(req, all.map((it) => it.id));
+			const page = Math.max(1, Math.floor(Number(req.query.page)) || 1);
+			const limit = Math.min(60, Math.max(1, Math.floor(Number(req.query.limit)) || 24));
+			const rule = String(req.query.rule || '');
+			const level = Math.floor(Number(req.query.level)) || 0;
+			const show = String(req.query.show || '');
+			const cards = all.map((it) => bankCardOf(it, ctx));
+			const rules = new Map<string, { slug: string; name: string; n: number }>();
+			for (const it of all) {
+				const e = rules.get(it.skill_slug) || { slug: it.skill_slug, name: it.skill_name, n: 0 };
+				e.n++;
+				rules.set(it.skill_slug, e);
+			}
+			const shown = cards.filter((c) => (!rule || c.rule.slug === rule) && (!level || c.difficulty === level) && (show !== 'free' || !c.locked) && (show !== 'todo' || !c.done));
+			const thumbs = [...new Map(all.map((it) => [it.practice_id, it.thumbnail_url || `https://i.ytimg.com/vi/${it.youtube_video_id}/hqdefault.jpg`])).values()];
+			return res.json({
+				success: true,
+				data: {
+					items: shown.slice((page - 1) * limit, page * limit), total: shown.length, page, limit,
+					rules: [...rules.values()].sort((a, b) => b.n - a.n),
+					/** Of the whole bank, for the front page tile */
+					summary: { total: cards.length, free: cards.filter((c) => !c.is_premium).length, done: cards.filter((c) => c.done).length, videos: thumbs.length, thumbs: thumbs.slice(0, 3) },
+					default_price: BANK.price, earn: BANK.earn,
+				},
+			});
+		} catch (error) {
+			return fail(res, 'Bank', error);
+		}
+	});
+
+	/** The sentence after this one that the learner can open (the card's "next") */
+	async function bankNext(req: any, it: BankItem) {
+		const all = await loadBankItems(database);
+		const ctx = await bankCtx(req, all.map((x) => x.id));
+		const next = all.find((x) => x.n > it.n && !bankCardOf(x, ctx).locked) || all.find((x) => x.n !== it.n && !bankCardOf(x, ctx).locked) || null;
+		return { card: bankCardOf(it, ctx), next: next ? next.id : null };
+	}
+
+	router.get('/listening-lab/practice/:key', async (req: any, res: any) => {
+		const key = String(req.params.key || '');
+		if (!UUID_RE.test(key)) return res.status(400).json({ success: false, message: 'Invalid sentence' });
+		try {
+			const [it] = await loadBankItems(database, { clipId: key });
+			if (!it) return res.status(404).json({ success: false, message: 'Sentence not found' });
+			const { card, next } = await bankNext(req, it);
+			return res.json({ success: true, data: { ...card, next } });
+		} catch (error) {
+			return fail(res, 'Bank item', error);
+		}
+	});
+
+	/** Start or resume one sentence. A price to pay: 402 PRICE, then again with { pay: true } */
+	router.post('/listening-lab/practice/:key/runs', async (req: any, res: any) => {
+		const key = String(req.params.key || '');
+		if (!UUID_RE.test(key)) return res.status(400).json({ success: false, message: 'Invalid sentence' });
+		const learner = learnerOf(req);
+		if (!learner.key) return res.status(400).json({ success: false, message: 'anonymous_id needed' });
+		try {
+			const [it] = await loadBankItems(database, { clipId: key });
+			if (!it) return res.status(404).json({ success: false, message: 'Sentence not found' });
+			const { card } = await bankNext(req, it);
+			if (card.blocked) return res.status(403).json({ success: false, code: card.blocked });
+			if (card.price > 0) {
+				if (!req.body?.pay) return res.status(402).json({ success: false, code: 'PRICE', price: card.price });
+				await unlockBankVideo(database, learner.userId!, it.practice_id, card.price);
+			}
+			const g = await loadLessonGraph(req, context);
+			const pools = await pickedPools(database, g, [{ lesson_id: it.lesson_id } as RunItem]);
+			const clip = pools.get(it.lesson_id)?.byId.get(it.id)?.clip;
+			if (!clip) return res.status(409).json({ success: false, code: 'EMPTY_LESSON' });
+			const run = await openRun(learner, 'bank', {},
+				() => [{ clip_id: it.id, lesson_id: it.lesson_id, phase: 'practice' as const, format: bankFormat(clip, Math.floor(Math.random() * 3)), result: null }],
+				{ restart: !!req.body?.restart, extra: { practice_id: it.practice_id, clip_id: it.id }, match: { clip_id: it.id } });
+			if (!run) return res.status(409).json({ success: false, code: 'EMPTY_LESSON' });
+			return res.json({ success: true, data: await runOut(database, g, run) });
+		} catch (error) {
+			if (error instanceof CoinError) return coinFail(res, error);
+			return fail(res, 'Start bank run', error);
+		}
+	});
+
+	/** The end of one sentence: kept as done when right, Xu the first time it is right, its answer and explanation */
+	async function finishBank(req: any, learner: ReturnType<typeof learnerOf>, run: any, first: boolean) {
+		const items: RunItem[] = run.items || [];
+		const correct = !!items[0]?.result?.correct;
+		const coins = { added: 0, balance: null as number | null };
+		if (learner.userId && first && run.clip_id) {
+			const old = await database('practice_clip_progress').where({ user_id: learner.userId, clip_id: run.clip_id }).first();
+			await database('practice_clip_progress').insert({
+				user_id: learner.userId, clip_id: run.clip_id, right_once: correct, plays: 1,
+				first_right_at: correct ? database.fn.now() : null, last_played_at: database.fn.now(),
+			}).onConflict(['user_id', 'clip_id']).merge({
+				plays: database.raw('practice_clip_progress.plays + 1'), last_played_at: database.fn.now(),
+				...(correct ? { right_once: true, first_right_at: old?.first_right_at || database.fn.now() } : {}),
+			});
+			// Xu once per sentence ever, for the first time it is heard right
+			if (correct) {
+				const won = await earnCoins(database, learner.userId, { reason: 'bank', amount: BANK.earn, dedupe: `bank:${run.clip_id}` });
+				coins.added += won.added;
+				coins.balance = won.coins;
+			}
+		}
+		const [it] = run.clip_id ? await loadBankItems(database, { clipId: run.clip_id }) : [];
+		const info = it ? await bankNext(req, it) : null;
+		const review = reviewOfRun(items, await pickedPools(database, null as any, items), null);
+		return { mode: 'bank' as const, correct, coins, card: info?.card || null, next: info?.next || null, review };
+	}
 
 	// ── Xu ────────────────────────────────────────────────────────────────
 	router.get('/listening-lab/wallet', async (req: any, res: any) => {
