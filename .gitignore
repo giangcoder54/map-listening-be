@@ -51,3 +51,6 @@ Desktop.ini
 
 # Local DB backups (restore points, may hold user data)
 database/backups/
+
+# Graphify knowledge-graph outputs (local, regenerable; includes per-file cache)
+graphify-out/
