@@ -36,7 +36,7 @@ export function registerAdminRuleRoutes(router: any, context: any) {
 							WHERE c.lesson_id = l.id AND c.status = 'published' AND c.role IN ('core', 'pool')
 						))::int AS playable
 					FROM listening_skills s
-					LEFT JOIN listening_lessons l ON l.skill_id = s.id
+					LEFT JOIN listening_lessons l ON l.skill_id = s.id AND coalesce(l.kind, 'pattern') <> 'bank'
 					GROUP BY s.id
 					ORDER BY s.sort ASC NULLS LAST, s.name
 				`),

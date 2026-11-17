@@ -124,8 +124,8 @@ export async function loadLessonGraph(req: any, context: any) {
 		database('listening_groups').select('id', 'name', 'slug', 'sort', 'answer_mode', 'is_premium').where('status', 'published'),
 		database('listening_skills').select('id', 'group_id', 'name', 'slug', 'sort', 'category', 'is_premium').where('status', 'published'),
 		database('listening_lessons').select('id', 'skill_id', 'short_id', 'text', 'difficulty', 'is_premium', 'sort', 'learners_count', 'date_created', 'kind', 'review_of').where('status', 'published')
-			// Weekly challenge rounds (lib/challenges.ts) are lessons too, never on the path
-			.whereRaw(`coalesce(kind, 'pattern') <> 'challenge'`),
+			// Weekly challenge rounds (lib/challenges.ts) and the bank's own sentences (kind 'bank') are lessons too, never on the path
+			.whereRaw(`coalesce(kind, 'pattern') NOT IN ('challenge', 'bank')`),
 		database('listening_groups_translations').select('listening_groups_id as owner', 'languages_code', 'description'),
 		database('listening_skills_translations').select('listening_skills_id as owner', 'languages_code', 'description', 'example'),
 		database.raw(`

@@ -1029,6 +1029,8 @@ export function registerRunRoutes(router: any, context: any) {
 			video: { short_id: it.video_short_id, title: it.video_title },
 			rule: { slug: it.skill_slug, name: it.skill_name },
 			difficulty: it.difficulty,
+			/** Written for the bank (a hidden lesson of kind 'bank'), not taken from a lesson */
+			own: it.lesson_kind === 'bank',
 			is_premium: it.is_premium, locked,
 			/** Xu to open its video now (0: open): all the video's sentences open together */
 			price: locked ? bankPrice(it) : 0, premium: ctx.premium,
@@ -1041,7 +1043,7 @@ export function registerRunRoutes(router: any, context: any) {
 
 	/**
 	 * The bank, a page at a time: ?page=1&limit=24 and the filters rule (a rule's slug), level (1-3),
-	 * show (free | todo). Order is the bank's own (videos, then as said), with `n` as the number.
+	 * show (free | todo), source (bank: only sentences written for the bank | lesson: the ones taken from lessons). Order is the bank's own (videos, then as said), with `n` as the number.
 	 */
 	router.get('/listening-lab/practice', async (req: any, res: any) => {
 		try {
@@ -1052,6 +1054,7 @@ export function registerRunRoutes(router: any, context: any) {
 			const rule = String(req.query.rule || '');
 			const level = Math.floor(Number(req.query.level)) || 0;
 			const show = String(req.query.show || '');
+			const source = String(req.query.source || '');
 			const cards = all.map((it) => bankCardOf(it, ctx));
 			const rules = new Map<string, { slug: string; name: string; n: number }>();
 			for (const it of all) {
@@ -1059,7 +1062,7 @@ export function registerRunRoutes(router: any, context: any) {
 				e.n++;
 				rules.set(it.skill_slug, e);
 			}
-			const shown = cards.filter((c) => (!rule || c.rule.slug === rule) && (!level || c.difficulty === level) && (show !== 'free' || !c.locked) && (show !== 'todo' || !c.done));
+			const shown = cards.filter((c) => (!rule || c.rule.slug === rule) && (!level || c.difficulty === level) && (show !== 'free' || !c.locked) && (show !== 'todo' || !c.done) && (!source || (source === 'bank') === c.own));
 			const thumbs = [...new Map(all.map((it) => [it.practice_id, it.thumbnail_url || `https://i.ytimg.com/vi/${it.youtube_video_id}/hqdefault.jpg`])).values()];
 			return res.json({
 				success: true,
@@ -1076,11 +1079,19 @@ export function registerRunRoutes(router: any, context: any) {
 		}
 	});
 
-	/** The sentence after this one that the learner can open (the card's "next") */
+	/** The sentence after this one that the learner can open; with the list's filters (rule, level, show) it stays inside them */
 	async function bankNext(req: any, it: BankItem) {
 		const all = await loadBankItems(database);
 		const ctx = await bankCtx(req, all.map((x) => x.id));
-		const next = all.find((x) => x.n > it.n && !bankCardOf(x, ctx).locked) || all.find((x) => x.n !== it.n && !bankCardOf(x, ctx).locked) || null;
+		const rule = String(req.query?.rule || '');
+		const level = Math.floor(Number(req.query?.level)) || 0;
+		const show = String(req.query?.show || '');
+		const source = String(req.query?.source || '');
+		const ok = (x: BankItem) => {
+			const c = bankCardOf(x, ctx);
+			return !c.locked && (!rule || c.rule.slug === rule) && (!level || c.difficulty === level) && (show !== 'todo' || !c.done) && (!source || (source === 'bank') === c.own);
+		};
+		const next = all.find((x) => x.n > it.n && ok(x)) || all.find((x) => x.n !== it.n && ok(x)) || null;
 		return { card: bankCardOf(it, ctx), next: next ? next.id : null };
 	}
 

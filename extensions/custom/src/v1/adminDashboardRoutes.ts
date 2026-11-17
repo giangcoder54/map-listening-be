@@ -91,7 +91,7 @@ export function registerAdminDashboardRoutes(router: any, context: any) {
 			(SELECT count(*) FROM listening_attempts WHERE date_created >= t0 AND date_created < t1 AND ${real('user_id')})::int AS attempts,
 			(SELECT count(*) FROM listening_lesson_learners WHERE date_created >= t0 AND date_created < t1 AND ${real('user_id')})::int AS lesson_starts,
 			(SELECT count(*) FROM listening_progress WHERE status = 'completed' AND completed_at >= t0 AND completed_at < t1 AND ${real('user_id')})::int AS completions,
-			(SELECT count(*) FROM listening_lessons WHERE status = 'published' AND published_at >= t0 AND published_at < t1)::int AS lessons_published
+			(SELECT count(*) FROM listening_lessons WHERE status = 'published' AND coalesce(kind, 'pattern') <> 'bank' AND published_at >= t0 AND published_at < t1)::int AS lessons_published
 		FROM days ORDER BY day
 	`, [from, to])).rows;
 
@@ -562,6 +562,7 @@ export function registerAdminDashboardRoutes(router: any, context: any) {
 					count(*) FILTER (WHERE l.status <> 'published')::int AS drafts
 				FROM listening_lessons l
 				LEFT JOIN directus_users u ON u.id = l.user_created
+				WHERE coalesce(l.kind, 'pattern') <> 'bank'
 				GROUP BY 1, 2, 3
 				ORDER BY published_month DESC, published_total DESC
 			`, [monthFrom, monthTo])).rows;

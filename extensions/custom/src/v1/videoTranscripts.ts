@@ -18,6 +18,7 @@
 import type { Router } from 'express';
 import { extractVideoId, fetchCaptions, fetchPlayer, getVideoMeta, pickCaptionTrack } from './youtube';
 import { isStaff } from '../lib/staff';
+import { tagNewVideos } from '../lib/videoTags';
 
 type Line = { text: string; start: number; end: number };
 
@@ -145,6 +146,9 @@ export function handleVideoTranscripts(router: Router, context: any) {
 				results.push({ input, status: 'error', youtube_video_id: videoId, message: e?.message });
 			}
 		}
+		// Measured and tagged by the AI in the background (lib/videoTags.ts); the page does not wait
+		const fresh = results.filter((r) => r.status === 'added' || r.status === 'transcript_added').map((r) => r.video?.id).filter(Boolean);
+		if (fresh.length) void tagNewVideos(database, fresh, logger);
 		return res.json({ success: true, data: results });
 	});
 

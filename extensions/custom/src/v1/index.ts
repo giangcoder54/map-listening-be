@@ -20,9 +20,14 @@ import { registerFeedbackRoutes } from './feedbackRoutes';
 import { registerAdminLessonRoutes } from './adminLessonRoutes';
 import { registerAdminVietsubRoutes } from './adminVietsubRoutes';
 import { registerAdminRuleRoutes } from './adminRuleRoutes';
+import { registerAdminPracticeRoutes } from './adminPracticeRoutes';
 import { registerEventRoutes } from './eventRoutes';
 import { registerPhraseRoutes } from './phraseRoutes';
 import { registerAdminPhraseRoutes } from './adminPhraseRoutes';
+import { registerAdminLibraryRoutes } from './adminLibraryRoutes';
+import { registerExtensiveRoutes } from './extensiveRoutes';
+import { registerDictRoutes } from './dictRoutes';
+import { registerAdminExtensiveRoutes } from './adminExtensiveRoutes';
 import { staffRole } from '../lib/staff';
 
 
@@ -292,9 +297,14 @@ export default defineEndpoint((router, context) => {
 	registerAdminLessonRoutes(router, context);
 	registerAdminVietsubRoutes(router, context);
 	registerAdminRuleRoutes(router, context);
+	registerAdminPracticeRoutes(router, context);
 	registerEventRoutes(router, context);
 	registerPhraseRoutes(router, context);
 	registerAdminPhraseRoutes(router, context);
+	registerAdminLibraryRoutes(router, context);
+	registerExtensiveRoutes(router, context);
+	registerDictRoutes(router, context);
+	registerAdminExtensiveRoutes(router, context);
 
 	// =====================================================================
 	// POST /phrase-requests -> gợi ý cụm từ muốn có bài luyện (phải đăng nhập, không lưu ai gửi)

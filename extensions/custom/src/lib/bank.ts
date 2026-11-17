@@ -29,14 +29,14 @@ export const CLIP_FILTER = `
 	c.status = 'published' AND c.role IS NOT NULL AND c.role <> 'trap'
 	AND c.start_time IS NOT NULL AND c.end_time IS NOT NULL AND sv.youtube_video_id IS NOT NULL
 	AND (nullif(trim(c.answer), '') IS NOT NULL OR c.transcript ~ '\\[[^\\]]+\\]')
-	AND l.status = 'published' AND (l.kind = 'challenge' OR s.status = 'published')
+	AND l.status = 'published' AND (l.kind IN ('challenge', 'bank') OR s.status = 'published')
 	AND NOT EXISTS (SELECT 1 FROM listening_challenges ch WHERE ch.lesson_id = l.id AND (ch.status <> 'published' OR ch.ends_at > now()))
 	AND NOT EXISTS (SELECT 1 FROM listening_challenges ch JOIN listening_lessons cl ON cl.id = ch.lesson_id,
 		jsonb_array_elements(CASE WHEN jsonb_typeof(cl.practice) = 'array' THEN cl.practice ELSE '[]'::jsonb END) st
 		WHERE (ch.status <> 'published' OR ch.ends_at > now()) AND st->>'clip_id' = c.id::text)`;
 
 export type BankItem = {
-	id: string; n: number; lesson_id: string; difficulty: 1 | 2 | 3; skill_slug: string; skill_name: string;
+	id: string; n: number; lesson_id: string; lesson_kind: string; difficulty: 1 | 2 | 3; skill_slug: string; skill_name: string;
 	practice_id: string; video_short_id: string; video_title: string; youtube_video_id: string; thumbnail_url: string | null;
 	is_premium: boolean; price_xu: number | null;
 };
@@ -47,7 +47,7 @@ export type BankItem = {
  */
 export async function loadBankItems(db: any, where: { clipId?: string } = {}): Promise<BankItem[]> {
 	const { rows } = await db.raw(`
-		SELECT c.id, c.lesson_id, c.difficulty, s.slug AS skill_slug, s.name AS skill_name,
+		SELECT c.id, c.lesson_id, l.kind AS lesson_kind, c.difficulty, s.slug AS skill_slug, s.name AS skill_name,
 			p.id AS practice_id, p.short_id AS video_short_id, p.title AS video_title, p.is_premium, p.price_xu,
 			sv.youtube_video_id, sv.thumbnail_url
 		FROM practice_videos p
@@ -56,6 +56,7 @@ export async function loadBankItems(db: any, where: { clipId?: string } = {}): P
 		JOIN listening_lessons l ON l.id = c.lesson_id
 		JOIN listening_skills s ON s.id = l.skill_id
 		WHERE p.status = 'published' AND ${CLIP_FILTER}
+			AND NOT EXISTS (SELECT 1 FROM practice_hidden_clips h WHERE h.clip_id = c.id)
 		ORDER BY p.sort, p.id, c.start_time, c.id`);
 	const all: BankItem[] = rows.map((r: any, i: number) => ({ ...r, n: i + 1, difficulty: Math.min(3, Math.max(1, Number(r.difficulty) || 2)) as 1 | 2 | 3 }));
 	return where.clipId ? all.filter((it) => it.id === where.clipId) : all;
@@ -94,12 +95,18 @@ export function bankWrong(target: string): string[] {
 	return out.slice(0, 3);
 }
 
-/** The format the n-th item of a go is asked in: a choice, a word bank, a gap in turn (when the clip allows it), else typed */
+/**
+ * The format the n-th item of a go is asked in. The team's own choice (answer_format) first; then by
+ * level: easy ones take turns between a choice, a word bank and a gap, medium ones lean on the word
+ * bank and the gap, hard ones are asked as a gap (or the word bank) and are never a plain choice
+ * unless nothing else fits. Typed when the clip allows none.
+ */
 export function bankFormat(c: PoolClip, n: number): Format {
-	const order: Format[] = ['choice', 'bank', 'gap'];
-	for (let k = 0; k < order.length; k++) {
-		const f = order[(n + k) % order.length]!;
-		if (supports(c, f)) return f;
-	}
+	if (c.forced && (['choice', 'bank', 'gap', 'type'] as string[]).includes(c.forced) && supports(c, c.forced as Format)) return c.forced as Format;
+	const turns: Format[] = ['choice', 'bank', 'gap'];
+	const order: Format[] = c.difficulty === 3 ? ['gap', 'bank', 'choice']
+		: c.difficulty === 2 ? (['bank', 'gap', 'choice'] as Format[]).slice(n % 2).concat((['bank', 'gap', 'choice'] as Format[]).slice(0, n % 2))
+		: turns.slice(n % turns.length).concat(turns.slice(0, n % turns.length));
+	for (const f of order) if (supports(c, f)) return f;
 	return 'type';
 }

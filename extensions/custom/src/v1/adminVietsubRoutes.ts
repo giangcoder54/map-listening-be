@@ -6,7 +6,8 @@
  *
  *   GET  /admin/clips/:id/subs?lang=vi-VN   the clip's lines with their translation in `lang`,
  *                                            and the languages that can be translated to
- *   POST /admin/subs/translate              { lang, lines: [english] } -> { tr: [translation] }
+ *   POST /admin/subs/translate              { lang, lines: [english], focus? } -> { tr: [translation] }
+ *                                            with `focus` (the clip's answer) the AI bolds its meaning as **…**
  *                                            by the AI (lib/ai.ts), nothing saved
  *   PUT  /admin/clips/:id/subs              { lang, lines: [{ start, end, text, tr, origin }] }
  *                                            the clip's lines become these (a line of the same
@@ -63,6 +64,7 @@ export function registerAdminVietsubRoutes(router: any, context: any) {
 		const lang = await langOf(req.body?.lang);
 		const lines: string[] = Array.isArray(req.body?.lines) ? req.body.lines.map(clean).slice(0, 40) : [];
 		if (!lang || !lines.length || lines.some((l) => !l)) return res.status(400).json({ success: false, message: 'Nothing to translate' });
+		const focus = clean(req.body?.focus).slice(0, 120);
 		if (!aiConfigured()) return res.status(503).json({ success: false, code: 'AI_OFF', message: 'AI is not configured' });
 		const name = LANG_NAME[lang.split('-')[0]!.toLowerCase()] || lang;
 		const out = await aiJson<{ tr?: unknown }>([
@@ -71,13 +73,36 @@ export function registerAdminVietsubRoutes(router: any, context: any) {
 				content: `You translate English video subtitles into ${name} subtitles for language learners. `
 					+ 'Translate each line on its own, in order, into natural spoken language a native speaker would say in that situation (not word for word), '
 					+ 'keeping names, numbers and the tone (casual, joking, angry). Use the other lines only as context. '
+					+ (focus ? `The learner is practising the English words "${focus}". In the line that contains them, wrap the words of the translation that mean exactly that in **double asterisks** (e.g. "nó rất **tuyệt**"); use ** nowhere else and only once. If no line contains them, use no **. ` : 'Never use ** in the translation. ')
 					+ 'Answer JSON only: {"tr": ["line 1", "line 2", ...]} with exactly as many lines as given.',
 			},
 			{ role: 'user', content: JSON.stringify({ lines }) },
 		], { maxTokens: 300 + lines.join(' ').length * 3, timeoutMs: 40000, temperature: 0.3, logger });
-		const tr = Array.isArray(out?.tr) ? out!.tr.map((t) => String(t ?? '').replace(/\s+/g, ' ').trim()) : null;
+		const tr = Array.isArray(out?.tr) ? out!.tr.map((t) => String(t ?? '').replace(/\s+/g, ' ').trim()).map((t) => (focus ? t : t.replace(/\*\*/g, ''))) : null;
 		if (!tr || tr.length !== lines.length || tr.some((t) => !t)) return res.status(502).json({ success: false, code: 'AI_FAILED', message: 'The AI did not answer one line per line' });
 		return res.json({ success: true, data: { tr } });
+	}));
+
+	/** Only the translations of the lines the clip already has (the bank's "Sửa nghĩa"): { lang, tr: [one per line, in order] } */
+	router.put('/admin/clips/:id/subs/tr', staff(async (req, res) => {
+		if (!UUID_RE.test(req.params.id)) return res.status(400).json({ success: false, message: 'Bad clip id' });
+		const lang = await langOf(req.body?.lang);
+		if (!lang) return res.status(400).json({ success: false, message: 'Unknown language' });
+		const tr: string[] = Array.isArray(req.body?.tr) ? req.body.tr.map((t: unknown) => String(t ?? '').replace(/\s+/g, ' ').trim().slice(0, 500)) : [];
+		const origin = req.body?.origin === 'ai' ? 'ai' : 'human';
+		const rows = await database('listening_clip_lines').select('line_id').where('clip_id', req.params.id).orderBy('sort');
+		if (rows.length !== tr.length) return res.status(409).json({ success: false, message: 'The clip has changed, reload it' });
+		for (const [i, r] of rows.entries()) {
+			if (!tr[i]) continue;
+			await database.raw(
+				`INSERT INTO video_line_translations (line_id, languages_code, text, source_hash, origin)
+				 SELECT ?::uuid, ?::varchar, ?::text, md5(text), ?::varchar FROM video_lines WHERE id = ?::uuid
+				 ON CONFLICT (line_id, languages_code) DO UPDATE SET text = EXCLUDED.text, source_hash = EXCLUDED.source_hash,
+				 	origin = EXCLUDED.origin, date_updated = now()`,
+				[r.line_id, lang, tr[i], origin, r.line_id],
+			);
+		}
+		return res.json({ success: true });
 	}));
 
 	router.put('/admin/clips/:id/subs', staff(async (req, res) => {

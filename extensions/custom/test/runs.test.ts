@@ -12,15 +12,16 @@ import { createRequire } from 'node:module';
 import { readdirSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import {
-	MIXED, RUN, choicesFor, drawLesson, drawMixed, drawReview, drawTest, fitsLesson, fitsMixed, formatFor, isRight, passed, practiceOf, reviewOfValue,
+	MIXED, RUN, acceptOf, choicesFor, drawLesson, drawMixed, drawReview, drawTest, fitsLesson, fitsMixed, formatFor, isRight, passed, practiceOf, reviewOfValue,
 	summaryOf, tilesFor, weakestForms, withRetry,
 	type PoolClip, type PracticeStep, type RunItem,
 } from '../src/lib/runs';
 import { gradeOf, masteryOf, schedule } from '../src/lib/review';
-import { mixUps } from '../src/lib/mixups';
+import { contractionMixUps, mixUps } from '../src/lib/mixups';
+import { mistakeOf } from '../src/lib/mistakes';
 import { Rating } from 'ts-fsrs';
-import { COIN, CoinError, buyFreeze, earnCoins, unlockLesson, walletOf } from '../src/lib/coins';
-import { loadLessonGraph } from '../src/lib/lessons';
+import { COIN, CoinError, buyFreeze, earnCoins, payAiCheck, refundAiCheck, streakDayXu, unlockLesson } from '../src/lib/coins';
+import { answerOf, loadLessonGraph } from '../src/lib/lessons';
 
 const PNPM = '/directus/node_modules/.pnpm';
 const knexDir = readdirSync(PNPM).find((d) => d.startsWith('knex@'));
@@ -230,6 +231,16 @@ describe('checking an answer', () => {
 		assert.ok(isRight(c, 'bank', 'tell him'));
 		assert.ok(!isRight(c, 'bank', 'him tell'), 'the words in order');
 		assert.ok(!isRight(c, 'gap', 'tell them'));
+	});
+	test('other spellings: right when typed, not in a choice or word bank', () => {
+		const n = clip('core', { answer: 'need to', accept: acceptOf('needa |  neeta\nneedta') });
+		assert.deepEqual(n.accept, ['needa', 'neeta', 'needta']);
+		assert.ok(isRight(n, 'type', 'Need to'), 'the answer still right');
+		assert.ok(isRight(n, 'type', 'NEEDA!'));
+		assert.ok(isRight(n, 'gap', 'neeta'));
+		assert.ok(!isRight(n, 'choice', 'needa'), 'a choice is picked, not typed');
+		assert.ok(!isRight(n, 'type', 'need'));
+		assert.ok(!isRight(clip('core', { answer: 'need to', accept: acceptOf('') }), 'type', ''), 'empty never right');
 	});
 	test('a short phrase is the whole answer in every format', () => {
 		const short = clip('pool', { answer: 'Tell him', focus: 'tell him' });
@@ -515,15 +526,15 @@ describe('Xu', () => {
 		assert.equal((await purse()).coins, 10);
 	});
 
-	test(`the purse stops at ${COIN.cap}: the rest is written as missed`, async () => {
-		await give(COIN.cap - 4);
-		const r = await earnCoins(trx, user, { reason: 'lesson', amount: 10, dedupe: 'lesson:y' }, D);
-		assert.deepEqual({ added: r.added, wanted: r.wanted }, { added: 4, wanted: 10 });
-		const full = await earnCoins(trx, user, { reason: 'lesson', amount: 10, dedupe: 'lesson:z' }, D);
-		assert.equal(full.added, 0);
-		assert.equal((await purse()).coins, COIN.cap);
-		const row = await trx('coin_events').where({ user_id: user, dedupe_key: 'lesson:z' }).first();
-		assert.deepEqual({ amount: row.amount, wanted: row.wanted }, { amount: 0, wanted: 10 }, 'the full purse still uses the key');
+	test('no cap: the purse keeps growing', async () => {
+		await give(5000);
+		const r = await earnCoins(trx, user, { reason: 'lesson', amount: 70, dedupe: 'lesson:y' }, D);
+		assert.deepEqual({ added: r.added, wanted: r.wanted }, { added: 70, wanted: 70 });
+		assert.equal((await purse()).coins, 5070);
+	});
+
+	test('streak days pay more the longer the run', () => {
+		assert.deepEqual([1, 6, 7, 29, 30, 100].map(streakDayXu), [10, 10, 15, 15, 20, 20]);
 	});
 
 	test('unlocking takes the price and keeps the lesson', async () => {
@@ -544,11 +555,24 @@ describe('Xu', () => {
 		assert.equal((await trx('listening_unlocks').where('user_id', user)).length, 0);
 	});
 
-	test(`${COIN.weeklyUnlocks} lessons a week at most`, async () => {
-		await give(COIN.cap);
-		for (let i = 0; i < COIN.weeklyUnlocks; i++) await unlockLesson(trx, user, await makeLesson(), D);
-		await assert.rejects(unlockLesson(trx, user, await makeLesson(), D), (e: any) => e.code === 'WEEKLY_LIMIT');
-		assert.equal((await walletOf(trx, user, 2, D)).unlocks_left, 0);
+	test('many lessons in a day: no weekly limit', async () => {
+		await give(5 * COIN.unlock.pattern!);
+		for (let i = 0; i < 5; i++) await unlockLesson(trx, user, await makeLesson(), D);
+		assert.equal((await purse()).coins, 0);
+	});
+
+	test('an AI check costs Xu, and is given back once', async () => {
+		await give(20);
+		assert.equal((await payAiCheck(trx, user, 'k1', D)).coins, 20 - COIN.aiCheck);
+		await refundAiCheck(trx, user, 'k1', D);
+		await refundAiCheck(trx, user, 'k1', D);
+		assert.equal((await purse()).coins, 20);
+	});
+
+	test('an AI check with too few Xu changes nothing', async () => {
+		await give(COIN.aiCheck - 1);
+		await assert.rejects(payAiCheck(trx, user, 'k2', D), (e: any) => e.code === 'NOT_ENOUGH');
+		assert.equal((await purse()).coins, COIN.aiCheck - 1);
 	});
 
 	test('a freeze costs Xu, 2 held at most', async () => {
@@ -586,7 +610,7 @@ describe('Xu under concurrent clicks', () => {
 	test('two unlock clicks at once pay once', async () => {
 		user2 = randomUUID();
 		await live('directus_users').insert({ id: user2, email: `xu2-${user2}@example.com`, status: 'active', is_internal: true });
-		await earnCoins(live, user2, { reason: 'admin', amount: COIN.cap, dedupe: 'give' }, D);
+		await earnCoins(live, user2, { reason: 'admin', amount: 1000, dedupe: 'give' }, D);
 		const k = randomUUID().slice(0, 8);
 		const [g] = await live('listening_groups').insert({ name: `T ${k}`, slug: `t-${k}` }).returning('id');
 		const [sk] = await live('listening_skills').insert({ group_id: g.id, name: `T ${k}`, slug: `t-${k}` }).returning('id');
@@ -594,7 +618,7 @@ describe('Xu under concurrent clicks', () => {
 		lessons.push(l.id);
 		const results = await Promise.allSettled([1, 2, 3].map(() => unlockLesson(live, user2, { id: l.id, kind: 'pattern' }, D)));
 		assert.equal(results.filter((r) => r.status === 'fulfilled').length, 1);
-		assert.equal((await live('user_xp').where('user_id', user2).first()).coins, COIN.cap - COIN.unlock.pattern!);
+		assert.equal((await live('user_xp').where('user_id', user2).first()).coins, 1000 - COIN.unlock.pattern!);
 	});
 });
 
@@ -675,5 +699,104 @@ describe('rules of a group open in order', () => {
 
 	test('guests keep no progress: nothing waits', async () => {
 		assert.deepEqual((await lockOf(null)).out, { A: null, B: null, C: null, D: null });
+	});
+});
+
+describe('practice set up by the team, traps that teach', () => {
+	const steps = (pool: PoolClip[]): PracticeStep[] => pool.filter((c) => c.role === 'pool' || c.role === 'trap').slice(0, 6).map((c) => ({ clip_id: c.id, format: 'gap', wrong: [] }));
+
+	test('any number of steps from 2 to 8, more are cut', () => {
+		const pool = fullPool();
+		const six = steps(pool);
+		assert.equal(drawLesson(pool, new Set(), Math.random, six).filter((it) => it.phase === 'practice').length, 6);
+		const ten = Array.from({ length: 10 }, (_, i) => ({ clip_id: `x${i}`, format: 'gap', wrong: [] }));
+		assert.equal(practiceOf(ten).length, 8);
+	});
+
+	test('shuffled steps: the same steps in a new order, and a run left halfway still fits', () => {
+		const pool = fullPool();
+		const script = steps(pool);
+		const has = (id: string) => pool.some((c) => c.id === id);
+		const orders = new Set<string>();
+		for (let k = 0; k < 20; k++) {
+			const items = drawLesson(pool, new Set(), Math.random, script, { shuffle: true });
+			const practice = items.filter((it) => it.phase === 'practice').map((it) => it.clip_id);
+			assert.deepEqual([...practice].sort(), script.map((s) => s.clip_id).sort());
+			assert.ok(fitsLesson(items, script, has, true));
+			orders.add(practice.join(','));
+		}
+		assert.ok(orders.size > 1, 'the order changes');
+	});
+
+	test('why lines are kept per wrong answer, empty ones dropped', () => {
+		const [s] = practiceOf([{ clip_id: 'a', format: 'choice', wrong: ['he', "he'd"], why: { he: '  bỏ sót  đuôi ', "he'd": '' } }]);
+		assert.deepEqual(s!.why, { he: 'bỏ sót đuôi' });
+	});
+
+	test('the traps asked for in a test: 0, 1 or 2', () => {
+		const f = { lessonId: 'a', clips: [...Array.from({ length: 8 }, () => clip('pool')), clip('trap'), clip('trap'), clip('trap')] };
+		const trapsIn = (items: RunItem[]) => items.filter((it) => f.clips.find((c) => c.id === it.clip_id)!.role === 'trap').length;
+		for (let k = 0; k < 20; k++) {
+			assert.equal(trapsIn(drawTest([f], 4, new Set(), Math.random, 0)), 0);
+			assert.ok(trapsIn(drawTest([f], 4, new Set(), Math.random, 2)) >= 2);
+		}
+	});
+
+	test('the summary counts traps and mistakes by kind', () => {
+		const list: RunItem[] = [
+			{ clip_id: 'a', phase: 'practice', format: 'choice', result: { correct: true, answer: 'x', listens: 1, slow: false, hint: false, trap: true } },
+			{ clip_id: 'b', phase: 'practice', format: 'choice', result: { correct: false, answer: 'he', listens: 1, slow: false, hint: false, mistake: mistakeOf("he'll", 'he') } },
+			{ clip_id: 'c', phase: 'practice', format: 'choice', result: { correct: false, answer: 'I', listens: 1, slow: false, hint: false, mistake: mistakeOf("I'll", 'I') } },
+		];
+		const s = summaryOf(list);
+		assert.deepEqual(s.traps, { total: 1, right: 1 });
+		assert.deepEqual(s.mistakes, [{ kind: 'missing', n: 2 }]);
+	});
+});
+
+describe('what a wrong answer says (lib/mistakes.ts)', () => {
+	test('the ending swallowed, added, or another one', () => {
+		assert.deepEqual(mistakeOf("he'll", 'he'), { kind: 'missing', heard: 'he', said: "he'll", ending: "'ll", note: null });
+		assert.equal(mistakeOf('they', "they'll")!.kind, 'extra');
+		assert.equal(mistakeOf("he'll", "he'd")!.kind, 'ending');
+		assert.equal(mistakeOf("You'll never", 'You never')!.kind, 'missing');
+	});
+	test('full and short forms', () => {
+		assert.equal(mistakeOf("he'll go", 'he will go')!.kind, 'full');
+		assert.equal(mistakeOf('they will', "they'll")!.kind, 'short');
+		assert.equal(mistakeOf("won't", 'will not')!.kind, 'full');
+	});
+	test('another word, a typo, nothing to say', () => {
+		assert.equal(mistakeOf("he'll", "she'll")!.kind, 'word');
+		assert.equal(mistakeOf('publishing', 'publising')!.kind, 'typo');
+		assert.equal(mistakeOf("he'll", ''), null);
+	});
+	test('a whole word missed or added names that word', () => {
+		assert.deepEqual(mistakeOf('need to', 'need'), { kind: 'dropped', heard: '', said: 'to', ending: null, note: null });
+		assert.deepEqual(mistakeOf('need', 'need to'), { kind: 'added', heard: 'to', said: '', ending: null, note: null });
+		assert.equal(mistakeOf('I need to go', 'I need go')!.said, 'to');
+	});
+	test('digits, hyphens and curly quotes are the same answer', () => {
+		const c = { id: 'n', role: 'pool', answer: 'two of them', focus: null, difficulty: null, forced: null, hasChoices: false } as PoolClip;
+		assert.ok(isRight(c, 'type', '2 of them'));
+		assert.ok(isRight({ ...c, answer: 'twenty-one' }, 'type', '21'));
+		assert.ok(isRight({ ...c, answer: "I'm" }, 'type', 'I’m'));
+		assert.ok(!isRight(c, 'type', '3 of them'));
+	});
+	test('a challenge is checked against its [bracket], not the lesson text', () => {
+		assert.equal(answerOf({ role: 'challenge', step: 'challenge', challenge_mode: 'speed', transcript: 'I need [me to] go' }, 'Need', 'one_answer'), 'me to');
+		assert.equal(answerOf({ role: 'core', step: 'type', transcript: 'I [need] it' }, 'Need', 'one_answer'), 'Need');
+	});
+	test('the line the team wrote wins', () => {
+		assert.equal(mistakeOf("he'll", 'He', { he: 'Bạn bỏ sót âm L.' })!.note, 'Bạn bỏ sót âm L.');
+	});
+});
+
+describe('wrong answers for a pronoun with an ending', () => {
+	test("the same pronoun bare and with its other endings", () => {
+		assert.deepEqual(contractionMixUps("he'll"), ['he', "he's", "he'd"]);
+		assert.deepEqual(contractionMixUps("You'll"), ['You', "You're", "You'd"]);
+		assert.deepEqual(mixUps("and he'll go"), ['and he go', "and he's go", "and he'd go"]);
+		assert.equal(contractionMixUps('will'), null);
 	});
 });

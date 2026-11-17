@@ -89,7 +89,8 @@ export function registerAdminLessonRoutes(router: any, context: any) {
 		const page = Math.max(1, Math.floor(Number(query.page)) || 1);
 
 		// Every filter but the state tab: the tabs show their count for the rest
-		const where: string[] = [];
+		// The bank's hidden lessons (kind 'bank') are managed in /admin/practice
+		const where: string[] = [`coalesce(l.kind, 'pattern') <> 'bank'`];
 		const bindings: unknown[] = [];
 		const skill = String(query.skill || '');
 		if (skill) {
