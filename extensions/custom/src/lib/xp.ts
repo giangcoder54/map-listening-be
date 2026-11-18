@@ -17,6 +17,7 @@
  *   +20 a lesson finished the first time (step 1 all right), +10 if an answer was looked at,
  *   +5 a lesson already finished, done again (once a day per lesson), +5 a review right.
  *   Extensive Listening: +20 a lesson heard to the end the first time, +5 again (once a day).
+ *   Intensive Listening: +20 a passage finished the first time, +5 again (once a day); +5 a Review card right (once a day per sentence).
  *   Phrase Lab: +20 a phrase learned the first time, +5 a phrase review right (once a day per phrase).
  *   Days are Vietnam days.
  */
@@ -27,7 +28,7 @@ import { TZ, vnDay } from './days';
 
 export { TZ, vnDay };
 /** lesson_test: a lesson skipped by its test; skill_test: a rule skipped, or its final test passed */
-export const XP = { lesson: 20, lessonRevealed: 10, replay: 5, review: 5, lessonTest: 10, skillTest: 30, phrase: 20, phraseReview: 5, extensive: 20 };
+export const XP = { lesson: 20, lessonRevealed: 10, replay: 5, review: 5, lessonTest: 10, skillTest: 30, phrase: 20, phraseReview: 5, extensive: 20, intensive: 20, intensiveReview: 5, wordReview: 5 };
 /** Streak freezes held at most; they are bought with Xu (lib/coins.ts) */
 export const MAX_FREEZES = 2;
 /** Daily goal reached this many days in a row: REWARD_PREMIUM_DAYS of Premium */
@@ -39,11 +40,11 @@ export const LEVELS = [0, 60, 200, 400, 700, 1100, 1600, 2400];
 export const DEFAULT_GOAL = 40;
 
 /** amount: when the rule's XP depends on how it was won (a lesson with an answer looked at) */
-export type XpRule = { reason: 'lesson' | 'replay' | 'review' | 'lesson_test' | 'skill_test' | 'phrase' | 'phrase_review' | 'extensive'; dedupe: string; lessonId?: string | null; amount?: number };
+export type XpRule = { reason: 'lesson' | 'replay' | 'review' | 'lesson_test' | 'skill_test' | 'phrase' | 'phrase_review' | 'extensive' | 'intensive' | 'intensive_review' | 'word_review'; dedupe: string; lessonId?: string | null; amount?: number };
 /** key: the user_rewards dedupe key (premium:<day> | freeze:<n>) */
 export type NewReward = { kind: 'premium_day' | 'freeze'; days: number; key: string };
 
-const AMOUNT: Record<XpRule['reason'], number> = { lesson: XP.lesson, replay: XP.replay, review: XP.review, lesson_test: XP.lessonTest, skill_test: XP.skillTest, phrase: XP.phrase, phrase_review: XP.phraseReview, extensive: XP.extensive };
+const AMOUNT: Record<XpRule['reason'], number> = { lesson: XP.lesson, replay: XP.replay, review: XP.review, lesson_test: XP.lessonTest, skill_test: XP.skillTest, phrase: XP.phrase, phrase_review: XP.phraseReview, extensive: XP.extensive, intensive: XP.intensive, intensive_review: XP.intensiveReview, word_review: XP.wordReview };
 
 const addDays = (day: string, n: number) => {
 	const d = new Date(`${day}T00:00:00Z`);

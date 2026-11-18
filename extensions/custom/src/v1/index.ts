@@ -28,6 +28,9 @@ import { registerAdminLibraryRoutes } from './adminLibraryRoutes';
 import { registerExtensiveRoutes } from './extensiveRoutes';
 import { registerDictRoutes } from './dictRoutes';
 import { registerAdminExtensiveRoutes } from './adminExtensiveRoutes';
+import { registerIntensiveRoutes } from './intensiveRoutes';
+import { registerWordsRoutes } from './wordsRoutes';
+import { registerAdminIntensiveRoutes } from './adminIntensiveRoutes';
 import { staffRole } from '../lib/staff';
 
 
@@ -305,6 +308,9 @@ export default defineEndpoint((router, context) => {
 	registerExtensiveRoutes(router, context);
 	registerDictRoutes(router, context);
 	registerAdminExtensiveRoutes(router, context);
+	registerIntensiveRoutes(router, context);
+	registerWordsRoutes(router, context);
+	registerAdminIntensiveRoutes(router, context);
 
 	// =====================================================================
 	// POST /phrase-requests -> gợi ý cụm từ muốn có bài luyện (phải đăng nhập, không lưu ai gửi)
