@@ -29,11 +29,11 @@ const adminOnly = (req: any, res: any) => {
 };
 
 /** Video details and transcript from YouTube; null when the video cannot be read */
-async function fromYouTube(videoId: string, logger: any) {
+async function fromYouTube(videoId: string, logger: any, plain = false) {
 	const { data } = await fetchPlayer(videoId, logger);
 	const meta = data ? getVideoMeta(data, videoId) : null;
 	if (!meta) return null;
-	const captions = await fetchCaptions(data, logger, 'en');
+	const captions = await fetchCaptions(data, logger, 'en', plain);
 	const transcript = (captions.items || []) as Line[];
 	// The track could not be downloaded: which subtitles it has is still known, but nothing is kept
 	const kind = captions.items ? captions.kind : null;
@@ -119,7 +119,7 @@ export function handleVideoTranscripts(router: Router, context: any) {
 					results.push({ input, status: 'exists', video });
 					continue;
 				}
-				const yt = await fromYouTube(videoId, logger);
+				const yt = await fromYouTube(videoId, logger, !!body.plain);
 				if (!yt) {
 					results.push({ input, status: 'unavailable', youtube_video_id: videoId });
 					continue;

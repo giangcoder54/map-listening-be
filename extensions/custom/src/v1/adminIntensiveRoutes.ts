@@ -4,8 +4,14 @@
  *   GET    /admin/intensive              passages (status, level, q, page) with how learners did
  *   GET    /admin/intensive/:id          one passage with its sentences, traps, and which labels learners got per sentence
  *   PUT    /admin/intensive/:id/status   { status } publish / hide / back to draft (publishing is checked)
- *   PUT    /admin/intensive/:id/sentences/:sid   { text?, start_ms?, end_ms? } fix one sentence
+ *   GET    /admin/intensive/:id/stats        finishing, where learners stop, the ladder, practice, feedback, thumbs on diagnoses, key words missed again
+ *   PUT    /admin/intensive/:id/gist         { prompt, options[3], answer, explain?, sentences[] } the gist question and the sentences (n) that hold its answer
+ *   PUT    /admin/intensive/:id/sentences/:sid   { text?, start_ms?, end_ms?, traps?, key_words? } fix one sentence (traps = the words to watch: [{ text, kind, real?, note?, skill? }])
  *   DELETE /admin/intensive/:id          admins only
+ *   GET    /admin/intensive/chunks       the shared chunks (il_chunks: "sort of" → "sorta"), traps in every passage
+ *   POST   /admin/intensive/chunks       { text, kind?, real?, note?, skill?, active? } add one
+ *   PUT    /admin/intensive/chunks/:id   same fields, any of them
+ *   DELETE /admin/intensive/chunks/:id   remove one
  *
  * Passages are written by Claude (docs/giao-trinh/tools/il_write.py) as drafts and reviewed here.
  */
@@ -39,6 +45,7 @@ export function registerAdminIntensiveRoutes(router: any, context: any) {
 		sentences.forEach((s, i) => {
 			if (!tokens(s.text).length) out.push(`Câu ${s.n} chưa có chữ`);
 			if (s.end_ms - s.start_ms < 600) out.push(`Câu ${s.n} quá ngắn`);
+			if (tokens(s.text).length > 18) out.push(`Câu ${s.n} dài ${tokens(s.text).length} từ (tối đa 18): tách thành hai câu`);
 				if (i && s.start_ms < sentences[i - 1].end_ms) out.push(`Câu ${s.n} chồng lên câu ${sentences[i - 1].n}`);
 			(s.traps || []).forEach((t: any) => {
 				if (!KINDS.includes(t.kind)) out.push(`Câu ${s.n}: loại bẫy "${t.kind}" không hợp lệ`);
@@ -77,6 +84,70 @@ export function registerAdminIntensiveRoutes(router: any, context: any) {
 		return res.json({ success: true, data: { items: rows.map((r: any) => ({ ...r, thumbnail: thumbOf(r), full_count: undefined })), total: rows[0]?.full_count || 0, page, limit } });
 	}));
 
+	// ── Shared chunks. Registered before /:id so "chunks" is not read as a passage id ──
+	const chunkFields = (body: any, partial: boolean) => {
+		const out: Record<string, any> = {};
+		if (!partial || body.text !== undefined) {
+			const text = tokens(String(body.text || '')).join(' ');
+			if (!text) return { error: 'Cụm từ cần có chữ' };
+			if (text.split(' ').length > 5) return { error: 'Cụm dài tối đa 5 từ' };
+			out.text = text;
+		}
+		if (body.kind !== undefined) {
+			if (!KINDS.includes(String(body.kind))) return { error: 'Loại không hợp lệ' };
+			out.kind = String(body.kind);
+		}
+		for (const k of ['real', 'note'] as const) if (body[k] !== undefined) out[k] = String(body[k] || '').trim().slice(0, 300) || null;
+		if (body.skill !== undefined) out.skill = String(body.skill || '').trim().slice(0, 80) || null;
+		if (body.active !== undefined) out.active = !!body.active;
+		return { out };
+	};
+	/** What learners reported (il_issues), newest first; PUT marks one as done / new again */
+	router.get('/admin/intensive/issues', staff(async (req, res) => {
+		const status = req.query?.status === 'done' ? 'done' : 'new';
+		const items = await database('il_issues as i').join('il_lessons as l', 'l.id', 'i.lesson_id')
+			.leftJoin('il_sentences as s', function (this: any) { this.on('s.lesson_id', 'i.lesson_id').andOn('s.n', 'i.sentence_n'); })
+			.leftJoin('directus_users as u', 'u.id', 'i.user_id')
+			.select('i.id', 'i.issue', 'i.comment', 'i.typed', 'i.status', 'i.sentence_n', 'i.date_created', 'l.id as lesson_id', 'l.title', 's.text as sentence', 'u.email')
+			.where('i.status', status).orderBy('i.date_created', 'desc').limit(200);
+		return res.json({ success: true, data: { items } });
+	}));
+	router.put('/admin/intensive/issues/:id', staff(async (req, res) => {
+		if (!UUID_RE.test(String(req.params.id))) return res.status(404).json({ success: false, message: 'Not found' });
+		const status = req.body?.status === 'done' ? 'done' : 'new';
+		await database('il_issues').where({ id: req.params.id }).update({ status });
+		return res.json({ success: true });
+	}));
+	router.get('/admin/intensive/chunks', staff(async (_req, res) => {
+		const items = await database('il_chunks').orderBy('text');
+		const skills = await database('listening_skills').select('slug', 'name').where('status', 'published').orderBy('name');
+		return res.json({ success: true, data: { items, skills } });
+	}));
+	router.post('/admin/intensive/chunks', staff(async (req, res) => {
+		const { out, error } = chunkFields(req.body || {}, false);
+		if (error || !out) return res.status(422).json({ success: false, message: error });
+		if (await database('il_chunks').whereRaw('lower(text) = ?', [out.text]).first()) return res.status(409).json({ success: false, message: 'Cụm này đã có' });
+		const [row] = await database('il_chunks').insert(out).returning('*');
+		return res.json({ success: true, data: row });
+	}));
+	router.put('/admin/intensive/chunks/:id', staff(async (req, res) => {
+		const id = String(req.params.id);
+		if (!UUID_RE.test(id)) return res.status(400).json({ success: false, message: 'Bad id' });
+		const { out, error } = chunkFields(req.body || {}, true);
+		if (error || !out) return res.status(422).json({ success: false, message: error });
+		if (!Object.keys(out).length) return res.status(400).json({ success: false, message: 'Nothing to change' });
+		if (out.text && await database('il_chunks').whereRaw('lower(text) = ?', [out.text]).whereNot('id', id).first()) return res.status(409).json({ success: false, message: 'Cụm này đã có' });
+		const n = await database('il_chunks').where('id', id).update({ ...out, date_updated: database.fn.now() });
+		if (!n) return res.status(404).json({ success: false, message: 'Not found' });
+		return res.json({ success: true, data: await database('il_chunks').where('id', id).first() });
+	}));
+	router.delete('/admin/intensive/chunks/:id', staff(async (req, res) => {
+		const id = String(req.params.id);
+		if (!UUID_RE.test(id)) return res.status(400).json({ success: false, message: 'Bad id' });
+		await database('il_chunks').where('id', id).delete();
+		return res.json({ success: true, data: null });
+	}));
+
 	router.get('/admin/intensive/:id', staff(async (req, res) => {
 		const id = String(req.params.id);
 		if (!UUID_RE.test(id)) return res.status(400).json({ success: false, message: 'Bad id' });
@@ -103,6 +174,38 @@ export function registerAdminIntensiveRoutes(router: any, context: any) {
 		} });
 	}));
 
+	/** How learners get on with one passage: finishing, where they stop, the ladder, practice, the feedback card, the thumbs on
+	 *  diagnoses, and whether the same key words are missed again on a later go (the real test that the flow works). */
+	router.get('/admin/intensive/:id/stats', staff(async (req, res) => {
+		const id = String(req.params.id);
+		if (!UUID_RE.test(id)) return res.status(400).json({ success: false, message: 'Bad id' });
+		const one = async (sql: string, args: any[] = [id]) => (await database.raw(sql, args)).rows;
+		const [att] = await one(`SELECT count(*)::int AS starts, count(finished_at)::int AS finished,
+			round(avg(extract(epoch FROM finished_at - date_created) / 60) FILTER (WHERE finished_at IS NOT NULL)::numeric, 1) AS minutes,
+			count(practice)::int AS practice_opened, coalesce(sum((practice->>'done')::int), 0)::int AS practice_done, coalesce(sum((practice->>'right')::int), 0)::int AS practice_right
+			FROM il_attempts WHERE lesson_id = ?`);
+		const stopped = await one(`SELECT coalesce(m.n, 0)::int AS n, count(*)::int AS c FROM il_attempts a
+			LEFT JOIN LATERAL (SELECT max(s.n) AS n FROM il_results r JOIN il_sentences s ON s.id = r.sentence_id WHERE r.attempt_id = a.id) m ON true
+			WHERE a.lesson_id = ? AND a.finished_at IS NULL GROUP BY 1 ORDER BY 1`);
+		const ladder = await one(`SELECT r.ladder->>'outcome' AS outcome, count(*)::int AS c FROM il_results r JOIN il_attempts a ON a.id = r.attempt_id
+			WHERE a.lesson_id = ? AND r.ladder IS NOT NULL GROUP BY 1`);
+		const [fb] = await one(`SELECT count(*)::int AS n, round(avg(rating)::numeric, 2) AS avg FROM il_feedback WHERE lesson_id = ?`);
+		const tags = await one(`SELECT t AS tag, count(*)::int AS c FROM il_feedback, unnest(tags) t WHERE lesson_id = ? GROUP BY 1 ORDER BY 2 DESC`);
+		const comments = await one(`SELECT rating, tags, comment, locale, date_created FROM il_feedback WHERE lesson_id = ? ORDER BY date_created DESC LIMIT 30`);
+		const votes = await one(`SELECT sentence_n AS n, word, outcome, count(*) FILTER (WHERE vote = 1)::int AS up, count(*) FILTER (WHERE vote = -1)::int AS down
+			FROM il_diag_votes WHERE lesson_id = ? GROUP BY 1, 2, 3 ORDER BY down DESC, up DESC, 1`);
+		// Learners with two or more finished goes: key words missed on their first go against their latest go
+		const [again] = await one(`WITH att AS (
+				SELECT id, user_id, row_number() OVER (PARTITION BY user_id ORDER BY seq) AS first_go, row_number() OVER (PARTITION BY user_id ORDER BY seq DESC) AS last_go, count(*) OVER (PARTITION BY user_id) AS goes
+				FROM il_attempts WHERE lesson_id = ? AND finished_at IS NOT NULL AND user_id IS NOT NULL),
+			miss AS (
+				SELECT a.user_id, a.first_go, a.last_go FROM att a JOIN il_results r ON r.attempt_id = a.id AND r.round = 1 JOIN il_sentences s ON s.id = r.sentence_id, jsonb_array_elements(r.labels) m
+				WHERE a.goes >= 2 AND (a.first_go = 1 OR a.last_go = 1) AND replace(lower(m->>'word'), chr(39), '') = ANY(s.key_words))
+			SELECT (SELECT count(DISTINCT user_id) FROM att WHERE goes >= 2)::int AS users,
+				count(*) FILTER (WHERE first_go = 1)::int AS first_missed, count(*) FILTER (WHERE last_go = 1)::int AS last_missed FROM miss`);
+		return res.json({ success: true, data: { attempts: att, stopped, ladder, feedback: { ...fb, tags, comments }, votes, again } });
+	}));
+
 	router.put('/admin/intensive/:id/status', staff(async (req, res) => {
 		const id = String(req.params.id);
 		const status = String(req.body?.status || '');
@@ -115,6 +218,28 @@ export function registerAdminIntensiveRoutes(router: any, context: any) {
 		}
 		await database('il_lessons').where('id', id).update({ status, date_updated: database.fn.now() });
 		return res.json({ success: true, data: { status } });
+	}));
+
+	/** The gist question (base text) and the sentences that hold its answer */
+	router.put('/admin/intensive/:id/gist', staff(async (req, res) => {
+		const id = String(req.params.id);
+		if (!UUID_RE.test(id)) return res.status(400).json({ success: false, message: 'Bad id' });
+		const l = await database('il_lessons').where('id', id).first();
+		if (!l) return res.status(404).json({ success: false, message: 'Not found' });
+		const b = req.body || {};
+		const prompt = String(b.prompt || '').trim();
+		const options = Array.isArray(b.options) ? b.options.map((o: any) => String(o || '').trim()) : [];
+		const answer = Number(b.answer);
+		if (!prompt) return res.status(422).json({ success: false, message: 'Cần câu hỏi' });
+		if (options.length !== 3 || options.some((o: string) => !o)) return res.status(422).json({ success: false, message: 'Cần đúng 3 đáp án' });
+		if (!Number.isInteger(answer) || answer < 0 || answer > 2) return res.status(422).json({ success: false, message: 'Chọn đáp án đúng' });
+		const ns = new Set((await database('il_sentences').where('lesson_id', id).pluck('n')).map(Number));
+		const lines = [...new Set((Array.isArray(b.sentences) ? b.sentences : []).map(Number))].filter((n) => ns.has(n)).sort((x, y) => x - y);
+		await database('il_lessons').where('id', id).update({
+			gist_prompt: prompt.slice(0, 400), gist_options: JSON.stringify(options.map((o: string) => o.slice(0, 300))), gist_answer: answer,
+			gist_explain: String(b.explain || '').trim().slice(0, 600) || null, gist_sentences: lines, date_updated: database.fn.now(),
+		});
+		return res.json({ success: true });
 	}));
 
 	/** Fix one sentence: its text and/or its time range in ms (the team listens with the player and corrects it) */
@@ -135,9 +260,34 @@ export function registerAdminIntensiveRoutes(router: any, context: any) {
 			if (!Number.isFinite(v) || v < 0) return res.status(422).json({ success: false, message: 'Thời gian không hợp lệ' });
 			patch[k] = v;
 		}
-		if (!Object.keys(patch).length) return res.status(400).json({ success: false, message: 'Nothing to change' });
+		if (!Object.keys(body).some((k) => ['text', 'start_ms', 'end_ms', 'traps', 'key_words'].includes(k))) return res.status(400).json({ success: false, message: 'Nothing to change' });
 		const s = await database('il_sentences').where({ id: sid, lesson_id: id }).first();
 		if (!s) return res.status(404).json({ success: false, message: 'Not found' });
+		if (body.traps !== undefined) {
+			if (!Array.isArray(body.traps) || body.traps.length > 12) return res.status(422).json({ success: false, message: 'Tối đa 12 bẫy mỗi câu' });
+			const sentence = ` ${tokens(patch.text ?? s.text).join(' ')} `;
+			const traps: any[] = [];
+			for (const t of body.traps) {
+				const text = tokens(String(t?.text || '')).join(' ');
+				if (!text) continue;
+				if (!KINDS.includes(String(t?.kind))) return res.status(422).json({ success: false, message: `Loại bẫy "${text}" không hợp lệ` });
+				if (!sentence.includes(` ${text} `)) return res.status(422).json({ success: false, message: `Bẫy "${text}" không nằm trong câu` });
+				const clip = (v: any, n: number) => String(v || '').trim().slice(0, n) || undefined;
+				traps.push({ text: String(t.text).trim(), kind: t.kind, real: clip(t.real, 300), note: clip(t.note, 400), skill: clip(t.skill, 80) });
+			}
+			patch.traps = JSON.stringify(traps);
+		}
+		// Key words: words of the sentence that change its meaning when missed (can't, not, the main nouns). Stored lower case
+		// without apostrophes; a word no longer in the sentence (after a text fix) is dropped
+		const inSentence = new Set(tokens(patch.text ?? s.text).map((w) => w.replace(/'/g, '')));
+		if (body.key_words !== undefined || patch.text) {
+			const want: string[] = Array.isArray(body.key_words) ? body.key_words : s.key_words || [];
+			const keys = [...new Set(want.map((w) => String(w || '').toLowerCase().replace(/[‘’']/g, '').trim()).filter(Boolean))];
+			const out = keys.filter((w) => inSentence.has(w));
+			if (body.key_words !== undefined && out.length < keys.length) return res.status(422).json({ success: false, message: `Từ "${keys.find((w) => !inSentence.has(w))}" không nằm trong câu` });
+			if (out.length > 6) return res.status(422).json({ success: false, message: 'Tối đa 6 từ quan trọng mỗi câu' });
+			patch.key_words = out;
+		}
 		const start = patch.start_ms ?? s.start_ms;
 		const end = patch.end_ms ?? s.end_ms;
 		if (end - start < 600) return res.status(422).json({ success: false, message: 'Câu quá ngắn (tối thiểu 0,6 giây)' });

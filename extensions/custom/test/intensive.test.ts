@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { diffWords, hintOf, isRight, labelMisses, sentenceLabel, tokens, toConfirm } from '../src/lib/intensive';
+import { diffWords, hintOf, isRight, labelMisses, sentenceLabel, tokens, toConfirm, withChunks } from '../src/lib/intensive';
 
 const status = (r: ReturnType<typeof diffWords>) => r.words.map((w) => `${w.w}:${w.status}`).join(' ');
 
@@ -112,4 +112,38 @@ test('a close miss asks "misheard or misspelt?", and the answer sets the label',
 	assert.equal(labelMisses(r, [], w, [], null, '', [], { reside: 'misheard' })[0]!.label, 'confusable');
 	// A far miss is not asked about
 	assert.deepEqual(toConfirm(labelMisses('a reside', [], diffWords('a reside', 'a table').words)), []);
+});
+
+test('a shared chunk labels a miss as linking, with how it is said', () => {
+	const sentence = "Well, it turns out you can, sort of.";
+	const typed = 'Well it term out you can, soil up';
+	const d = diffWords(sentence, typed);
+	const chunks = [{ text: 'sort of', kind: 'linking' as const, real: '"sorta"', skill: 'flap-t' }];
+	const m = labelMisses(sentence, withChunks([], chunks), d.words, [], null, typed);
+	const sortOf = m.filter((x) => x.word === 'sort' || x.word === 'of');
+	assert.equal(sortOf.length, 2);
+	assert.ok(sortOf.every((x) => x.label === 'linking' && x.real === '"sorta"' && x.skill === 'flap-t'), JSON.stringify(m));
+});
+
+test('consonant-to-vowel break is linking without any trap', () => {
+	const sentence = "Well, it turns out you can, sort of.";
+	const typed = 'Well it term out you can, soil up';
+	const m = labelMisses(sentence, [], diffWords(sentence, typed).words, [], null, typed);
+	const turns = m.find((x) => x.word === 'turns')!;
+	assert.equal(turns.label, 'linking', JSON.stringify(m));
+	assert.equal(turns.skill, 'linking-words');
+	assert.equal(m.find((x) => x.word === 'of')!.label, 'linking');
+});
+
+test('an own trap wins over the same shared chunk', () => {
+	const own = [{ text: 'Sort of', kind: 'imagine' as const }];
+	const all = withChunks(own, [{ text: 'sort of', kind: 'linking' as const }]);
+	assert.equal(all.length, 1);
+	assert.equal(all[0]!.kind, 'imagine');
+});
+
+test('a right word lines up with itself, and "kind of" counts for "kinda"', () => {
+	const r = diffWords('Does that sound kinda familiar?', "that's sound kind of familiar?");
+	assert.equal(status(r), 'does:missing that:wrong sound:ok kinda:ok familiar:ok');
+	assert.deepEqual(hintOf('Does that sound kinda familiar?', r.words), ['****', '****', 'sound', 'kinda', 'familiar?']);
 });

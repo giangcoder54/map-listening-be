@@ -15,6 +15,7 @@
  */
 import { PRACTICE, UUID_RE, acceptOf, answerOf, practicePrefsOf } from '../lib/lessons';
 import { isPremiumUser } from '../lib/premium';
+import { dueReviews } from '../lib/reviewDue';
 import { DEFAULT_GOAL, TZ, XP, engagementOf, grantRewards, recordPractice } from '../lib/xp';
 
 export { TZ, XP };
@@ -50,7 +51,7 @@ const periodStart = (unit: 'week' | 'month') => `date_trunc('${unit}', now() AT 
 
 /** Ranked learners of a period, kept 2 minutes: the board is read far more than it changes */
 const LEADERBOARD_TTL_MS = 120_000;
-const leaderboardCache = new Map<string, { at: number; rows: { user_id: string; xp: number }[] }>();
+const leaderboardCache = new Map<string, { at: number; rows: { user_id: string; xp: number; seconds: number }[] }>();
 
 /** First name + initial of the last name: what other learners see */
 /** Name on the leaderboard: first and last name in full ("Giang Nguyễn Thế Trường") */
@@ -87,10 +88,10 @@ export function registerEngagementRoutes(router: any, context: any) {
 		try {
 			const [engagement, due, phrasesDue] = await Promise.all([
 				engagementOf(database, userId),
-				database('listening_reviews').where('user_id', userId).where('due_at', '<=', database.fn.now()).count('* as n').first(),
+				dueReviews(database, userId),
 				database('phrase_progress').where('user_id', userId).where('due', '<=', database.fn.now()).count('* as n').first(),
 			]);
-			return res.json({ success: true, data: { ...engagement, reviews_due: Number(due?.n) || 0, phrases_due: Number(phrasesDue?.n) || 0 } });
+			return res.json({ success: true, data: { ...engagement, reviews_due: due, phrases_due: Number(phrasesDue?.n) || 0 } });
 		} catch (error) {
 			return fail(res, 'Load engagement', error);
 		}
@@ -209,32 +210,56 @@ export function registerEngagementRoutes(router: any, context: any) {
 	router.get('/leaderboard', async (req: any, res: any) => {
 		const userId = req.accountability?.user ?? null;
 		const unit = req.query.period === 'month' ? 'month' : 'week';
+		// scope=friends: only the learners who added each other (v1/friendsRoutes.ts), and the learner
+		const friendsOnly = req.query.scope === 'friends' && !!userId;
 		try {
-			let cached = leaderboardCache.get(unit);
-			if (!cached || Date.now() - cached.at > LEADERBOARD_TTL_MS) {
+			let ranked: { user_id: string; xp: number; seconds: number }[];
+			if (friendsOnly) {
 				const sums = await database.raw(`
-					SELECT user_id, sum(xp)::int AS xp FROM user_daily_stats
-					WHERE day >= ${periodStart(unit)} GROUP BY user_id HAVING sum(xp) > 0 ORDER BY xp DESC
-				`);
-				cached = { at: Date.now(), rows: (sums.rows || []).map((r: any) => ({ user_id: r.user_id, xp: Number(r.xp) || 0 })) };
-				leaderboardCache.set(unit, cached);
-			}
-			let ranked = cached.rows;
-			// The learner's own XP fresh (a lesson just finished is not in the 2-minute cache yet)
-			if (userId) {
-				const own = await database.raw(`SELECT coalesce(sum(xp), 0)::int AS xp FROM user_daily_stats WHERE user_id = ? AND day >= ${periodStart(unit)}`, [userId]);
-				const xp = Number(own.rows?.[0]?.xp) || 0;
-				ranked = ranked.filter((r) => r.user_id !== userId);
-				if (xp > 0) ranked = [...ranked, { user_id: userId, xp }].sort((a, b) => b.xp - a.xp);
+					WITH ids AS (SELECT friend_id AS id FROM user_friends WHERE user_id = ? UNION SELECT ?::uuid)
+					SELECT i.id AS user_id, coalesce(x.xp, 0)::int AS xp, coalesce(s.seconds, 0)::int AS seconds
+					FROM ids i
+					LEFT JOIN (SELECT user_id, sum(xp)::int AS xp FROM user_daily_stats
+						WHERE day >= ${periodStart(unit)} AND user_id IN (SELECT id FROM ids) GROUP BY user_id) x ON x.user_id = i.id
+					LEFT JOIN (SELECT user_id, sum(seconds)::int AS seconds FROM user_study_time
+						WHERE day >= ${periodStart(unit)} AND user_id IN (SELECT id FROM ids) GROUP BY user_id) s ON s.user_id = i.id
+					ORDER BY xp DESC, seconds DESC
+				`, [userId, userId]);
+				ranked = (sums.rows || []).map((r: any) => ({ user_id: r.user_id, xp: Number(r.xp) || 0, seconds: Number(r.seconds) || 0 }));
+			} else {
+				let cached = leaderboardCache.get(unit);
+				if (!cached || Date.now() - cached.at > LEADERBOARD_TTL_MS) {
+					const sums = await database.raw(`
+						SELECT d.user_id, d.xp, coalesce(s.seconds, 0)::int AS seconds
+						FROM (SELECT user_id, sum(xp)::int AS xp FROM user_daily_stats
+							WHERE day >= ${periodStart(unit)} GROUP BY user_id HAVING sum(xp) > 0) d
+						LEFT JOIN (SELECT user_id, sum(seconds)::int AS seconds FROM user_study_time
+							WHERE day >= ${periodStart(unit)} GROUP BY user_id) s ON s.user_id = d.user_id
+						ORDER BY d.xp DESC
+					`);
+					cached = { at: Date.now(), rows: (sums.rows || []).map((r: any) => ({ user_id: r.user_id, xp: Number(r.xp) || 0, seconds: Number(r.seconds) || 0 })) };
+					leaderboardCache.set(unit, cached);
+				}
+				ranked = cached.rows;
+				// The learner's own XP fresh (a lesson just finished is not in the 2-minute cache yet)
+				if (userId) {
+					const own = await database.raw(`SELECT coalesce(sum(xp), 0)::int AS xp,
+							(SELECT coalesce(sum(seconds), 0)::int FROM user_study_time WHERE user_id = ? AND day >= ${periodStart(unit)}) AS seconds
+						FROM user_daily_stats WHERE user_id = ? AND day >= ${periodStart(unit)}`, [userId, userId]);
+					const xp = Number(own.rows?.[0]?.xp) || 0;
+					ranked = ranked.filter((r) => r.user_id !== userId);
+					if (xp > 0) ranked = [...ranked, { user_id: userId, xp, seconds: Number(own.rows?.[0]?.seconds) || 0 }].sort((a, b) => b.xp - a.xp);
+				}
 			}
 			const ids = ranked.map((r: any) => r.user_id);
 			const users = ids.length
 				? await database('directus_users').select('id', 'first_name', 'last_name', 'avatar', 'avatar_url', 'leaderboard_hidden', 'status').whereIn('id', ids)
 				: [];
 			const byId = new Map(users.map((u: any) => [u.id, u]));
+			// Hiding is from the public board: a friend you added yourself stays on your private one
 			const visible = ranked.filter((r: any) => {
 				const u: any = byId.get(r.user_id);
-				return u && u.status === 'active' && (!u.leaderboard_hidden || r.user_id === userId);
+				return u && u.status === 'active' && (friendsOnly || !u.leaderboard_hidden || r.user_id === userId);
 			});
 			const rows = visible.map((r: any, i: number) => {
 				const u: any = byId.get(r.user_id);
@@ -245,7 +270,10 @@ export function registerEngagementRoutes(router: any, context: any) {
 					avatar: u.avatar || null,
 					avatar_url: u.avatar ? null : u.avatar_url || null,
 					xp: r.xp,
+					seconds: r.seconds,
 					me: r.user_id === userId,
+					// A friend's id, to remove them (only on the private board)
+					...(friendsOnly && r.user_id !== userId ? { friend_id: r.user_id } : {}),
 				};
 			});
 			const mine = rows.find((r: any) => r.me) || null;
@@ -262,10 +290,21 @@ export function registerEngagementRoutes(router: any, context: any) {
 				const at = mine.rank - 1;
 				around = rows.slice(Math.max(0, at - 1), at + 5);
 			}
+			// Near me: three above and three below, for a learner far from the top
+			const near = mine ? rows.slice(Math.max(0, mine.rank - 1 - 3), mine.rank + 3) : [];
+			// The same learner's previous week / month: "more than last time" is the comparison that always makes sense
+			let last: { xp: number; seconds: number } | null = null;
+			if (userId) {
+				const prev = `(date_trunc('${unit}', now() AT TIME ZONE '${TZ}') - interval '1 ${unit}')::date`;
+				const lr = await database.raw(`SELECT coalesce(sum(xp), 0)::int AS xp,
+						(SELECT coalesce(sum(seconds), 0)::int FROM user_study_time WHERE user_id = ? AND day >= ${prev} AND day < ${periodStart(unit)}) AS seconds
+					FROM user_daily_stats WHERE user_id = ? AND day >= ${prev} AND day < ${periodStart(unit)}`, [userId, userId]);
+				last = { xp: Number(lr.rows?.[0]?.xp) || 0, seconds: Number(lr.rows?.[0]?.seconds) || 0 };
+			}
 			const ends = await database.raw(`SELECT (date_trunc('${unit}', now() AT TIME ZONE '${TZ}') + interval '1 ${unit}') AT TIME ZONE '${TZ}' AS ends_at`);
 			return res.json({
 				success: true,
-				data: { period: unit, ends_at: ends.rows?.[0]?.ends_at, top: rows.slice(0, 50), me: mine, learners: rows.length, prev_rank: prevRank, around },
+				data: { period: unit, scope: friendsOnly ? 'friends' : 'all', ends_at: ends.rows?.[0]?.ends_at, top: rows.slice(0, 50), me: mine, near, last, learners: rows.length, prev_rank: prevRank, around },
 			});
 		} catch (error) {
 			return fail(res, 'Load leaderboard', error);

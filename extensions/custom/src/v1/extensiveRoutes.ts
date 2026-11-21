@@ -2,7 +2,8 @@
  * Extensive Listening for learners (lib/extensive.ts says how a lesson goes and how the Level moves).
  *
  *   GET  /extensive/home?topic=               my Level, minutes this week, lessons around my Level
- *   GET  /extensive/lessons?level&topic&page  every published lesson, paged
+ *   GET  /extensive/lessons?level&topic&page  every published lesson, paged (sort=fit, the default, is "For you": my topics near my Level
+ *                                             and one in four from another topic, lib/recommend.ts; guests send ?topics=a,b)
  *   GET  /extensive/lessons/:key              one lesson to play (answers stay on the server)
  *   POST /extensive/lessons/:key/start        { mode?: 'resume' | 'restart' } -> { attempt_id, part } (signed in; guests play without one).
  *                                             A lesson already finished starts a 'redo': minutes only, no XP, no Level move
@@ -22,8 +23,16 @@ import { wordKey } from '../lib/dict';
 import { isPremiumUser } from '../lib/premium';
 import { isStaff } from '../lib/staff';
 import { grantRewards, recordPractice, vnDay } from '../lib/xp';
+import { addStudySeconds } from '../lib/studyTime';
+import { interestOf, rankAll, topicsParam } from '../lib/recommend';
 
 const KEY_RE = /^[a-z0-9]{8}$/;
+
+/** A user id put straight into SQL text: only a real UUID, anything else cannot reach the query */
+const sqlUuid = (id: string) => {
+	if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) throw new Error('Bad user id');
+	return id;
+};
 
 export function registerExtensiveRoutes(router: any, context: any) {
 	const { database, logger } = context;
@@ -59,7 +68,7 @@ export function registerExtensiveRoutes(router: any, context: any) {
 	// Title and topic name in the learner's language, the base (Vietnamese) text where a translation is missing.
 	// `lang` is already checked by langOf (xx-XX), so it is safe in the SQL text.
 	const cardSql = (userId: string | null, lang: string) => CARD_SQL.replace(/%LANG%/g, lang).replace('%DONE%', userId
-		? `, EXISTS (SELECT 1 FROM el_attempts a WHERE a.lesson_id = l.id AND a.user_id = '${userId}' AND a.finished_at IS NOT NULL) AS done`
+		? `, EXISTS (SELECT 1 FROM el_attempts a WHERE a.lesson_id = l.id AND a.user_id = '${sqlUuid(userId)}' AND a.finished_at IS NOT NULL) AS done`
 		: ', false AS done');
 	/** The learner's language: ?lang= on a GET, `lang` in the body of a POST */
 	const reqLang = (req: any) => langOf(req.query?.lang ?? req.body?.lang);
@@ -127,6 +136,18 @@ export function registerExtensiveRoutes(router: any, context: any) {
 		const order = sort === 'popular' ? 'x.plays DESC, x.title'
 			: sort === 'level' ? 'x.level, x.title'
 				: `x.done, abs(x.level - ${Number(myLevel)}), x.plays, x.title`;
+		if (sort === 'fit') {
+			// "For you": the whole filtered list ranked (a few hundred cards at most), then the page cut from it
+			const picks = topicsParam(req.query?.topics);
+			const interest = await interestOf(database, userId, picks);
+			const { rows } = await database.raw(`SELECT x.*, (SELECT count(*)::int FROM el_attempts a WHERE a.lesson_id = x.id) AS starts
+				FROM (${cardSql(userId, reqLang(req))}${where}) x ${outer.length ? `WHERE ${outer.join(' AND ')}` : ''}`, params);
+			// Below my Level is easy listening (fine); above it is harder (fits less)
+			const fit = (r: any) => { const d = Number(r.level) - myLevel; return Math.max(0.05, d < 0 ? 1 + 0.25 * d : 1 - 0.4 * d); };
+			const ranked = rankAll(rows.map((r: any) => ({ ...card(r, premium), starts: r.starts })), interest, fit, `${userId || 'guest'}:${new Date().toISOString().slice(0, 10)}:${picks.join(',')}`);
+			const items = ranked.slice((page - 1) * limit, page * limit).map(({ starts, ...c }: any) => c);
+			return res.json({ success: true, data: { items, total: ranked.length, page, limit } });
+		}
 		const { rows } = await database.raw(`SELECT *, count(*) OVER()::int AS full_count FROM (${cardSql(userId, reqLang(req))}${where}) x
 			${outer.length ? `WHERE ${outer.join(' AND ')}` : ''}
 			ORDER BY ${order} LIMIT ${limit} OFFSET ${(page - 1) * limit}`, params);
@@ -158,7 +179,7 @@ export function registerExtensiveRoutes(router: any, context: any) {
 			trOf(l.id, lang),
 			userId ? database('el_attempts').select('id', 'part').where({ user_id: userId, lesson_id: l.id }).whereNull('finished_at')
 				.where('date_created', '>', database.raw(`now() - interval '${RESUME_DAYS} days'`)).orderBy('date_created', 'desc').first() : null,
-			userId ? database('el_attempts').select('id').where({ user_id: userId, lesson_id: l.id }).whereNotNull('finished_at').first() : null,
+			userId ? database('el_attempts').select('id').where({ user_id: userId, lesson_id: l.id }).whereNotNull('finished_at').orderBy('finished_at', 'desc').first() : null,
 		]);
 		// Question text in the learner's language (keys q:<id>:prompt, q:<id>:o<i>), base text when missing
 		const q = (x: any) => ({
@@ -177,7 +198,7 @@ export function registerExtensiveRoutes(router: any, context: any) {
 			marks: [...vocab.map((v: any) => ({ k: 'v', id: v.id, forms: [v.term, ...(v.forms || [])] })), ...notes.map((n: any) => ({ k: 'n', id: n.id, forms: [n.term, ...(n.forms || [])] }))],
 			// Shown before listening: only what the learner needs to follow the talk
 			notes_before: locked ? [] : notes.filter((n: any) => n.before).map((n: any) => ({ id: n.id, term: n.term, kind: n.kind, explain: pickOr(tr, `note:${n.n}`, n.explain) })).filter((n: any) => n.explain),
-			progress: { unfinished: open ? { attempt_id: open.id, part: open.part } : null, finished: !!finished },
+			progress: { unfinished: open ? { attempt_id: open.id, part: open.part } : null, finished: !!finished, last_id: finished?.id ?? null },
 			me,
 		} });
 	}));
@@ -258,7 +279,8 @@ export function registerExtensiveRoutes(router: any, context: any) {
 		// A redo counts the minutes only: no XP, no Level move
 		if (a.kind === 'redo' && !a.finished_at) {
 			await database('el_attempts').where('id', a.id).update({ right_count: right, total, self_rating: rating, listened_s: listened, finished_at: database.fn.now(), move: 0 });
-			await recordPractice(database, userId, { attempts: total });
+			await recordPractice(database, userId, { attempts: total, noTime: true });
+			await addStudySeconds(database, userId, listened);
 			const w = await weekSeconds(userId);
 			return res.json({ success: true, data: { right, total, self_rating: rating, move: 0, level_before: null, level_after: null, xp: 0, week_s: w.s, next: [], redo: true } });
 		}
@@ -280,8 +302,10 @@ export function registerExtensiveRoutes(router: any, context: any) {
 		let xp = 0;
 		if (!result.again) {
 			const first = !(await database('el_attempts').where({ user_id: userId, lesson_id: a.lesson_id }).whereNotNull('finished_at').whereNot('id', a.id).first());
+			await addStudySeconds(database, userId, listened);
 			const won = await recordPractice(database, userId, {
 				attempts: total,
+				noTime: true,
 				xp: first
 					? { reason: 'extensive', dedupe: `extensive:${a.lesson_id}`, lessonId: null }
 					: { reason: 'extensive', dedupe: `extensive:${a.lesson_id}:${vnDay()}`, lessonId: null, amount: EL.xpAgain },
@@ -327,6 +351,19 @@ export function registerExtensiveRoutes(router: any, context: any) {
 			// The transcript with its translation; `tr` is null when this language has none yet
 			lines: linesIn(l.transcript, l.start_ms, l.end_ms).map((c) => ({ ...c, tr: subOf.get(c.start) ?? null })),
 		} });
+	}));
+
+	/** "Report a problem" on the lesson on screen: POST /extensive/lessons/:key/issue { issue, comment? } */
+	router.post('/extensive/lessons/:key/issue', wrap('issue', async (req, res) => {
+		const userId = userOf(req);
+		if (!userId) return res.status(401).json({ success: false, message: 'Login first' });
+		const l = await findLesson(String(req.params.key));
+		if (!l) return res.status(404).json({ success: false, message: 'Lesson not found' });
+		const issue = String(req.body?.issue || '');
+		if (!['subtitle_off', 'wrong_answer', 'marked_wrong', 'video_issue', 'other'].includes(issue)) return res.status(422).json({ success: false, message: 'Invalid issue' });
+		const comment = typeof req.body?.comment === 'string' ? req.body.comment.trim().slice(0, 2000) || null : null;
+		await database('el_issues').insert({ lesson_id: l.id, user_id: userId, issue, comment });
+		return res.json({ success: true });
 	}));
 
 	router.post('/extensive/vocab/:id/save', wrap('save', async (req, res) => {

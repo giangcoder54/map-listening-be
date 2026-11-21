@@ -7,6 +7,8 @@
  */
 import { createHash } from 'node:crypto';
 import { notifyAdmin } from '../lib/sepay';
+import { clientIp, isLimited } from '../lib/rateLimit';
+import { verifyTurnstile } from '../lib/turnstile';
 
 const str = (v: unknown, max: number) => (typeof v === 'string' ? v.trim().slice(0, max) : '');
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
@@ -30,18 +32,6 @@ function shouldReport(key: string) {
 	return true;
 }
 
-// Contact form: 3 messages per 10 minutes per IP
-const contactHits = new Map<string, number[]>();
-function contactLimited(ip: string) {
-	const now = Date.now();
-	const hits = (contactHits.get(ip) || []).filter((t) => now - t < 600000);
-	if (hits.length >= 3) return true;
-	hits.push(now);
-	contactHits.set(ip, hits);
-	if (contactHits.size > 5000) contactHits.clear();
-	return false;
-}
-
 export function registerOpsRoutes(router: any, context: any) {
 	const { database, logger } = context;
 
@@ -56,6 +46,8 @@ export function registerOpsRoutes(router: any, context: any) {
 	});
 
 	router.post('/client-errors', async (req: any, res: any) => {
+		// 30 reports per 10 minutes per IP: a bot cannot use up the hourly Telegram quota alone
+		if (isLimited('client-errors', clientIp(req), 30, 600000)) return res.status(204).end();
 		const body = req.body || {};
 		const message = str(body.message, 500);
 		if (!message) return res.status(204).end();
@@ -82,8 +74,11 @@ export function registerOpsRoutes(router: any, context: any) {
 		if (!EMAIL_RE.test(email) || message.length < 5) {
 			return res.status(400).json({ success: false, code: 'INVALID', message: 'Enter your email and a message.' });
 		}
-		const ip = String(req.headers['x-forwarded-for'] || req.ip || '').split(',')[0]!.trim();
-		if (contactLimited(ip)) return res.status(429).json({ success: false, code: 'TOO_MANY_REQUESTS', message: 'Please try again in a few minutes.' });
+		// Contact form: 3 messages per 10 minutes per IP
+		if (isLimited('support', clientIp(req), 3, 600000)) return res.status(429).json({ success: false, code: 'TOO_MANY_REQUESTS', message: 'Please try again in a few minutes.' });
+		if (!(await verifyTurnstile(body.turnstile_token, clientIp(req), logger))) {
+			return res.status(400).json({ success: false, code: 'CAPTCHA_FAILED', message: 'Captcha check failed' });
+		}
 		const topic = ['account', 'payment', 'lesson', 'affiliate', 'other'].includes(body.topic) ? body.topic : 'other';
 		try {
 			await database('support_messages').insert({

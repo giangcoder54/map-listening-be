@@ -22,11 +22,11 @@
  */
 import { UUID_RE, answerOf, loadLessonGraph, type LessonGraph, type LessonRow } from '../lib/lessons';
 import {
-	LESSON_TEST, MAX_LISTENS, acceptOf, choicesFor, drawLesson, drawMixed, drawReview, drawTest, fitsLesson, fitsMixed, focusFits, isRight, triesFor, passed,
+	LESSON_TEST, MAX_LISTENS, acceptOf, choicesFor, drawLesson, drawMixed, drawTest, fitsLesson, fitsMixed, focusFits, isRight, triesFor, passed,
 	practiceOf, reviewOfValue, summaryOf, targetOf,
 	tilesFor, weakestForms, withRetry, type PoolClip, type RunItem,
 } from '../lib/runs';
-import { REVIEW, gradeOf, masteryOf, schedule, cardColumns } from '../lib/review';
+import { REVIEW } from '../lib/review';
 import { COIN, CoinError, buyFreeze, earnCoins, payRetest, streakDayXu, unlockLesson, walletOf, type CoinReason } from '../lib/coins';
 import { MAX_FREEZES, goalRunOf, grantRewards, lessonXp, recordPractice, vnDay, DEFAULT_GOAL } from '../lib/xp';
 import { mixUps } from '../lib/mixups';
@@ -248,9 +248,13 @@ export function registerRunRoutes(router: any, context: any) {
 	/** The run, locked for this transaction; null when it is not this learner's */
 	async function loadRun(req: any, trx: any = database) {
 		const id = String(req.params.id || '');
-		if (!UUID_RE.test(id)) return null;
+		// The full id, or its first 8 hex characters (the short ?result= address): only ever among this learner's own runs
+		const short = /^[0-9a-f]{8}$/i.test(id);
+		if (!short && !UUID_RE.test(id)) return null;
 		const { key } = learnerOf(req);
-		const run = await trx('listening_runs').where('id', id).forUpdate().first();
+		if (!key) return null;
+		const q = trx('listening_runs').where('learner_key', key);
+		const run = await (short ? q.whereRaw('id::text like ?', [`${id.toLowerCase()}%`]) : q.where('id', id)).forUpdate().first();
 		if (!run || !key || run.learner_key !== key) return null;
 		return run;
 	}
@@ -417,71 +421,6 @@ export function registerRunRoutes(router: any, context: any) {
 		} catch (error) {
 			if (error instanceof CoinError) return coinFail(res, error);
 			return fail(res, 'Start skill test', error);
-		}
-	});
-
-	// ── Review ────────────────────────────────────────────────────────────
-	/** Forms due for this learner that they can still open, most overdue first */
-	async function dueForms(g: LessonGraph, userId: string) {
-		const rows = await database('listening_review_cards').select('lesson_id', 'due').where('user_id', userId).where('due', '<=', database.fn.now()).orderBy('due');
-		const open = rows.filter((r: any) => { const l = g.lessonById.get(r.lesson_id); return l && !g.isLocked(l); });
-		const locked = rows.length - open.length;
-		return { open: open.map((r: any) => r.lesson_id as string) as string[], locked };
-	}
-	async function reviewsToday(userId: string) {
-		const row = await database('user_daily_stats').select('reviews').where({ user_id: userId, day: vnDay() }).first();
-		return Number(row?.reviews) || 0;
-	}
-
-	router.get('/listening-lab/review', async (req: any, res: any) => {
-		const userId = req.accountability?.user ?? null;
-		if (!userId) return res.status(401).json({ success: false, code: 'LOGIN_REQUIRED' });
-		try {
-			const g = await loadLessonGraph(req, context);
-			const [due, done, next] = await Promise.all([
-				dueForms(g, userId),
-				reviewsToday(userId),
-				database('listening_review_cards').where('user_id', userId).where('due', '>', database.fn.now()).min('due as d').first(),
-			]);
-			const left = g.premium ? REVIEW.session : Math.max(0, REVIEW.free - done);
-			const active = await database('listening_runs').where({ user_id: userId, mode: 'review', status: 'active' }).first('id');
-			return res.json({
-				success: true,
-				data: {
-					due: due.open.length,
-					// Forms of lessons no longer open (Premium ended): they wait for it
-					locked: due.locked,
-					premium: g.premium,
-					done_today: done,
-					left_today: left,
-					free_per_day: REVIEW.free,
-					next_due: next?.d || null,
-					resume: !!active,
-				},
-			});
-		} catch (error) {
-			return fail(res, 'Review summary', error);
-		}
-	});
-
-	router.post('/listening-lab/review/runs', async (req: any, res: any) => {
-		const learner = learnerOf(req);
-		if (!learner.userId) return res.status(401).json({ success: false, code: 'LOGIN_REQUIRED' });
-		try {
-			const g = await loadLessonGraph(req, context);
-			const due = await dueForms(g, learner.userId);
-			const left = g.premium ? REVIEW.session : Math.max(0, REVIEW.free - (await reviewsToday(learner.userId)));
-			const active = await database('listening_runs').where({ user_id: learner.userId, mode: 'review', status: 'active' }).first('id');
-			if (!active && !left) return res.status(402).json({ success: false, code: 'REVIEW_LIMIT', free_per_day: REVIEW.free });
-			const ids = due.open.slice(0, left || REVIEW.session);
-			const pools = await poolsOf(database, g, ids);
-			const run = await openRun(learner, 'review', { lesson_id: null, skill_id: null },
-				async () => drawReview(ids.filter((id: string) => pools.has(id)).map((id: string) => ({ lessonId: id, clips: pools.get(id)!.clips })), left,
-					await metOf(learner.userId, [...pools.values()].flatMap((p) => [...p.byId.keys()]))));
-			if (!run) return res.status(409).json({ success: false, code: 'NOTHING_DUE' });
-			return res.json({ success: true, data: await runOut(database, g, run) });
-		} catch (error) {
-			return fail(res, 'Start review', error);
 		}
 	});
 
@@ -671,10 +610,28 @@ export function registerRunRoutes(router: any, context: any) {
 				completed_at = coalesce(listening_progress.completed_at, now()), last_run_id = EXCLUDED.last_run_id, date_updated = now()
 		`, [userId, lessonId, runId]);
 		await trx.raw(`
-			INSERT INTO listening_review_cards (user_id, lesson_id, due, source) VALUES (?, ?, now() + (? || ' days')::interval, 'tested_out')
-			ON CONFLICT (user_id, lesson_id) DO NOTHING
+			INSERT INTO review_cards (user_id, kind, ref_id, due, source) VALUES (?, 'form', ?, now() + (? || ' days')::interval, 'tested_out')
+			ON CONFLICT (user_id, kind, ref_id) DO NOTHING
 		`, [userId, lessonId, REVIEW.testedOutDays]);
 	};
+
+	// The learner's last finished go at a lesson: a lesson done and opened again shows that result (POST /runs/:id/finish
+	// on it only reads: nothing is paid twice), not a new start
+	router.get('/listening-lab/lessons/:key/last-run', async (req: any, res: any) => {
+		const key = String(req.params.key || '');
+		if (badKey(key)) return res.status(400).json({ success: false, message: 'Invalid lesson key' });
+		const learner = learnerOf(req);
+		if (!learner.key) return res.json({ success: true, data: null });
+		try {
+			const g = await loadLessonGraph(req, context);
+			const lesson = g.findLesson(key);
+			if (!lesson) return res.status(404).json({ success: false, message: 'Lesson not found' });
+			const run = await database('listening_runs').select('id').where({ learner_key: learner.key, lesson_id: lesson.id, mode: 'learn', status: 'finished' }).orderBy('finished_at', 'desc').first();
+			return res.json({ success: true, data: run ? { id: run.id } : null });
+		} catch (error) {
+			return fail(res, 'Last run', error);
+		}
+	});
 
 	router.post('/listening-lab/runs/:id/finish', async (req: any, res: any) => {
 		const learner = learnerOf(req);
@@ -739,8 +696,8 @@ export function registerRunRoutes(router: any, context: any) {
 						// A review lesson teaches no form of its own: the forms it mixed keep theirs.
 						if (!items.some((it) => it.lesson_id)) {
 							await trx.raw(`
-								INSERT INTO listening_review_cards (user_id, lesson_id, due, source) VALUES (?, ?, now() + interval '1 day', 'learned')
-								ON CONFLICT (user_id, lesson_id) DO NOTHING
+								INSERT INTO review_cards (user_id, kind, ref_id, due, source) VALUES (?, 'form', ?, now() + interval '1 day', 'learned')
+								ON CONFLICT (user_id, kind, ref_id) DO NOTHING
 							`, [userId, run.lesson_id]);
 						}
 						await refreshSkillProgress(trx, userId, run.skill_id);
@@ -774,36 +731,6 @@ export function registerRunRoutes(router: any, context: any) {
 					});
 					await addXp(await recordPractice(database, userId, { xp: { reason: 'skill_test', dedupe: `skill_test:${run.skill_id}` } }, today), 'skill_test');
 					await earn('skill_test', COIN.earn.skillTest, `skill_test:${run.skill_id}`);
-				} else if (mode === 'review') {
-					const answered = items.filter((it) => it.result && it.lesson_id);
-					const skills = new Set<string>();
-					await database.transaction(async (trx: any) => {
-						for (const it of answered) {
-							const card = await trx('listening_review_cards').where({ user_id: userId, lesson_id: it.lesson_id }).forUpdate().first();
-							const next = cardColumns(schedule(card || null, gradeOf(it.result!)));
-							await trx('listening_review_cards').insert({ user_id: userId, lesson_id: it.lesson_id, ...next, source: card?.source || 'learned' })
-								.onConflict(['user_id', 'lesson_id']).merge(next);
-							const l = await trx('listening_lessons').select('skill_id').where('id', it.lesson_id).first();
-							if (l?.skill_id) skills.add(l.skill_id);
-						}
-						await trx.raw(`
-							INSERT INTO user_daily_stats (user_id, day, reviews) VALUES (?, ?, ?)
-							ON CONFLICT (user_id, day) DO UPDATE SET reviews = user_daily_stats.reviews + EXCLUDED.reviews
-						`, [userId, today, answered.length]);
-						// The rule's bar: how well its forms are held now
-						for (const skillId of skills) {
-							const cards = await trx('listening_review_cards as c').join('listening_lessons as l', 'l.id', 'c.lesson_id')
-								.select('c.*').where({ 'c.user_id': userId, 'l.skill_id': skillId });
-							await trx.raw(`
-								INSERT INTO listening_skill_progress (user_id, skill_id, mastery, date_updated) VALUES (?, ?, ?, now())
-								ON CONFLICT (user_id, skill_id) DO UPDATE SET mastery = EXCLUDED.mastery, date_updated = now()
-							`, [userId, skillId, masteryOf(cards)]);
-						}
-					});
-					for (const [i, it] of items.entries()) {
-						if (it.result?.correct) await addXp(await recordPractice(database, userId, { xp: { reason: 'review', dedupe: `review:${run.id}:${i}` } }, today), 'review');
-					}
-					await earn('review', COIN.earn.review, `review:${run.id}`);
 				}
 				// Xu won on traps during this run (given at once, when answered): counted in the run's total
 				if (mode === 'learn' || mode === 'review') {
@@ -841,10 +768,17 @@ export function registerRunRoutes(router: any, context: any) {
 				});
 			}
 			const skill = run.skill_id ? g.skillById.get(run.skill_id) : null;
+			// A lesson's end shows each sentence heard, with the clip to play again and why (once per clip)
+			let review: any[] = [];
+			if (mode === 'learn') {
+				const seen = new Set<string>();
+				const once = items.filter((it) => (seen.has(it.clip_id) ? false : (seen.add(it.clip_id), true)));
+				review = reviewOfRun(once, await poolsOf(database, g, once.map((it) => it.lesson_id || run.lesson_id)), run.lesson_id);
+			}
 			return res.json({
 				success: true,
 				data: {
-					mode, summary, time_ms: timeMs, passed: closed.ok, weakest, xp, coins, rewards,
+					mode, summary, time_ms: timeMs, passed: closed.ok, weakest, xp, coins, rewards, review,
 					skill: skill ? { slug: skill.slug, name: skill.name } : null,
 				},
 			});
@@ -1102,7 +1036,22 @@ export function registerRunRoutes(router: any, context: any) {
 			const [it] = await loadBankItems(database, { clipId: key });
 			if (!it) return res.status(404).json({ success: false, message: 'Sentence not found' });
 			const { card, next } = await bankNext(req, it);
-			return res.json({ success: true, data: { ...card, next } });
+			// Back on a sentence already played (no run waiting to be resumed): its last result, not a new start
+			let last: { id: string; correct: boolean; time_ms: number | null; review: any } | null = null;
+			const learner = learnerOf(req);
+			if (learner.key && !card.resume) {
+				const run = await database('listening_runs').where({ learner_key: learner.key, mode: 'bank', status: 'finished', clip_id: key }).orderBy('finished_at', 'desc').first();
+				if (run) {
+					const items: RunItem[] = run.items || [];
+					last = {
+						id: run.id,
+						correct: !!items[0]?.result?.correct,
+						time_ms: run.finished_at && run.started_at ? new Date(run.finished_at).getTime() - new Date(run.started_at).getTime() : null,
+						review: reviewOfRun(items, await pickedPools(database, null as any, items), null),
+					};
+				}
+			}
+			return res.json({ success: true, data: { ...card, next, last } });
 		} catch (error) {
 			return fail(res, 'Bank item', error);
 		}

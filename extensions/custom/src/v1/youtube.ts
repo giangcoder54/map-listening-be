@@ -228,14 +228,14 @@ export function pickCaptionTrack(data: any, lang = "en"): { track: any; kind: Tr
  * Transcript with where it came from. `kind` is 'none' when the video has no subtitles in the
  * language; `items` is null when YouTube could not be read (try again later).
  */
-export async function fetchCaptions(data: any, logger: any, lang = "en"): Promise<{ items: { text: string; start: number; end: number }[] | null; kind: TranscriptKind; lang: string | null }> {
+export async function fetchCaptions(data: any, logger: any, lang = "en", plain = false): Promise<{ items: { text: string; start: number; end: number }[] | null; kind: TranscriptKind; lang: string | null }> {
   const tracks: any[] = data?.captions?.playerCaptionsTracklistRenderer?.captionTracks ?? [];
   logger.info(
     `[youtube] caption tracks=${tracks.length} langs=[${tracks.map((t) => `${t.languageCode}${t.kind === "asr" ? "(asr)" : ""}`).join(", ")}]`
   );
   const picked = pickCaptionTrack(data, lang);
   if (!picked.track) return { items: [], kind: "none", lang: null };
-  const items = await downloadTrack(picked.track, logger, picked.kind === "manual" ? "manual" : "asr");
+  const items = await downloadTrack(picked.track, logger, picked.kind === "manual" ? "manual" : "asr", plain);
   return { items, kind: picked.kind, lang: picked.lang };
 }
 
@@ -252,7 +252,7 @@ export async function fetchTranscriptFromPlayer(data: any, logger: any, lang = "
  * The track as transcript lines: sentence lines (see lib/sentenceLines) when they can be made,
  * else YouTube's cues as they are.
  */
-async function downloadTrack(track: any, logger: any, kind: "manual" | "asr") {
+async function downloadTrack(track: any, logger: any, kind: "manual" | "asr", plain = false) {
   if (!track?.baseUrl) {
     logger.warn(`[youtube] no baseUrl on selected caption track`);
     return null;
@@ -270,7 +270,8 @@ async function downloadTrack(track: any, logger: any, kind: "manual" | "asr") {
     const xml = await res.text();
     const items = parseTranscriptXml(xml);
     logger.info(`[youtube] transcript parsed ${items.length} segments (lang=${track.languageCode})`);
-    if (!items.length) return items;
+    // plain: keep an automatic track's cues as they are, no AI punctuation (fast)
+    if (!items.length || (plain && kind === "asr")) return items;
     const lines = await sentenceLines(xml, kind, logger).catch((e) => {
       logger.warn(`[youtube] sentence lines failed: ${e?.message}`);
       return null;

@@ -54,3 +54,8 @@ database/backups/
 
 # Graphify knowledge-graph outputs (local, regenerable; includes per-file cache)
 graphify-out/
+
+# Database dumps (contain user data)
+*.dump
+dump.sql
+database/backups/

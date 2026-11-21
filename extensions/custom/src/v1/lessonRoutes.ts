@@ -252,8 +252,8 @@ export function registerLessonRoutes(router: any, context: any) {
 			if (g.userId) {
 				const [row, cards, settings, tried] = await Promise.all([
 					database('listening_skill_progress').where({ user_id: g.userId, skill_id: skill.id }).first(),
-					database('listening_review_cards as c').join('listening_lessons as l', 'l.id', 'c.lesson_id')
-						.select('c.*').where({ 'c.user_id': g.userId, 'l.skill_id': skill.id }),
+					database('review_cards as c').join('listening_lessons as l', 'l.id', 'c.ref_id')
+						.select('c.*').where({ 'c.user_id': g.userId, 'c.kind': 'form', 'l.skill_id': skill.id }),
 					database('listening_skills').select('test_size', 'pass_ratio').where('id', skill.id).first(),
 					database('listening_runs').where({ user_id: g.userId, mode: 'skill_test', skill_id: skill.id })
 						.where('started_at', '>=', database.raw(`date_trunc('day', now() AT TIME ZONE 'Asia/Ho_Chi_Minh') AT TIME ZONE 'Asia/Ho_Chi_Minh'`))

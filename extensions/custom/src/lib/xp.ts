@@ -23,6 +23,7 @@
  */
 import { activatePremiumForUser } from '../utils';
 import { COIN } from './coins';
+import { touchStudy } from './studyTime';
 
 import { TZ, vnDay } from './days';
 
@@ -109,7 +110,8 @@ export async function goalRunOf(database: any, userId: string, today = vnDay()) 
  * rule gives some, its XP. Returns the XP actually won (0 for a repeat) and new rewards.
  * `today` is only passed by the tests (test/xp.test.ts), to play several days.
  */
-export async function recordPractice(database: any, userId: string, opts: { attempts?: number; xp?: XpRule | null }, today = vnDay()) {
+export async function recordPractice(database: any, userId: string, opts: { attempts?: number; xp?: XpRule | null; /** the caller adds its own measured time (Extensive) */ noTime?: boolean }, today = vnDay()) {
+	if (!opts.noTime) await touchStudy(database, userId, today);
 	return database.transaction(async (trx: any) => {
 		const acc = await lockUserXp(trx, userId);
 		await settleFreezes(trx, userId, today, Number(acc.freezes) || 0);

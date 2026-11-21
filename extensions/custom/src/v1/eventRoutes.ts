@@ -5,6 +5,8 @@
  *   POST /events   { event, lesson_key?, step?, path?, anonymous_id? }
  *                  event: visit | lesson_open | lesson_start | step | result | landing | skip | setting
  *                  (landing: the home page ear test, step = play | answer | right | cta;
+ *                  dyk: the daily "Bạn có biết?" card (shown only to variant B of the landing A/B test), path = card id,
+ *                  step = view | play | answer | right | cta_start | cta_lesson;
  *                  skip: "Skip this step", step = voice | challenge | more;
  *                  setting: a practice setting chosen, step = voice_type | challenge_hard...,
  *                  2026-10-26_practice_modes.sql)
@@ -19,19 +21,46 @@ import { PRACTICE, UUID_RE } from '../lib/lessons';
 
 const TZ = 'Asia/Ho_Chi_Minh';
 const ANON_ID_RE = /^[A-Za-z0-9-]{16,64}$/;
-const EVENTS = ['visit', 'lesson_open', 'lesson_start', 'step', 'result', 'landing', 'skip', 'setting'];
+const EVENTS = ['visit', 'lesson_open', 'lesson_start', 'step', 'result', 'landing', 'skip', 'setting', 'dyk'];
 const STEPS: Record<string, string[]> = {
 	step: ['type', 'voice', 'challenge', 'more'],
 	landing: ['play', 'answer', 'right', 'cta'],
+	dyk: ['view', 'play', 'answer', 'right', 'cta_start', 'cta_lesson'],
 	skip: ['voice', 'challenge', 'more'],
 	setting: [...PRACTICE.voice.map((v) => `voice_${v}`), ...PRACTICE.challenge.map((v) => `challenge_${v}`)],
 };
+/** People who must have answered the ear test before its wrong-answer share is shown */
+const MIN_ANSWERS = 50;
+/** Shown until MIN_ANSWERS people have answered; after that the measured share replaces it */
+const BASELINE_WRONG_PERCENT = 72;
 const LESSON_EVENTS = ['lesson_open', 'lesson_start', 'step', 'result', 'skip'];
 /** Crawlers, link previews, speed tests and headless browsers (they can run the page's JS) */
 const BOT_UA_RE = /bot|crawl|spider|slurp|headless|lighthouse|pagespeed|preview|facebookexternalhit|inspectiontool|phantomjs|puppeteer|playwright|selenium|python-requests|curl|wget/i;
 
 export function registerEventRoutes(router: any, context: any) {
 	const { database, logger } = context;
+
+	/**
+	 * GET /events/landing-stats: public. Of the real people who answered the home page ear test, the
+	 * share who did not pick the right sentence. null until MIN_ANSWERS people have answered (BASELINE_WRONG_PERCENT until then), so a
+	 * handful of early visitors never shows as a statistic.
+	 */
+	router.get('/events/landing-stats', async (_req: any, res: any) => {
+		try {
+			const r = await database.raw(`
+				SELECT count(DISTINCT actor_key) FILTER (WHERE step = 'answer')::int AS answered,
+					count(DISTINCT actor_key) FILTER (WHERE step = 'right')::int AS right_answer
+				FROM learning_events WHERE event = 'landing' AND human
+			`);
+			const row = r.rows?.[0] || { answered: 0, right_answer: 0 };
+			const wrong = row.answered >= MIN_ANSWERS ? Math.round((1 - row.right_answer / row.answered) * 100) : BASELINE_WRONG_PERCENT;
+			res.set('Cache-Control', 'public, max-age=3600');
+			return res.json({ wrong_percent: wrong });
+		} catch (error) {
+			logger?.warn?.(`[events] landing stats failed: ${String(error)}`);
+			return res.json({ wrong_percent: null });
+		}
+	});
 
 	router.post('/events', async (req: any, res: any) => {
 		const body = req.body || {};

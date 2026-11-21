@@ -1,5 +1,5 @@
 /**
- * Review by form (listening_review_cards, one FSRS card per learner x lesson). Same
+ * Review by form (a review_cards row of kind 'form', one FSRS card per learner x lesson). Same
  * scheduler settings as Phrase Lab (lib/phrases.ts on feature/phrase-lab): whole days,
  * 90% retention, a year at most.
  *

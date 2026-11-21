@@ -8,6 +8,7 @@
  * Không cần đăng nhập, chỉ đọc. Kết quả ít đổi nên được cache 1 ngày ở trình duyệt và CDN.
  */
 import { wordKey, dictLang } from '../lib/dict';
+import { cleanIpa } from '../lib/meanings';
 
 export function registerDictRoutes(router: any, context: any) {
 	const { database, logger } = context;
@@ -29,18 +30,24 @@ export function registerDictRoutes(router: any, context: any) {
 			let lemma: any = null;
 			if (doc.form_of?.lemma && doc.form_of.lemma !== w) {
 				const base = await findEntry(doc.form_of.lemma);
-				if (base) lemma = { word: base.w, ipa: base.ipa, senses: (base.senses || []).slice(0, 2).map((s: any) => ({ g: s.g, ex: s.ex })) };
+				if (base) lemma = { word: base.w, ipa: cleanIpa(base.ipa), senses: (base.senses || []).slice(0, 2).map((s: any) => ({ g: s.g, ex: s.ex })) };
 			}
+
+			// Nghĩa theo ngôn ngữ người học (bảng word_meanings); dạng biến hình thì lấy của từ gốc
+			const wm = (word: string) => database('word_meanings').select('short', 'pos').where({ word, lang }).orderBy('ord').limit(3);
+			let meanings: any[] = await wm(w);
+			if (!meanings.length && doc.form_of?.lemma && doc.form_of.lemma !== w) meanings = await wm(doc.form_of.lemma);
 
 			res.set('Cache-Control', 'public, max-age=86400');
 			return res.json({ success: true, data: {
 				word: doc.w,
 				lang,
-				ipa: doc.ipa || null,
+				ipa: cleanIpa(doc.ipa),
 				pos: doc.pos || [],
 				senses: (doc.senses || []).map((s: any) => ({ g: s.g, ex: s.ex || null })),
 				// Bản dịch theo từng từ (Wiktionary dịch ít từ, nên thường là null)
 				tr: doc.tr?.[lang] ?? null,
+				meanings: meanings.map((m: any) => ({ short: m.short, pos: m.pos })),
 				form_of: doc.form_of ? { lemma: doc.form_of.lemma, tags: doc.form_of.tags || [], base: lemma } : null,
 				source: 'Wiktionary (CC BY-SA)',
 			} });

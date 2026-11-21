@@ -21,6 +21,8 @@ import { registerAdminLessonRoutes } from './adminLessonRoutes';
 import { registerAdminVietsubRoutes } from './adminVietsubRoutes';
 import { registerAdminRuleRoutes } from './adminRuleRoutes';
 import { registerAdminPracticeRoutes } from './adminPracticeRoutes';
+import { registerAdminDykRoutes } from './adminDykRoutes';
+import { registerDykRoutes } from './dykRoutes';
 import { registerEventRoutes } from './eventRoutes';
 import { registerPhraseRoutes } from './phraseRoutes';
 import { registerAdminPhraseRoutes } from './adminPhraseRoutes';
@@ -30,8 +32,14 @@ import { registerDictRoutes } from './dictRoutes';
 import { registerAdminExtensiveRoutes } from './adminExtensiveRoutes';
 import { registerIntensiveRoutes } from './intensiveRoutes';
 import { registerWordsRoutes } from './wordsRoutes';
+import { registerProfileRoutes } from './profileRoutes';
+import { registerFriendsRoutes } from './friendsRoutes';
+import { registerReviewRoutes } from './reviewRoutes';
+import { registerInterestRoutes } from './interestRoutes';
 import { registerAdminIntensiveRoutes } from './adminIntensiveRoutes';
 import { staffRole } from '../lib/staff';
+import { clientIp, isLimited } from '../lib/rateLimit';
+import { verifyTurnstile } from '../lib/turnstile';
 
 
 export default defineEndpoint((router, context) => {
@@ -88,7 +96,22 @@ export default defineEndpoint((router, context) => {
 
 	router.post('/register', async (req, res) => {
 		try {
-			const { email, password, first_name, last_name, verification_url } = req.body;
+			const { email, password } = req.body || {};
+			// Honeypot: a field people never see. A bot that fills it gets a fake success.
+			if (typeof req.body?.website === 'string' && req.body.website.trim()) {
+				return res.status(200).json({ success: true, message: 'User registered successfully' });
+			}
+			// 5 sign-ups per hour per IP (mass account creation)
+			if (isLimited('register', clientIp(req), 5, 3600000)) {
+				return res.status(429).json({ success: false, code: 'TOO_MANY_REQUESTS', error: 'Too many sign-ups. Please try again later.' });
+			}
+			// Cloudflare Turnstile: the token the sign-up form's widget made (skipped when no secret is set)
+			if (!(await verifyTurnstile(req.body?.turnstile_token, clientIp(req), context.logger))) {
+				return res.status(400).json({ success: false, code: 'CAPTCHA_FAILED', error: 'Captcha check failed' });
+			}
+			const name = (v: unknown) => (typeof v === 'string' ? v.trim().slice(0, 80) : undefined) || undefined;
+			const first_name = name(req.body?.first_name);
+			const last_name = name(req.body?.last_name);
 
 			if (!email || !password) {
 				return res.status(400).json({
@@ -101,8 +124,8 @@ export default defineEndpoint((router, context) => {
 			if (typeof email !== 'string' || email.length > 254 || !/^[^\s@]+@[^\s@.]+(\.[^\s@.]+)*\.[a-z]{2,}$/i.test(email.trim())) {
 				return res.status(400).json({ success: false, code: 'INVALID_EMAIL', error: 'Invalid email address' });
 			}
-			if (typeof password !== 'string' || password.length < 6) {
-				return res.status(400).json({ success: false, code: 'WEAK_PASSWORD', error: 'Password must be at least 6 characters' });
+			if (typeof password !== 'string' || password.length < 8 || password.length > 128) {
+				return res.status(400).json({ success: false, code: 'WEAK_PASSWORD', error: 'Password must be 8 to 128 characters' });
 			}
 
 			const { UsersService } = context.services;
@@ -302,6 +325,8 @@ export default defineEndpoint((router, context) => {
 	registerAdminRuleRoutes(router, context);
 	registerAdminPracticeRoutes(router, context);
 	registerEventRoutes(router, context);
+	registerDykRoutes(router, context);
+	registerAdminDykRoutes(router, context);
 	registerPhraseRoutes(router, context);
 	registerAdminPhraseRoutes(router, context);
 	registerAdminLibraryRoutes(router, context);
@@ -310,6 +335,10 @@ export default defineEndpoint((router, context) => {
 	registerAdminExtensiveRoutes(router, context);
 	registerIntensiveRoutes(router, context);
 	registerWordsRoutes(router, context);
+	registerProfileRoutes(router, context);
+	registerFriendsRoutes(router, context);
+	registerReviewRoutes(router, context);
+	registerInterestRoutes(router, context);
 	registerAdminIntensiveRoutes(router, context);
 
 	// =====================================================================
