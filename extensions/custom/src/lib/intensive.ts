@@ -386,8 +386,9 @@ export function skillFor(label: Label, word: string, typed: string, trap?: Trap)
 export function likelyUnknown(words: WordResult[]): string[] {
 	return [...new Set(words
 		.filter((x) => (x.status === 'wrong' || x.status === 'missing') && !FUNCTION_WORDS.has(bare(x.w)) && rankOf(x.w) > IL.rareRank)
-		// Typed close to the word (resize for reside): the sounds were heard, so ask "misheard or misspelt?" instead
-		.filter((x) => !(x.typed && lev(bare(x.w), bare(x.typed)) / Math.max(x.w.length, 1) <= 0.5))
+		// A REAL word typed close to it (resize for reside): another word was heard, so ask "misheard or misspelt?" instead.
+		// A non-word typed close to a rare word (frount for frown) is the sound written down by a learner who does not know the word
+		.filter((x) => !(x.typed && isWord(bare(x.typed)) && lev(bare(x.w), bare(x.typed)) / Math.max(x.w.length, 1) <= 0.5))
 		.map((x) => x.w))];
 }
 

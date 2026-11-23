@@ -18,8 +18,9 @@
  *   POST /intensive/slow                        { sentence_id, typed, slow_typed, unknown[], heard?, attempt_id? } -> the final labels;
  *                                               `confirm` = misses to ask "misheard or misspelt?" about, `heard` the answers
  *                                               (a word right at 0.75x is "speed"); makes a Review card for a missed sentence
- *   POST /intensive/explain                     { sentence_id, typed, lang } -> the AI's reason per missed word (sound, IPA, a tip), cached in
- *                                               il_explain; { available: false } when the AI is off (lib/ilExplain.ts)
+ *   POST /intensive/explain                     { sentences: [{ sentence_id, typed }], lang } -> per sentence and missed word: the IPA of it and of what
+ *                                               was typed (dictionary), and the AI's one-line reason (diff, why). One AI call for the whole
+ *                                               attempt; cached per sentence in il_explain when the AI answered (lib/ilExplain.ts)
  *   GET  /intensive/word-clips?word=&not=       the word said in other videos (subtitle lines, one per channel), to hear it more
  *   POST /intensive/attempts/:id/finish         -> the passage's result, the labels, XP
  *   GET  /intensive/review                      Review cards due: the sentence's video and times, never its text
@@ -28,7 +29,7 @@
  * Guests can play free passages; nothing is saved for them.
  */
 import { dueReviews } from '../lib/reviewDue';
-import { IL, FUNCTION_WORDS, NOT_LISTENING, diffWords, hintOf, isRight, labelMisses, likelyUnknown, withChunks, rankOf, newCard, sameWord, toConfirm, type Heard, sentenceLabel, tokens, type Label, type Trap } from '../lib/intensive';
+import { IL, FUNCTION_WORDS, LABELS, NOT_LISTENING, diffWords, hintOf, isRight, labelMisses, likelyUnknown, withChunks, rankOf, newCard, sameWord, toConfirm, type Heard, sentenceLabel, tokens, type Label, type Trap } from '../lib/intensive';
 import { meaningFor, meaningPool } from '../lib/meanings';
 import { thumbOf } from '../lib/extensive';
 import { TOPIC_JOINS, interestOf, lessonTopicSql, rankAll, topicsParam } from '../lib/recommend';
@@ -38,7 +39,7 @@ import { isStaff } from '../lib/staff';
 import { grantRewards, recordPractice, vnDay } from '../lib/xp';
 import { touchStudy } from '../lib/studyTime';
 import { aiConfigured } from '../lib/ai';
-import { explainMisses, missRuns } from '../lib/ilExplain';
+import { bareKey, explainBatch, missWords, type BatchSentence, type ExplainItem } from '../lib/ilExplain';
 
 const KEY_RE = /^[a-z0-9]{8}$/;
 /** A passage's readable key, from its title (il_lessons.slug): you-cant-unboil-an-egg */
@@ -389,23 +390,50 @@ export function registerIntensiveRoutes(router: any, context: any) {
 		explainHits.set(key, hits);
 		return ok;
 	};
-	/** { sentence_id, typed (the first try), lang } -> { available, items: [{ word, heard, ipa_word, ipa_heard, why, tip }] } (available false = AI off or down) */
+	/** { sentences: [{ sentence_id, typed (the first try) }], lang } -> { available, results: { <sentence_id>: [{ word, heard, ipa_word, ipa_heard, diff, why }] } }.
+	 *  A whole attempt in one request: the sentences already explained for the same typed answer come from il_explain, and all the
+	 *  others go to the AI together, in ONE call */
 	router.post('/intensive/explain', wrap('explain', async (req, res) => {
-		const s = await sentenceOf(String(req.body?.sentence_id || ''), req);
-		const typed = clean(req.body?.typed);
-		if (!s || !typed.trim()) return res.status(422).json({ success: false, message: 'Bad request' });
-		const runs = missRuns(s.text, typed);
-		if (!runs.length) return res.json({ success: true, data: { available: true, items: [] } });
+		// rules: the label the page's check gave each missed word ({ word: label }); only known labels are kept
+		const rulesOf = (v: any): Record<string, string> => Object.fromEntries(Object.entries(v && typeof v === 'object' ? v : {}).slice(0, 40)
+			.filter(([, l]) => typeof l === 'string' && (LABELS as readonly string[]).includes(l)).map(([w, l]) => [bareKey(w), l as string]));
+		const list = (Array.isArray(req.body?.sentences) ? req.body.sentences : []).slice(0, 40)
+			.map((x: any) => ({ id: String(x?.sentence_id || ''), typed: clean(x?.typed), rules: rulesOf(x?.rules) }))
+			.filter((x: { id: string; typed: string }) => UUID_RE.test(x.id) && x.typed.trim());
+		if (!list.length) return res.status(422).json({ success: false, message: 'Bad request' });
 		const lang = langOf(req);
-		const typedKey = tokens(typed).join(' ').slice(0, 600);
-		const hit = await database('il_explain').where({ sentence_id: s.id, lang, typed_key: typedKey }).first();
-		if (hit) return res.json({ success: true, data: { available: true, items: hit.items } });
-		if (!aiConfigured()) return res.json({ success: true, data: { available: false, items: [] } });
-		if (!explainAllowed(userOf(req) || String(req.ip))) return res.status(429).json({ success: false, message: 'Too many requests' });
-		const items = await explainMisses({ sentence: s.text, typed, runs, lang, logger });
-		if (!items) return res.json({ success: true, data: { available: false, items: [] } });
-		await database.raw(`INSERT INTO il_explain (sentence_id, typed_key, lang, items) VALUES (?, ?, ?, ?::jsonb) ON CONFLICT (sentence_id, lang, typed_key) DO NOTHING`, [s.id, typedKey, lang, JSON.stringify(items)]);
-		return res.json({ success: true, data: { available: true, items } });
+		const ids: string[] = [...new Set<string>(list.map((x: { id: string }) => x.id))];
+		const staff = isStaff(req.accountability);
+		const chunks = await chunksOf();
+		const rows = new Map<string, any>((await database('il_sentences as s').join('il_lessons as l', 'l.id', 's.lesson_id')
+			.select('s.id', 's.text', 's.traps', 'l.status').whereIn('s.id', ids)).filter((r: any) => r.status === 'published' || staff).map((r: any) => [r.id, r]));
+		const text = new Map<string, string>([...rows.values()].map((r: any) => [r.id, r.text]));
+		const saved = new Map<string, ExplainItem[]>((await database('il_explain').whereIn('sentence_id', ids).where({ lang }))
+			.map((r: any) => [`${r.sentence_id}|${r.typed_key}`, r.items]));
+		const results: Record<string, ExplainItem[]> = {};
+		const todo: (BatchSentence & { key: string })[] = [];
+		for (const x of list) {
+			const t = text.get(x.id);
+			if (!t) continue;
+			const words = missWords(t, x.typed, x.rules);
+			if (!words.length) { results[x.id] = []; continue; }
+			const key = tokens(x.typed).join(' ').slice(0, 600);
+			const hit = saved.get(`${x.id}|${key}`);
+			if (hit) results[x.id] = hit;
+			else todo.push({ id: x.id, text: t, typed: x.typed, traps: withChunks(trapsOf(rows.get(x.id)), chunks), words, key });
+		}
+		if (todo.length) {
+			// Without the AI (off, or this learner asked too often) the items still carry the IPA; they are not kept, so the AI is tried again
+			// The AI is paid for: it stays off unless the server says so (IL_EXPLAIN_AI=on). Off, the items still carry the IPA, for free
+			const useAi = process.env.IL_EXPLAIN_AI === 'on' && aiConfigured() && explainAllowed(userOf(req) || String(req.ip));
+			const done = await explainBatch(database, { sentences: todo, lang, useAi, logger });
+			for (const s of todo) {
+				const r = done.get(s.id)!;
+				results[s.id] = r.items;
+				if (r.ai) await database.raw(`INSERT INTO il_explain (sentence_id, typed_key, lang, items) VALUES (?, ?, ?, ?::jsonb) ON CONFLICT (sentence_id, lang, typed_key) DO NOTHING`, [s.id, s.key, lang, JSON.stringify(r.items)]);
+			}
+		}
+		return res.json({ success: true, data: { available: true, results } });
 	}));
 
 	// ── Feedback on the flow: a card on the result, and a thumb on each diagnosis ──────────────

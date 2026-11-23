@@ -10,6 +10,12 @@ import { registerGoogleAvatar } from './googleAvatar';
 import { registerDefaultRole } from './defaultRole';
 import { recordConversion, voidConversion } from '../lib/referrals';
 import { refreshGrowthConfig } from '../lib/growthConfig';
+import { creditCoinOrder } from '../lib/gemOrders';
+import { sweepRooms } from '../lib/rooms';
+import { sweepCoop } from '../lib/coop';
+import { drop as coopDrop, startTicker as startCoopTicker, subscribe as coopSubscribe } from '../lib/coopHub';
+import { nightlyCoinJob } from '../lib/coinLedger';
+import { notifyAdmin } from '../lib/sepay';
 
 export default defineHook((registerEvents, context) => {
 	const { filter, action } = registerEvents;
@@ -34,6 +40,19 @@ export default defineHook((registerEvents, context) => {
 	action('growth_settings.items.create', () => refreshGrowthConfig(context.database, context.logger));
 	action('growth_settings.items.update', () => refreshGrowthConfig(context.database, context.logger));
 
+	// Kim cương: totals per day for the admin stats + ledger check, at 03:00 Vietnam time (lib/coinLedger.ts)
+	registerEvents.schedule('40 * * * *', async () => { await nightlyCoinJob(context.database, notifyAdmin, context.logger); });
+
+	// Phong Dau: rooms past their deadline give the fees back or pay out, every 10 minutes (lib/rooms.ts)
+	// Luyện cùng: rooms push their state over Directus's WebSocket (the browser sends { type: 'coop.sub', room })
+	startCoopTicker(context.database, context.logger);
+	action('websocket.message', ({ message, client }: any) => {
+		if (message?.type === 'coop.sub' && /^[0-9a-f-]{36}$/i.test(String(message.room || ''))) coopSubscribe(context.database, client, String(message.room), Number(message.since) || 0).catch(() => null);
+		else if (message?.type === 'coop.unsub') coopDrop(client);
+	});
+	action('websocket.close', ({ client }: any) => coopDrop(client));
+	registerEvents.schedule('*/10 * * * *', async () => { await sweepCoop(context.database).catch(() => 0); await sweepRooms(context.database).catch((e: any) => context.logger?.warn?.(`[rooms] sweep failed: ${String(e)}`)); });
+
 	// Register cronjob check transactions
 	// registerCronjob(registerEvents, context);
 
@@ -54,6 +73,14 @@ export default defineHook((registerEvents, context) => {
 					const purchase = await purchaseHistoryService.readOne(id, { fields: ['*', 'user.*'] });
 					if (purchase && purchase.status === 'published') {
 						const customerId = typeof purchase.user === 'object' ? purchase.user?.id : purchase.user;
+						// A Kim cuong top-up pays its coins, never a Premium plan (lib/gemOrders.ts, once per order)
+						if (customerId && purchase.product_type === 'coins') {
+							await creditCoinOrder(context.database, id).catch((error: any) =>
+								context.logger?.error(`[gems] Credit of order ${id} failed: ${String(error)}`));
+							await recordConversion(id, context, hookContext.schema).catch((error: any) =>
+								context.logger?.error(`[referral] Conversion of order ${id} failed: ${String(error)}`));
+							continue;
+						}
 						if (customerId) {
 							const amount = purchase.amount || 0;
 							const cycle = purchaseCycle(purchase.billing_cycle, amount);

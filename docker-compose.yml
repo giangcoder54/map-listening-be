@@ -85,6 +85,17 @@ services:
       - map-listening-backend-net
       - map-listening-frontend-net
 
+  # Voice for Luyện cùng (LiveKit). Dev keys: devkey / secret. In production use real keys and a public wss:// address.
+  map-listening-livekit:
+    image: livekit/livekit-server:latest
+    container_name: map-listening-livekit
+    restart: unless-stopped
+    command: --dev --bind 0.0.0.0 --node-ip 127.0.0.1
+    ports:
+      - '7880:7880'
+      - '7881:7881'
+      - '7882:7882/udp'
+
 networks:
   map-listening-backend-net:
   map-listening-frontend-net:

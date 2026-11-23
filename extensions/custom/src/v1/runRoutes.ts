@@ -23,7 +23,7 @@
 import { UUID_RE, answerOf, loadLessonGraph, type LessonGraph, type LessonRow } from '../lib/lessons';
 import {
 	LESSON_TEST, MAX_LISTENS, acceptOf, choicesFor, drawLesson, drawMixed, drawTest, fitsLesson, fitsMixed, focusFits, isRight, triesFor, passed,
-	practiceOf, reviewOfValue, summaryOf, targetOf,
+	maskForAsk, practiceOf, reviewOfValue, summaryOf, targetOf,
 	tilesFor, weakestForms, withRetry, type PoolClip, type RunItem,
 } from '../lib/runs';
 import { REVIEW } from '../lib/review';
@@ -37,6 +37,10 @@ import { CHALLENGE, beatsOf, cachedItemStats, challengeItems, lastClosedWeek, lo
 import { unlockBankVideo, unlockChallenge } from '../lib/coins';
 import { BANK, bankFormat, bankPrice, bankWrong, loadBankItems, type BankItem } from '../lib/bank';
 import { isPremiumUser } from '../lib/premium';
+import { STAR_MODES, STAR_PHASES, canAfford, playStar, starCheck, starSummary, starValue, starsUsed } from '../lib/stars';
+import { gemsOn } from '../lib/growthConfig';
+import { takeItem, useItem } from '../lib/chests';
+import { onAnswer as cardsOnAnswer } from '../lib/cards';
 import { clipOut, lessonTranslations, readClips, registerLearner, wrongOf } from './lessonRoutes';
 
 const ANON_ID_RE = /^[A-Za-z0-9-]{16,64}$/;
@@ -85,24 +89,42 @@ async function poolOf(database: any, g: LessonGraph, lesson: LessonRow, answerMo
 		// A choice with nothing to choose from (a run drawn when choices were borrowed from other
 		// clips, or wrong choices removed since): typed instead. The check asks for the same words.
 		const format = item.format === 'choice' && !choices ? (focusFits(clip) ? 'gap' : 'type') : item.format;
+		// Until it is answered the page gets the words to type or pick masked, and no explanation (lib/runs.ts maskForAsk)
+		const shown = {
+			...base,
+			format,
+			choices,
+			tiles: format === 'bank' ? tilesFor(clip, wrong) : null,
+			focus: clip.focus,
+		};
+		const asked = item.result ? shown : { ...maskForAsk(shown, format), translations: null, sounds_like: null, media: null };
 		return {
 			index,
 			phase: item.phase,
 			format,
 			result: item.result || null,
 			tries: item.tries || 0,
-			clip: {
-				...base,
-				format,
-				choices,
-				tiles: format === 'bank' ? tilesFor(clip, wrong) : null,
-				focus: clip.focus,
-			},
+			clip: asked,
+			// Ngôi sao: what the question is worth, and whether it can take a star now (lib/stars.ts)
+			value: starValue(clip.difficulty, format),
+			star_ok: STAR_PHASES.includes(item.phase) && !item.result && !((Number(item.tries) || 0) > 0),
 		};
 	};
 	return { lesson, byId, clips: [...byId.values()].map((x) => x.clip), payload };
 }
 type Pool = Awaited<ReturnType<typeof poolOf>>;
+
+/**
+ * What an answered item shows that the page did not have while it was asked (lib/runs.ts
+ * maskForAsk): the full answer and transcript, the subtitle lines, the explanations. Sent with
+ * the answer, so reading the run before answering never gives them away.
+ */
+async function revealedClip(database: any, clipId: string, lessonId: string, lessonText: string, answerMode: any) {
+	const row = (await readClips(database, [lessonId])).find((r: any) => r.id === clipId);
+	if (!row) return null;
+	const c = clipOut(row, lessonText, answerMode, true) as any;
+	return { answer: c.answer, transcript: c.transcript, cues: c.cues, lines: c.lines, translations: c.translations, sounds_like: c.sounds_like, media: c.media };
+}
 
 /** Pools of several lessons (tests of a rule, reviews), loaded once each */
 async function poolsOf(database: any, g: LessonGraph, lessonIds: string[]) {
@@ -187,7 +209,7 @@ function reviewOfRun(items: RunItem[], pools: Map<string, Pool>, fallbackLessonI
 }
 
 /** The run as the page plays it. Every item keeps its index, whatever the page skips. */
-async function runOut(database: any, g: LessonGraph, run: any) {
+async function runOut(database: any, g: LessonGraph, run: any, starsOn = false) {
 	const items: RunItem[] = run.items || [];
 	let pools: Map<string, Pool>;
 	let challenge: ChallengeRow | null = null;
@@ -200,6 +222,17 @@ async function runOut(database: any, g: LessonGraph, run: any) {
 			video = p ? { short_id: p.short_id, title: p.title } : null;
 		}
 	} else pools = await poolsOf(database, g, items.map((it) => it.lesson_id || run.lesson_id));
+	// Ngôi sao left in this run; null = no stars here (feature off, a guest, or a run that says nothing until its end)
+	let stars: { per_run: number; used: number; left: number; items: { shield: number; gold_star: number; extra_star: number } } | null = null;
+	if (starsOn && run.user_id && STAR_MODES.includes(run.mode)) {
+		const used = await starsUsed(database, run.id);
+		const perRun = COIN.star.perRun + (Number(run.extra_stars) || 0);
+		// What the learner holds that goes with a star (Khien, Ngoi sao vang, Them 1 Ngoi sao)
+		const held = await database('user_items').select('item_code').count('* as n').where('user_id', run.user_id).whereNull('used_at')
+			.whereIn('item_code', ['shield', 'gold_star', 'extra_star']).where((q: any) => q.whereNull('expires_at').orWhere('expires_at', '>', database.fn.now())).groupBy('item_code');
+		const n = (code: string) => Number(held.find((h: any) => h.item_code === code)?.n) || 0;
+		stars = { per_run: perRun, used, left: Math.max(0, perRun - used), items: { shield: n('shield'), gold_star: n('gold_star'), extra_star: n('extra_star') } };
+	}
 	const lesson = run.lesson_id ? g.lessonById.get(run.lesson_id) : null;
 	const skill = run.skill_id ? g.skillById.get(run.skill_id) : null;
 	// A lesson's practice steps may carry their own question: read live, so an edit shows at once
@@ -214,6 +247,7 @@ async function runOut(database: any, g: LessonGraph, run: any) {
 		status: run.status,
 		position: Number(run.position) || 0,
 		max_listens: challenge ? challenge.max_listens : MAX_LISTENS[run.mode] || 3,
+		stars,
 		bank: video,
 		challenge: challenge ? { short_id: challenge.short_id, week: challenge.week, title: { vi: challenge.title_vi, en: challenge.title_en } } : null,
 		lesson: lesson ? { short_id: lesson.short_id, number: g.numberOf(lesson) } : null,
@@ -330,7 +364,7 @@ export function registerRunRoutes(router: any, context: any) {
 					async () => drawMixed(forms, pool.clips, await metOf(learner.userId, ids), Math.random, script, practiced),
 					{ restart: !!req.body?.restart, valid: (items) => fitsMixed(items, has, script) });
 				if (!run) return res.status(409).json({ success: false, code: 'EMPTY_LESSON', message: 'This lesson has no clip to play yet' });
-				return res.json({ success: true, data: await runOut(database, g, run) });
+				return res.json({ success: true, data: await runOut(database, g, run, gemsOn('stars', req.accountability)) });
 			}
 			const script = practiceOf(written?.practice);
 			const shuffled = !!written?.practice_shuffle;
@@ -339,7 +373,7 @@ export function registerRunRoutes(router: any, context: any) {
 				async () => drawLesson(pool.clips, await metOf(learner.userId, [...pool.byId.keys()]), Math.random, script, { shuffle: shuffled }),
 				{ restart: !!req.body?.restart, valid: (items) => fitsLesson(items, script, (id) => pool.byId.has(id), shuffled) });
 			if (!run) return res.status(409).json({ success: false, code: 'EMPTY_LESSON', message: 'This lesson has no clip to play yet' });
-			return res.json({ success: true, data: await runOut(database, g, run) });
+			return res.json({ success: true, data: await runOut(database, g, run, gemsOn('stars', req.accountability)) });
 		} catch (error) {
 			return fail(res, 'Start run', error);
 		}
@@ -372,7 +406,7 @@ export function registerRunRoutes(router: any, context: any) {
 				async () => drawTest(forms, LESSON_TEST.size, await metOf(learner.userId, ids), Math.random, traps),
 				{ valid: (items) => items.every((it) => !!pools.get(it.lesson_id || lesson.id)?.byId.has(it.clip_id)) });
 			if (!run) return res.status(409).json({ success: false, code: 'EMPTY_LESSON' });
-			return res.json({ success: true, data: await runOut(database, g, run) });
+			return res.json({ success: true, data: await runOut(database, g, run, gemsOn('stars', req.accountability)) });
 		} catch (error) {
 			return fail(res, 'Start lesson test', error);
 		}
@@ -417,7 +451,7 @@ export function registerRunRoutes(router: any, context: any) {
 			const run = await openRun(learner, 'skill_test', { skill_id: skill.id, lesson_id: null },
 				async () => drawTest([...pools.values()].map((p) => ({ lessonId: p.lesson.id, clips: p.clips })), Number(settings?.test_size) || 8, await metOf(learner.userId, allIds)));
 			if (!run) return res.status(409).json({ success: false, code: 'EMPTY_LESSON' });
-			return res.json({ success: true, data: await runOut(database, g, run) });
+			return res.json({ success: true, data: await runOut(database, g, run, gemsOn('stars', req.accountability)) });
 		} catch (error) {
 			if (error instanceof CoinError) return coinFail(res, error);
 			return fail(res, 'Start skill test', error);
@@ -430,7 +464,7 @@ export function registerRunRoutes(router: any, context: any) {
 			const run = await loadRun(req);
 			if (!run) return res.status(404).json({ success: false, message: 'Run not found' });
 			const g = await loadLessonGraph(req, context);
-			return res.json({ success: true, data: await runOut(database, g, run) });
+			return res.json({ success: true, data: await runOut(database, g, run, gemsOn('stars', req.accountability)) });
 		} catch (error) {
 			return fail(res, 'Load run', error);
 		}
@@ -454,7 +488,7 @@ export function registerRunRoutes(router: any, context: any) {
 				const lessonRow = await trx('listening_lessons as l')
 					.join('listening_skills as s', 's.id', 'l.skill_id')
 					.join('listening_groups as g', 'g.id', 's.group_id')
-					.select('l.id', 'l.text', 'g.answer_mode').where('l.id', lessonId).first();
+					.select('l.id', 'l.text', 'l.is_premium', 'g.answer_mode').where('l.id', lessonId).first();
 				const clipRow = await trx('listening_clips').where('id', item.clip_id).first();
 				if (!lessonRow || !clipRow) return { status: 409 as const, code: 'CLIP_GONE' };
 
@@ -468,6 +502,26 @@ export function registerRunRoutes(router: any, context: any) {
 				const hint = body.hint === true;
 				const correct = !hint && isRight(clip, item.format, given);
 				const trap = clipRow.role === 'trap';
+				// Ngôi sao: a bet on this answer (lib/stars.ts). One try, no hearts; the purse must cover what it can lose.
+				let starWorth = 0;
+				// Items that go with a star: a gold star (x3 when right) and a shield (a miss costs nothing); each is used up with the star
+				let goldRow: any = null;
+				let shieldRow: any = null;
+				if (body.star) {
+					if (body.star !== 'normal' && body.star !== 'gold') return { status: 409 as const, code: 'STAR_KIND' };
+					const check = starCheck({ on: gemsOn('stars', req.accountability), userId: learner.userId, mode: run.mode, phase: item.phase, tries: Number(item.tries) || 0, used: await starsUsed(trx, run.id), perRun: COIN.star.perRun + (Number(run.extra_stars) || 0) });
+					if (!check.ok) return { status: 409 as const, code: check.code };
+					starWorth = starValue(clipRow.difficulty, item.format);
+					if (!(await canAfford(trx, learner.userId!, starWorth))) return { status: 409 as const, code: 'STAR_POOR' };
+					if (body.star === 'gold') {
+						goldRow = await takeItem(trx, learner.userId!, 'gold_star');
+						if (!goldRow) return { status: 409 as const, code: 'STAR_NO_ITEM' };
+					}
+					if (body.shield === true) {
+						shieldRow = await takeItem(trx, learner.userId!, 'shield');
+						if (!shieldRow) return { status: 409 as const, code: 'STAR_NO_ITEM' };
+					}
+				}
 				// What a wrong answer says about what was heard; a line the team wrote for that wrong choice wins
 				let mistake: Mistake | null = null;
 				if (!correct && !hint) {
@@ -482,7 +536,7 @@ export function registerRunRoutes(router: any, context: any) {
 				const timeMs = Number.isFinite(body.time_ms) ? Math.max(0, Math.min(3_600_000, Math.round(body.time_ms))) : null;
 				// A wrong typed answer with a heart left: tried again, the answer not shown yet
 				const tries = (Number(item.tries) || 0) + 1;
-				const again = !correct && !hint && tries < triesFor(run.mode, item.format, item.phase);
+				const again = !correct && !hint && !starWorth && tries < triesFor(run.mode, item.format, item.phase);
 				const attempt = (final: boolean) => learner.userId && trx('listening_attempts').insert({
 					id: trx.raw('gen_random_uuid()'), user_id: learner.userId, clip_id: item.clip_id, lesson_id: lessonId,
 					answer: hint ? '[REVEALED]' : given, is_correct: correct, attempt_number: tries, listen_count: listens,
@@ -517,10 +571,18 @@ export function registerRunRoutes(router: any, context: any) {
 						`, [learner.userId, run.lesson_id, run.id]);
 					}
 				}
+				// The star is settled with the answer: Kim cương won or lost, in the same transaction
+				const star = starWorth
+					? await playStar(trx, learner.userId!, { runId: run.id, clipId: item.clip_id, lessonId: lessonId as string, value: starWorth, correct, hint, today: vnDay(), perRun: COIN.star.perRun + (Number(run.extra_stars) || 0), kind: goldRow ? 'gold' : 'normal', shielded: !!shieldRow })
+					: null;
+				// The gold star goes once the star is played; the shield only when it saved a loss
+				if (star && goldRow) await useItem(trx, goldRow.id);
+				if (star && shieldRow && star.shield_used) await useItem(trx, shieldRow.id);
 				return {
 					// The lesson learned (a review lesson's items come from the lessons it reviews)
 					status: 200 as const, again: false, lessonId: (run.mode === 'learn' ? run.lesson_id : lessonId) as string, first: position === 0 && run.mode === 'learn',
-					mode: run.mode as Mode, clipRow, clipLessonId: lessonId as string,
+					mode: run.mode as Mode, clipRow, clipLessonId: lessonId as string, lessonText: lessonRow.text as string, answerMode: lessonRow.answer_mode,
+					premiumLesson: !!lessonRow.is_premium, phase: item.phase as string, hinted: hint, listensUsed: listens,
 					upcoming: items.filter((it, i) => i > position && !it.result).map((it) => it.clip_id),
 					// A miss about the rule (the focus words): another word misheard is not what a trap shows
 					aboutRule: !mistake || !clip.focus || (() => {
@@ -538,6 +600,7 @@ export function registerRunRoutes(router: any, context: any) {
 						position: position + 1,
 						total: items.length,
 						retry_added: items.length > before,
+						star,
 						done: position + 1 >= items.length,
 					},
 				};
@@ -547,6 +610,20 @@ export function registerRunRoutes(router: any, context: any) {
 
 			// A practice day (the streak); a learner counted once per lesson
 			if (out.again) return res.json({ success: true, data: out.data });
+			// Sự thật hay Thử thách: an open dare counts this answer; a learner low on Kim cuong counts toward the way back
+			let card: any = null;
+			if (learner.userId && gemsOn('cards', req.accountability)) {
+				try {
+					const c = await cardsOnAnswer(database, learner.userId, {
+						correct: !!out.data.correct, hint: out.hinted, phase: out.phase, difficulty: out.clipRow.difficulty ?? null, listens: out.listensUsed,
+						star: (out.data.star?.outcome as any) || null,
+					}, { freeLesson: !out.premiumLesson, premium: await isPremiumUser(database, learner.userId) });
+					if (c.premium_days) await grantRewards(context, req.schema, learner.userId, [{ kind: 'premium_day', days: c.premium_days, key: `card:${c.dare?.paid?.chest?.open_id || 'x'}` }]);
+					card = c.dare;
+				} catch (error) {
+					logger?.warn?.(`[cards] progress of ${learner.userId} not counted: ${String(error)}`);
+				}
+			}
 			// A challenge says nothing until the end: right or wrong shows on the result screen
 			if (out.mode === 'challenge') {
 				if (learner.userId) {
@@ -579,7 +656,8 @@ export function registerRunRoutes(router: any, context: any) {
 				: null;
 			// What the clip's lines mean, in the page's language (body.locale): shown now it is answered
 			const subs = await subsOf(database, out.clipRow.id, body.locale).catch(() => null);
-			return res.json({ success: true, data: { ...out.data, rewards, coins, contrast, subs } });
+			const clip = await revealedClip(database, out.clipRow.id, out.clipLessonId, out.lessonText, out.answerMode).catch(() => null);
+			return res.json({ success: true, data: { ...out.data, rewards, coins, contrast, subs, clip, card } });
 		} catch (error) {
 			return fail(res, 'Answer', error);
 		}
@@ -775,10 +853,13 @@ export function registerRunRoutes(router: any, context: any) {
 				const once = items.filter((it) => (seen.has(it.clip_id) ? false : (seen.add(it.clip_id), true)));
 				review = reviewOfRun(once, await poolsOf(database, g, once.map((it) => it.lesson_id || run.lesson_id)), run.lesson_id);
 			}
+			// What the run's Ngôi sao did: Kim cương won and lost, and the starred questions that were wrong (to hear again)
+			const starsDone = await starSummary(database, run.id);
 			return res.json({
 				success: true,
 				data: {
 					mode, summary, time_ms: timeMs, passed: closed.ok, weakest, xp, coins, rewards, review,
+					stars: starsDone.used ? starsDone : null,
 					skill: skill ? { slug: skill.slug, name: skill.name } : null,
 				},
 			});
@@ -886,7 +967,7 @@ export function registerRunRoutes(router: any, context: any) {
 				{ restart: !!req.body?.restart, extra: { challenge_id: c.id }, valid: (its) => its.map((it) => it.clip_id).join() === order });
 			if (!run) return res.status(409).json({ success: false, code: 'EMPTY_LESSON' });
 			const g = await loadLessonGraph(req, context);
-			return res.json({ success: true, data: await runOut(database, g, run) });
+			return res.json({ success: true, data: await runOut(database, g, run, gemsOn('stars', req.accountability)) });
 		} catch (error) {
 			if (error instanceof CoinError) return coinFail(res, error);
 			return fail(res, 'Start challenge', error);
@@ -1080,7 +1161,7 @@ export function registerRunRoutes(router: any, context: any) {
 				() => [{ clip_id: it.id, lesson_id: it.lesson_id, phase: 'practice' as const, format: bankFormat(clip, Math.floor(Math.random() * 3)), result: null }],
 				{ restart: !!req.body?.restart, extra: { practice_id: it.practice_id, clip_id: it.id }, match: { clip_id: it.id } });
 			if (!run) return res.status(409).json({ success: false, code: 'EMPTY_LESSON' });
-			return res.json({ success: true, data: await runOut(database, g, run) });
+			return res.json({ success: true, data: await runOut(database, g, run, gemsOn('stars', req.accountability)) });
 		} catch (error) {
 			if (error instanceof CoinError) return coinFail(res, error);
 			return fail(res, 'Start bank run', error);

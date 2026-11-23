@@ -13,7 +13,8 @@ export const aiConfigured = () => !!(process.env.AI_BASE_URL && process.env.AI_A
 
 export async function aiJson<T = any>(
 	messages: { role: 'system' | 'user' | 'assistant'; content: string }[],
-	opts: { maxTokens?: number; timeoutMs?: number; temperature?: number; logger?: any } = {},
+	/** think: false turns the model's thinking off (much faster, no reasoning tokens) for plain tasks like sorting into labels */
+	opts: { maxTokens?: number; timeoutMs?: number; temperature?: number; logger?: any; think?: boolean } = {},
 ): Promise<T | null> {
 	if (!aiConfigured()) return null;
 	const base = String(process.env.AI_BASE_URL).replace(/\/+$/, '');
@@ -30,8 +31,9 @@ export async function aiJson<T = any>(
 				temperature: opts.temperature ?? 0.2,
 				// The model thinks first (reasoning_content) and that counts against max_tokens: with a
 				// tight limit the answer is empty or cut off. Leave room for the thinking.
-				max_tokens: (opts.maxTokens ?? 800) + REASONING_ROOM,
+				max_tokens: (opts.maxTokens ?? 800) + (opts.think === false ? 0 : REASONING_ROOM),
 				response_format: { type: 'json_object' },
+				...(opts.think === false ? { thinking: { type: 'disabled' } } : {}),
 			}),
 		});
 		if (!res.ok) {

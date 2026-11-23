@@ -13,7 +13,7 @@ import { readdirSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import {
 	MIXED, RUN, acceptOf, choicesFor, drawLesson, drawMixed, drawReview, drawTest, fitsLesson, fitsMixed, formatFor, isRight, passed, practiceOf, reviewOfValue,
-	summaryOf, tilesFor, weakestForms, withRetry,
+	MASK, maskForAsk, maskWords, summaryOf, tilesFor, weakestForms, withRetry,
 	type PoolClip, type PracticeStep, type RunItem,
 } from '../src/lib/runs';
 import { gradeOf, masteryOf, schedule } from '../src/lib/review';
@@ -798,5 +798,53 @@ describe('wrong answers for a pronoun with an ending', () => {
 		assert.deepEqual(contractionMixUps("You'll"), ['You', "You're", "You'd"]);
 		assert.deepEqual(mixUps("and he'll go"), ['and he go', "and he's go", "and he'd go"]);
 		assert.equal(contractionMixUps('will'), null);
+	});
+});
+
+describe('masking an item before it is answered (T1.0)', () => {
+	const clip = (over: Record<string, unknown> = {}) => ({
+		answer: 'I want to go', focus: null as string | null, transcript: 'So I want to go home.',
+		cues: [{ start: 0, text: 'So I want' }, { start: 1, text: 'to go home.' }] as { start: number; text: string }[] | null,
+		lines: null as { start: number; text: string }[] | null, ...over,
+	});
+	test('maskWords keeps the number of words', () => {
+		assert.equal(maskWords('talk to him'), `${MASK} ${MASK} ${MASK}`);
+		assert.equal(maskWords('  '), '');
+	});
+	test('a typed answer: every word of the answer is masked, the words around it are not', () => {
+		const out = maskForAsk(clip(), 'type');
+		assert.equal(out.answer, `${MASK} ${MASK} ${MASK} ${MASK}`);
+		assert.equal(out.transcript, `So [${MASK} ${MASK} ${MASK} ${MASK}] home.`);
+		assert.deepEqual(out.cues!.map((c) => c.text), [`So ${MASK} ${MASK}`, `${MASK} ${MASK} home.`]);
+	});
+	test('a gap asks only the part with the rule: the rest of the answer stays', () => {
+		const out = maskForAsk(clip({ focus: 'want to' }), 'gap');
+		assert.equal(out.answer, `I ${MASK} ${MASK} go`);
+		assert.equal(out.focus, `${MASK} ${MASK}`);
+		assert.equal(out.transcript, `So [I ${MASK} ${MASK} go] home.`);
+	});
+	test('the team brackets win over the first place the words appear', () => {
+		const out = maskForAsk(clip({ answer: 'to', focus: null, transcript: 'I want to go to [to] the shop', cues: null }), 'type');
+		assert.equal(out.transcript, `I want to go to [${MASK}] the shop`);
+	});
+	test('nothing of the answer is left in what the page gets', () => {
+		for (const format of ['type', 'gap', 'choice', 'bank']) {
+			const out = maskForAsk(clip({ focus: 'want to' }), format);
+			const seen = JSON.stringify(out).toLowerCase();
+			const target = format === 'type' ? ['want', 'go'] : ['want'];
+			for (const w of target) assert.equal(seen.includes(w), false, `${format}: "${w}" is in ${seen}`);
+		}
+	});
+	test('an answer that is not in the transcript: no transcript, no lines', () => {
+		const out = maskForAsk(clip({ transcript: 'Something else entirely.', lines: [{ start: 0, text: 'Something else' }] }), 'type');
+		assert.equal(out.transcript, null);
+		assert.equal(out.cues, null);
+		assert.equal(out.lines, null);
+		assert.equal(out.answer, `${MASK} ${MASK} ${MASK} ${MASK}`);
+	});
+	test('punctuation and an apostrophe do not hide a word from the mask', () => {
+		const out = maskForAsk(clip({ answer: "it's here", transcript: "Well, it's here!", cues: null }), 'type');
+		assert.equal(out.transcript, `Well, [${MASK} ${MASK}]!`.replace(']!', ']!'));
+		assert.equal(JSON.stringify(out).includes('here'), false);
 	});
 });

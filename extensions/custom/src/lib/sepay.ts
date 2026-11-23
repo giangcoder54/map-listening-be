@@ -1,4 +1,5 @@
 import { pickPaymentCode } from '../v1/paymentCode'
+import { creditCoinOrder } from './gemOrders'
 
 export type SettleResult = 'activated' | 'already-settled' | 'no-match' | 'underpaid' | 'expired' | 'ignored'
 
@@ -96,6 +97,11 @@ export async function settleSepayTransaction(tx: SepayTxInput, context: any): Pr
 
   if (!updatedIds || updatedIds.length === 0)
     return 'already-settled'
+
+  // A Kim cuong top-up: pay the coins now (once per order); the update hook would do it too
+  if (order.product_type === 'coins') {
+    await creditCoinOrder(context.database, order.id).catch((error: any) => logger.error(`[SePay] Credit of order ${paymentCode} failed: ${String(error)}`))
+  }
 
   logger.info(`[SePay] Kích hoạt thành công đơn ${paymentCode}`)
   notifyAdmin(`✅ Thanh toán tự động qua SePay THÀNH CÔNG\nĐơn: ${paymentCode}\nSố tiền: ${amountIn.toLocaleString('vi-VN')}đ`)

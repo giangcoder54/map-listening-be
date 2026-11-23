@@ -519,3 +519,102 @@ export function summaryOf(items: RunItem[]) {
 		finished: items.length > 0 && items.every((it) => it.result),
 	};
 }
+
+// ── What the page may know before an answer (web repo docs/xu-v2-tasks.md T1.0) ──────────────
+// Until an item is answered the page gets the words to type or pick masked: each word becomes
+// MASK, so the blank keeps its size (how many words) but not its letters. The answer route sends
+// the clip in full once the item is answered. Without this, the answer could be read in the
+// browser's network tab, and with Ngôi sao (stars) a right answer wins Kim cương.
+
+export const MASK = '•••';
+/** One MASK per word */
+export const maskWords = (s: string) => s.split(/\s+/).filter(Boolean).map(() => MASK).join(' ');
+/** A word as compared: lower case, no punctuation or brackets (it's = it's, "Hello," = hello) */
+const bare = (w: string) => w.toLowerCase().replace(/[’`]/g, "'").replace(/[^a-z0-9']+/g, '');
+/** A word with its letters masked, its brackets and punctuation kept ("[want" -> "[•••") */
+const maskToken = (t: string) => {
+	const m = /^([^A-Za-z0-9'’]*)(.*?)([^A-Za-z0-9'’]*)$/.exec(t);
+	return m && m[2] ? `${m[1]}${MASK}${m[3]}` : t;
+};
+
+type Tok = { text: number; at: number; word: string; inBracket: boolean };
+/** The words of several texts in order, each knowing its text, its place and whether it sits in [brackets] */
+function tokensOf(texts: string[]): Tok[] {
+	const out: Tok[] = [];
+	let open = false;
+	texts.forEach((t, ti) => {
+		t.split(/(\s+)/).forEach((piece, at) => {
+			if (!piece.trim()) return;
+			const starts = piece.includes('[');
+			const inBracket = open || starts;
+			if (starts) open = true;
+			if (piece.includes(']')) open = false;
+			out.push({ text: ti, at, word: piece, inBracket });
+		});
+	});
+	return out;
+}
+
+/**
+ * Mask the words of `target` where they are said in `texts` (one text, or subtitle lines). The
+ * occurrence in [brackets] wins, else the n-th one (`nth`, as found in the transcript), else
+ * the first. Returns the texts (unchanged when the words are not found) and whether it masked.
+ */
+export function maskIn(texts: string[], target: string, nth = 0): { texts: string[]; masked: boolean; nth: number } {
+	const want = target.split(/\s+/).map(bare).filter(Boolean);
+	if (!want.length) return { texts, masked: false, nth: 0 };
+	const toks = tokensOf(texts).filter((t) => bare(t.word));
+	const hits: number[] = [];
+	for (let i = 0; i + want.length <= toks.length; i++) {
+		if (want.every((w, k) => bare(toks[i + k]!.word) === w)) hits.push(i);
+	}
+	if (!hits.length) return { texts, masked: false, nth: 0 };
+	const inside = hits.findIndex((i) => toks[i]!.inBracket);
+	const pick = inside >= 0 ? inside : Math.min(nth, hits.length - 1);
+	const start = hits[pick]!;
+	const pieces = texts.map((t) => t.split(/(\s+)/));
+	for (let k = 0; k < want.length; k++) {
+		const t = toks[start + k]!;
+		pieces[t.text]![t.at] = maskToken(pieces[t.text]![t.at]!);
+	}
+	return { texts: pieces.map((p) => p.join('')), masked: true, nth: pick };
+}
+
+type Shown = { answer?: string | null; focus?: string | null; transcript?: string | null; cues?: { start: number; text: string }[] | null; lines?: { start: number; text: string }[] | null };
+
+/**
+ * The clip of an item not answered yet, as the page may see it. `format`: the item's format
+ * ('type' asks the whole answer; gap, choice and bank ask its part with the rule, targetOf).
+ * The transcript gets its [blank] here (the page's clozeOf would put it around the answer).
+ * Subtitle lines and the video's lines that cannot be masked are left out (null): the page
+ * then times the masked transcript itself.
+ */
+export function maskForAsk<T extends Shown>(clip: T, format: string): T {
+	const answer = String(clip.answer || '');
+	const focus = String(clip.focus || '').trim() || null;
+	const target = format === 'type' || !focusFits({ answer, focus }) ? answer : focus!;
+	if (!target.trim()) return { ...clip, answer: answer ? maskWords(answer) : answer, focus: focus ? maskWords(focus) : focus, transcript: null, cues: null, lines: null };
+	const masked = maskIn([answer], target);
+	const answerOut = masked.masked ? masked.texts[0]! : maskWords(answer);
+	const focusOut = focus ? (target === focus ? maskWords(focus) : maskWords(focus)) : null;
+
+	// The transcript, with the answer in [brackets] as the page shows it
+	let transcript = String(clip.transcript || '');
+	let nth = 0;
+	if (transcript && !transcript.includes('[') && answer) {
+		const esc = answer.replace(/[.*+?^${}()|[\]\x5c]/g, '\x5c$&').replace(/\s+/g, '\x5cs+');
+		transcript = transcript.replace(new RegExp(`(${esc})`, 'i'), '[$1]');
+	}
+	let transcriptOut: string | null = null;
+	if (transcript.includes('[')) {
+		const m = maskIn([transcript], target);
+		if (m.masked) { transcriptOut = m.texts[0]!; nth = m.nth; }
+	}
+	const linesOf = (list: { start: number; text: string }[] | null | undefined) => {
+		if (!list?.length) return list ?? null;
+		if (!transcriptOut) return null;
+		const m = maskIn(list.map((c) => String(c.text || '')), target, nth);
+		return m.masked ? list.map((c, i) => ({ ...c, text: m.texts[i]! })) : null;
+	};
+	return { ...clip, answer: answerOut, focus: focusOut, transcript: transcriptOut, cues: linesOf(clip.cues), lines: linesOf(clip.lines) };
+}

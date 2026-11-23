@@ -3,13 +3,17 @@
  * row (Directus admin, a singleton), else the env var, else the default below, so the
  * admin can change them without restarting anything. See docs/growth-roadmap.md in the web repo.
  */
-type Settings = Record<string, string | number | null>;
+import { applyCoinSettings } from './coins';
+import { isStaff } from './staff';
+
+type Settings = Record<string, any>;
 let settings: Settings = {};
 
 /** Re-read growth_settings (on start, every minute and after an admin edit, see hook/index.ts) */
 export async function refreshGrowthConfig(database: any, logger?: any) {
 	try {
 		settings = (await database('growth_settings').first()) || {};
+		applyCoinSettings(settings.coin_settings);
 	} catch (error) {
 		logger?.warn?.(`[growth] growth_settings not loaded, using env: ${String(error)}`);
 	}
@@ -58,6 +62,29 @@ export const growthConfig = () => ({
 	phraseAiChecksFree: num('phrase_ai_checks_free', 'PHRASE_AI_CHECKS_FREE', 200, 0, 10000),
 	phraseAiChecksPremium: num('phrase_ai_checks_premium', 'PHRASE_AI_CHECKS_PREMIUM', 200, 0, 10000),
 });
+
+/** The parts of Kim cương v2 that can be switched on one by one (web repo docs/xu-v2-tasks.md) */
+export const GEMS_FEATURES = ['stars', 'cards', 'chests', 'purchase', 'share', 'help', 'rooms'] as const;
+export type GemsFeature = (typeof GEMS_FEATURES)[number];
+export type GemsFlag = 'off' | 'staff' | 'all';
+
+/** growth_settings.gems_flags, an object or its JSON text; a feature not set is off */
+export function gemsFlags(): Record<GemsFeature, GemsFlag> {
+	let o: any = settings.gems_flags;
+	if (typeof o === 'string') { try { o = JSON.parse(o); } catch { o = null; } }
+	const out = {} as Record<GemsFeature, GemsFlag>;
+	for (const f of GEMS_FEATURES) {
+		const v = o && typeof o === 'object' ? o[f] : null;
+		out[f] = v === 'all' || v === 'staff' ? v : 'off';
+	}
+	return out;
+}
+
+/** Is this Kim cương v2 feature on for this request? "staff" = admins and content editors only */
+export const gemsOn = (feature: GemsFeature, accountability: any) => {
+	const flag = gemsFlags()[feature];
+	return flag === 'all' || (flag === 'staff' && isStaff(accountability));
+};
 
 /** Site origin for links shown to users (invite link...) */
 export const siteOrigin = () =>

@@ -1,5 +1,5 @@
 -- Intensive Listening: why a learner missed words, explained by the AI (lib/ilExplain.ts).
---   il_explain   one row per sentence, typed answer (its words, lower case) and language: { items: [{ word, heard, ipa_word, ipa_heard, why, tip }] }.
+--   il_explain   one row per sentence, typed answer (its words, lower case) and language: { items: [{ word, heard, ipa_word, ipa_heard, diff, why }] }, one per missed word.
 --                Kept so the same typed answer is never sent to the AI twice.
 CREATE TABLE IF NOT EXISTS il_explain (
 	id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
