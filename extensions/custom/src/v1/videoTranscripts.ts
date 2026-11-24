@@ -4,6 +4,8 @@
  *
  *   POST /youtube/transcript           { youtube_video_id | url, refresh? }  stored one, else from YouTube
  *   POST /youtube/library/add          { url | urls[] }  add videos, no lesson needed (English transcript required)
+ *   POST /youtube/library/add-with-transcript  { url, transcript: [{text,start,end}] }  add a video with a transcript made by hand
+ *   POST /youtube/download            { url | youtube_video_id, audio? }  the video (mp4) or its audio (m4a) as a file
  *   POST /youtube/transcripts/index    { limit? }  fetch the next videos never fetched yet
  *   POST /youtube/transcripts/kinds    { limit? }  fill transcript_kind / _lang of videos fetched
  *                                      before those were kept (the transcript stays as it is)
@@ -16,7 +18,7 @@
  * (YouTube's automatic ones), 'none' (no English subtitles); NULL = not known.
  */
 import type { Router } from 'express';
-import { extractVideoId, fetchCaptions, fetchPlayer, getVideoMeta, pickCaptionTrack } from './youtube';
+import { extractVideoId, fetchCaptions, fetchPlayer, getVideoMeta, openVideoStream, pickCaptionTrack } from './youtube';
 import { isStaff } from '../lib/staff';
 import { tagNewVideos } from '../lib/videoTags';
 
@@ -150,6 +152,77 @@ export function handleVideoTranscripts(router: Router, context: any) {
 		const fresh = results.filter((r) => r.status === 'added' || r.status === 'transcript_added').map((r) => r.video?.id).filter(Boolean);
 		if (fresh.length) void tagNewVideos(database, fresh, logger);
 		return res.json({ success: true, data: results });
+	});
+
+	// Put a video in the library with a transcript the admin made (a song with no subtitles, hand-timed
+	// in CapCut...). A video already in the library gets this transcript instead of its own.
+	router.post('/youtube/library/add-with-transcript', async (req: any, res: any) => {
+		if (adminOnly(req, res)) return;
+		const body = req.body || {};
+		const input = String(body.youtube_video_id || body.url || '').trim();
+		const videoId = /^[\w-]{11}$/.test(input) ? input : extractVideoId(input);
+		if (!videoId || !/^[\w-]{11}$/.test(videoId)) return res.status(400).json({ success: false, message: 'Invalid YouTube URL.' });
+		const lines: Line[] = (Array.isArray(body.transcript) ? body.transcript : [])
+			.map((l: any) => ({ text: String(l?.text ?? '').replace(/\s+/g, ' ').trim().slice(0, 500), start: Math.round(Number(l?.start)), end: Math.round(Number(l?.end)) }))
+			.filter((l: Line) => l.text && Number.isFinite(l.start) && Number.isFinite(l.end) && l.start >= 0)
+			.map((l: Line) => ({ ...l, end: l.end > l.start ? l.end : l.start + 1000 }))
+			.sort((a: Line, b: Line) => a.start - b.start);
+		if (!lines.length) return res.status(400).json({ success: false, message: 'No subtitle lines found in the file.' });
+		if (lines.length > 3000) return res.status(400).json({ success: false, message: 'Too many subtitle lines (3000 at most).' });
+		try {
+			const { data } = await fetchPlayer(videoId, logger);
+			const meta = data ? getVideoMeta(data, videoId) : null;
+			if (!meta) return res.status(404).json({ success: false, message: 'Video not found or unavailable.' });
+			const row = await database('source_videos').select(VIDEO_FIELDS).where('youtube_video_id', videoId).first();
+			const now = new Date();
+			const kind = { transcript_kind: 'manual', transcript_lang: 'en' };
+			let id = row?.id;
+			if (id) {
+				await database('source_videos').where('id', id).update({ transcript: JSON.stringify(lines), transcript_updated_at: now, ...kind });
+			} else {
+				const schema = await context.getSchema();
+				const videos = new context.services.ItemsService('source_videos', { schema, accountability: req.accountability });
+				const { duration, ...rest } = meta;
+				id = await videos.createOne({ ...rest, transcript: lines, transcript_updated_at: now, ...kind });
+				void tagNewVideos(database, [id], logger);
+			}
+			return res.json({ success: true, data: { status: row ? 'transcript_added' : 'added', lines: lines.length, video: { id, ...meta } } });
+		} catch (e: any) {
+			logger.error(`[youtube/library/add-with-transcript] ${videoId}: ${e?.stack || e?.message}`);
+			return res.status(500).json({ success: false, message: 'Could not add the video.' });
+		}
+	});
+
+	// Download a video (or its audio) to the admin's computer. Streamed in pieces, so a big file
+	// is never held in memory.
+	router.post('/youtube/download', async (req: any, res: any) => {
+		if (adminOnly(req, res)) return;
+		const body = req.body || {};
+		const input = String(body.youtube_video_id || body.url || '').trim();
+		const videoId = /^[\w-]{11}$/.test(input) ? input : extractVideoId(input);
+		if (!videoId || !/^[\w-]{11}$/.test(videoId)) return res.status(400).json({ success: false, message: 'Invalid YouTube URL.' });
+		try {
+			const s = await openVideoStream(videoId, logger, !!body.audio);
+			if (!s) return res.status(404).json({ success: false, message: 'Video not found or unavailable.' });
+			if ('error' in s) return res.status(422).json({ success: false, message: s.error });
+			const name = `${s.title.replace(/[<>:"/\\|?*\x00-\x1f]/g, '').replace(/\s+/g, ' ').trim().slice(0, 100) || 'video'} [${videoId}].${s.ext}`;
+			res.status(200);
+			res.setHeader('Content-Type', s.contentType);
+			res.setHeader('Content-Length', String(s.size));
+			res.setHeader('Content-Disposition', `attachment; filename="${videoId}.${s.ext}"; filename*=UTF-8''${encodeURIComponent(name)}`);
+			res.setHeader('Access-Control-Expose-Headers', 'Content-Disposition, Content-Length');
+			let closed = false;
+			res.on('close', () => { closed = true; });
+			for await (const chunk of s.body()) {
+				if (closed) break;
+				if (!res.write(chunk)) await new Promise((r) => { res.once('drain', r); res.once('close', r); });
+			}
+			res.end();
+		} catch (e: any) {
+			logger.error(`[youtube/download] ${videoId}: ${e?.message}`);
+			if (!res.headersSent) return res.status(500).json({ success: false, message: 'Could not download the video.' });
+			res.destroy();
+		}
 	});
 
 	// Videos fetched before transcript_kind was kept: read which subtitles they have, without

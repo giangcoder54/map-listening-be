@@ -11,12 +11,13 @@ import { COIN, CoinError, earnCoins, lockPurse, spend } from './coins';
 import { secureRand } from './chests';
 import { vnDay } from './days';
 import { BASE_LANG } from './extensive';
+import { isEstablished } from './trust';
 
 export const FEES = [10, 20, 50, 100];
 const DAY_MS = 86400_000;
 
 export class RoomError extends Error {
-	constructor(public code: 'BAD_REQUEST' | 'NOT_ENOUGH' | 'NO_ROOM' | 'FULL' | 'JOINED' | 'NOT_MEMBER' | 'NOT_PLAYING' | 'DONE' | 'NO_QUESTIONS' | 'TOO_MANY') { super(code); }
+	constructor(public code: 'BAD_REQUEST' | 'NOT_ENOUGH' | 'NO_ROOM' | 'FULL' | 'JOINED' | 'NOT_MEMBER' | 'NOT_PLAYING' | 'DONE' | 'NO_QUESTIONS' | 'TOO_MANY' | 'NEW_ACCOUNT') { super(code); }
 }
 
 export type Member = { user_id: string; score: number | null; time_ms: number | null };
@@ -34,7 +35,10 @@ export function split(members: Member[], fee: number, rakePct: number) {
 }
 
 async function questionIds(trx: any, n: number) {
-	const rows = await trx('dyk_cards').where('status', 'approved').pluck('id');
+	// Cards already shown on the landing have their answer known to whoever answered them that day: those
+	// only when too few others are left
+	const unseen = await trx('dyk_cards').where('status', 'approved').whereNotIn('id', trx('dyk_schedule').select('card_id').where('day', '<=', vnDay())).pluck('id');
+	const rows = unseen.length >= n ? unseen : await trx('dyk_cards').where('status', 'approved').pluck('id');
 	const pool = [...rows];
 	for (let i = pool.length - 1; i > 0; i--) { const j = secureRand(i + 1); [pool[i], pool[j]] = [pool[j], pool[i]]; }
 	return pool.slice(0, n) as string[];
@@ -43,6 +47,7 @@ async function questionIds(trx: any, n: number) {
 export async function createRoom(db: any, userId: string, o: { fee: number; size: number; today?: string }) {
 	if (!FEES.includes(o.fee) || (o.size !== 2 && o.size !== 3)) throw new RoomError('BAD_REQUEST');
 	const today = o.today || vnDay();
+	if (o.fee > 0 && !(await isEstablished(db, userId))) throw new RoomError('NEW_ACCOUNT');
 	return db.transaction(async (trx: any) => {
 		await lockPurse(trx, userId);
 		// One waiting room each: stops a learner from filling the list
@@ -72,6 +77,8 @@ export async function joinRoom(db: any, userId: string, roomId: string, today = 
 		if (await trx('room_members').where({ room_id: roomId, user_id: userId }).first('user_id')) throw new RoomError('JOINED');
 		const n = Number((await trx('room_members').where('room_id', roomId).count('* as n').first())?.n) || 0;
 		if (n >= room.size) throw new RoomError('FULL');
+		// A paid room moves Kim cương between players: not from a throwaway account (lib/trust.ts)
+		if (room.fee > 0 && !(await isEstablished(trx, userId))) throw new RoomError('NEW_ACCOUNT');
 		await pay(trx, userId, roomId, room.fee, today);
 		await trx('room_members').insert({ room_id: roomId, user_id: userId });
 		if (n + 1 >= room.size) await trx('rooms').where('id', roomId).update({ status: 'playing', deadline: new Date(Date.now() + DAY_MS) });

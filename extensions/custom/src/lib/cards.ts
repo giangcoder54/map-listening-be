@@ -152,9 +152,8 @@ export async function drawView(db: any, d: any, lang: string) {
 	const reward = rewardView(card?.reward);
 	const base: any = { id: d.id, day: typeof d.day === 'string' ? d.day : new Date(d.day).toISOString().slice(0, 10), kind: d.kind, type: card?.type, difficulty: card?.difficulty, status: d.status, reward };
 	if (d.kind === 'dare') {
-		const short = lang.slice(0, 2);
-		const tr = (await db('card_translations').where('card_id', d.card_id).whereIn('lang', [short, 'vi']).select('lang', 'title', 'body')) as any[];
-		const t = tr.find((x) => x.lang === short) || tr.find((x) => x.lang === 'vi');
+		const tr = (await db('card_translations').where('card_id', d.card_id).whereIn('lang', [lang, BASE_LANG]).select('lang', 'title', 'body')) as any[];
+		const t = tr.find((x) => x.lang === lang) || tr.find((x) => x.lang === BASE_LANG);
 		return { ...base, title: t?.title || '', body: t?.body || '', progress: Number(d.progress) || 0, goal_n: Number(d.goal_n) || 0 };
 	}
 	const answered = d.status === 'done' || d.correct !== null;

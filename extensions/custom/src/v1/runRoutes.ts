@@ -208,6 +208,14 @@ function reviewOfRun(items: RunItem[], pools: Map<string, Pool>, fallbackLessonI
 	});
 }
 
+/** Clips this learner has answered (or looked at the answer of) before, among `clipIds` */
+async function answeredClips(db: any, userId: string, clipIds: string[]) {
+	const ids = [...new Set(clipIds)];
+	if (!ids.length) return new Set<string>();
+	const rows = await db('listening_attempts').distinct('clip_id').where('user_id', userId).whereIn('clip_id', ids);
+	return new Set<string>(rows.map((r: any) => String(r.clip_id)));
+}
+
 /** The run as the page plays it. Every item keeps its index, whatever the page skips. */
 async function runOut(database: any, g: LessonGraph, run: any, starsOn = false) {
 	const items: RunItem[] = run.items || [];
@@ -233,6 +241,8 @@ async function runOut(database: any, g: LessonGraph, run: any, starsOn = false) 
 		const n = (code: string) => Number(held.find((h: any) => h.item_code === code)?.n) || 0;
 		stars = { per_run: perRun, used, left: Math.max(0, perRun - used), items: { shield: n('shield'), gold_star: n('gold_star'), extra_star: n('extra_star') } };
 	}
+	// A question answered before (this run or another, the answer then shown) cannot take a star: the bet would be sure
+	const seen = stars ? await answeredClips(database, run.user_id, items.map((it) => it.clip_id)) : null;
 	const lesson = run.lesson_id ? g.lessonById.get(run.lesson_id) : null;
 	const skill = run.skill_id ? g.skillById.get(run.skill_id) : null;
 	// A lesson's practice steps may carry their own question: read live, so an edit shows at once
@@ -254,6 +264,7 @@ async function runOut(database: any, g: LessonGraph, run: any, starsOn = false) 
 		skill: skill ? { slug: skill.slug, name: skill.name } : null,
 		items: items.map((it, i) => {
 			const out = pools.get(it.lesson_id || run.lesson_id)?.payload(it, i);
+			if (out && seen?.has(it.clip_id)) out.star_ok = false;
 			// lesson_id: where a "report a problem" on the item is filed (reviews and tests mix lessons)
 			// The question of a practice step, and of its retry (same clip)
 			const prompt = it.phase === 'practice' || it.phase === 'retry' ? prompts.get(it.clip_id) || null : null;
@@ -511,6 +522,8 @@ export function registerRunRoutes(router: any, context: any) {
 					if (body.star !== 'normal' && body.star !== 'gold') return { status: 409 as const, code: 'STAR_KIND' };
 					const check = starCheck({ on: gemsOn('stars', req.accountability), userId: learner.userId, mode: run.mode, phase: item.phase, tries: Number(item.tries) || 0, used: await starsUsed(trx, run.id), perRun: COIN.star.perRun + (Number(run.extra_stars) || 0) });
 					if (!check.ok) return { status: 409 as const, code: check.code };
+					// Answered before: the answer was shown then, so the bet would be sure
+					if ((await answeredClips(trx, learner.userId!, [item.clip_id])).size) return { status: 409 as const, code: 'STAR_SEEN' };
 					starWorth = starValue(clipRow.difficulty, item.format);
 					if (!(await canAfford(trx, learner.userId!, starWorth))) return { status: 409 as const, code: 'STAR_POOR' };
 					if (body.star === 'gold') {
@@ -785,12 +798,20 @@ export function registerRunRoutes(router: any, context: any) {
 					const graph = await loadLessonGraph(req, context);
 					const lessonRow = graph.lessonById.get(run.lesson_id);
 					const paid = !!lessonRow && graph.isPremiumContent(lessonRow);
-					const first = await earn('lesson', paid ? COIN.earn.lessonPremium : COIN.earn.lesson, `lesson:${run.lesson_id}`, run.lesson_id);
-					if (summary.perfect) await earn('perfect', paid ? COIN.earn.perfectPremium : COIN.earn.perfect, `perfect:${run.lesson_id}`, run.lesson_id);
-					// A lesson done again still pays, much less: the first go of the day, then a little for each
+					// Kim cương only for a run really heard: enough answers right without a hint (a run clicked through on
+					// hints pays nothing, and leaves the lesson's key unused for a real go later)
+					const learned = summary.total > 0 && summary.right * 100 >= summary.total * COIN.earn.learnedPct;
+					const first = learned ? await earn('lesson', paid ? COIN.earn.lessonPremium : COIN.earn.lesson, `lesson:${run.lesson_id}`, run.lesson_id) : null;
+					if (learned && summary.perfect) await earn('perfect', paid ? COIN.earn.perfectPremium : COIN.earn.perfect, `perfect:${run.lesson_id}`, run.lesson_id);
+					// A lesson done again still pays, much less: the first go of the day, then a little, at most replayLaterMax
+					// a day per lesson (the key holds the count, so two finishes at once pay one)
 					if (first && !first.wanted) {
 						const again = await earn('replay', COIN.earn.replay, `replay:${run.lesson_id}:${today}`, run.lesson_id);
-						if (again && !again.wanted) await earn('replay', COIN.earn.replayLater, `replay:${run.lesson_id}:${today}:${run.id}`, run.lesson_id);
+						if (again && !again.wanted) {
+							const later = Number((await database('coin_events').where({ user_id: userId, reason: 'replay', lesson_id: run.lesson_id, day: today }).count('* as n').first())?.n) || 0;
+							// `later` counts the first go of the day too
+							if (later - 1 < COIN.earn.replayLaterMax) await earn('replay', COIN.earn.replayLater, `replay:${run.lesson_id}:${today}:later${later}`, run.lesson_id);
+						}
 					}
 				} else if (mode === 'lesson_test' && closed.ok) {
 					await database.transaction(async (trx: any) => {

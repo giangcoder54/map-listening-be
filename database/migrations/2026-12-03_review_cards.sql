@@ -53,7 +53,7 @@ END $$ LANGUAGE plpgsql;
 CREATE OR REPLACE FUNCTION review_card_drop() RETURNS trigger AS $$
 BEGIN
 	DELETE FROM review_cards WHERE ref_id = OLD.id AND kind = CASE TG_TABLE_NAME
-		WHEN 'user_words' THEN 'word' WHEN 'il_sentences' THEN 'sentence' WHEN 'listening_lessons' THEN 'form' ELSE OLD.kind END;
+		WHEN 'user_words' THEN 'word' WHEN 'il_sentences' THEN 'sentence' WHEN 'listening_lessons' THEN 'form' ELSE to_jsonb(OLD)->>'kind' END;
 	RETURN OLD;
 END $$ LANGUAGE plpgsql;
 DROP TRIGGER IF EXISTS user_words_card_add ON user_words;

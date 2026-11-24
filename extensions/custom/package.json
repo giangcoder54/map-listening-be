@@ -41,6 +41,7 @@
 		"test:xp": "esbuild test/xp.test.ts --bundle --platform=node --format=esm --outfile=test/.out/xp.test.mjs --log-level=warning && docker exec map-listening-api node --test /directus/extensions/custom/test/.out/xp.test.mjs",
 		"test:gems": "esbuild test/gems.test.ts --bundle --platform=node --format=esm --outfile=test/.out/gems.test.mjs --log-level=warning && docker exec map-listening-api node --test /directus/extensions/custom/test/.out/gems.test.mjs",
 		"test:gems2": "esbuild test/gems2.test.ts --bundle --platform=node --format=esm --outfile=test/.out/gems2.test.mjs --log-level=warning && docker exec map-listening-api node --test /directus/extensions/custom/test/.out/gems2.test.mjs",
+		"test:presence": "esbuild test/presence.test.ts --bundle --platform=node --format=esm --outfile=test/.out/presence.test.mjs --log-level=warning && docker exec map-listening-api node --test /directus/extensions/custom/test/.out/presence.test.mjs",
 		"test:stars": "esbuild test/stars.test.ts --bundle --platform=node --format=esm --outfile=test/.out/stars.test.mjs --log-level=warning && docker exec map-listening-api node --test /directus/extensions/custom/test/.out/stars.test.mjs",
 		"test:runs": "esbuild test/runs.test.ts --bundle --platform=node --format=esm --outfile=test/.out/runs.test.mjs --log-level=warning && docker exec map-listening-api node --test /directus/extensions/custom/test/.out/runs.test.mjs"
 	},

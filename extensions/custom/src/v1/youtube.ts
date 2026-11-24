@@ -77,7 +77,7 @@ const CLIENTS: Record<ClientType, { context: any; headers: Record<string, string
  * Gọi InnerTube player endpoint, thử lần lượt các client cho tới khi lấy được videoDetails.
  * Log chi tiết mọi bước để debug được trên server (docker logs map-listening-api).
  */
-export async function fetchPlayer(videoId: string, logger: any): Promise<{ data: any; clientType: ClientType | null; reason: string }> {
+export async function fetchPlayer(videoId: string, logger: any, needStream = false): Promise<{ data: any; clientType: ClientType | null; reason: string }> {
   const order: ClientType[] = ["ANDROID", "IOS", "WEB"];
   let lastReason = "unknown";
 
@@ -126,8 +126,15 @@ export async function fetchPlayer(videoId: string, logger: any): Promise<{ data:
         `[youtube] player client=${clientType} playabilityStatus=${status} reason="${reason}" hasVideoDetails=${hasDetails} (${Date.now() - started}ms)`
       );
 
-      if (hasDetails) {
+      // To download, the client must also give direct stream URLs (the WEB one often does not)
+      const sd = data?.streamingData;
+      const hasStream = [...(sd?.formats || []), ...(sd?.adaptiveFormats || [])].some((f: any) => f.url);
+      if (hasDetails && (!needStream || hasStream)) {
         return { data, clientType, reason: "" };
+      }
+      if (hasDetails) {
+        lastReason = `${status} - no direct stream URL`;
+        continue;
       }
 
       lastReason = `${status}${reason ? ` - ${reason}` : ""}`;
@@ -151,6 +158,49 @@ export function getVideoMeta(data: any, videoId: string) {
     channel_name: details.author,
     thumbnail_url: details.thumbnail?.thumbnails?.at(-1)?.url,
     duration: details.lengthSeconds ? parseInt(details.lengthSeconds) : undefined,
+  };
+}
+
+/**
+ * A video (or just its audio) to download. Video = the best ready-made mp4 (audio + video in
+ * one, usually 360p); audio = the best m4a. Returns null when YouTube cannot be read, or
+ * { error } when it has no such stream. The file is read in pieces through the same proxy as
+ * the player call: the stream URL only works from the IP that asked for it.
+ */
+export async function openVideoStream(videoId: string, logger: any, audio = false) {
+  const { data, clientType } = await fetchPlayer(videoId, logger, true);
+  const details = data?.videoDetails;
+  if (!details?.videoId || !clientType) return null;
+  const sd = data.streamingData || {};
+  const num = (x: any) => Number(x) || 0;
+  const mime = (f: any) => String(f.mimeType || "");
+  const pool: any[] = audio
+    ? (sd.adaptiveFormats || []).filter((f: any) => f.url && /^audio\/mp4/.test(mime(f))).sort((a: any, b: any) => num(b.bitrate) - num(a.bitrate))
+    : (sd.formats || []).filter((f: any) => f.url && /^video\/mp4/.test(mime(f)) && /mp4a/.test(mime(f))).sort((a: any, b: any) => num(b.height) - num(a.height));
+  const f = pool[0];
+  const size = num(f?.contentLength);
+  if (!f || !size) return { error: audio ? "This video has no audio stream to download." : "This video has no ready-made mp4 to download." };
+  const ua = CLIENTS[clientType].headers["User-Agent"]!;
+  const CHUNK = 8 * 1024 * 1024;
+  async function* body() {
+    let done = 0;
+    while (done < size) {
+      const end = Math.min(done + CHUNK, size) - 1;
+      const r = await proxiedFetch(f.url, { headers: { "User-Agent": ua, Range: `bytes=${done}-${end}` } });
+      if (!r.ok && r.status !== 206) throw new Error(`HTTP ${r.status} while downloading`);
+      const buf = Buffer.from(await r.arrayBuffer());
+      if (!buf.length) break;
+      done += buf.length;
+      yield buf;
+    }
+  }
+  return {
+    title: String(details.title || videoId),
+    ext: audio ? "m4a" : "mp4",
+    contentType: audio ? "audio/mp4" : "video/mp4",
+    quality: String(f.qualityLabel || f.audioQuality || ""),
+    size,
+    body,
   };
 }
 

@@ -6,6 +6,10 @@
  */
 import { COIN, earnCoins } from './coins';
 import { vnDay } from './days';
+import { isEstablished } from './trust';
+
+/** Rewards a helper can get from one learner a day */
+const HELP_PER_USER_DAY = 3;
 
 export const HINT_KINDS = ['position', 'rule', 'slow', 'letter'] as const;
 export type HintKind = (typeof HINT_KINDS)[number];
@@ -65,8 +69,11 @@ export async function useHint(db: any, userId: string, hintId: string, today = v
 		await trx('help_hints').where('id', hintId).increment('uses', 1);
 		const todayCount = Number((await trx('coin_events').where({ user_id: hint.user_id, reason: 'help', day: today }).count('* as n').first())?.n) || 0;
 		let rewarded = false;
-		if (todayCount < COIN.help.perDay && COIN.help.reward > 0) {
-			const r = await earnCoins(trx, hint.user_id, { reason: 'help', amount: COIN.help.reward, dedupe: `help:${hintId}:${userId}`, meta: { hint_id: hintId } }, today);
+		// Paid only for a use by an established account (lib/trust.ts), and at most HELP_PER_USER_DAY a day from one
+		// learner to one helper: a throwaway account cannot feed its owner's hints
+		const fromThem = todayCount < COIN.help.perDay ? Number((await trx('coin_events').where({ user_id: hint.user_id, reason: 'help', day: today }).whereRaw(`meta->>'from' = ?`, [userId]).count('* as n').first())?.n) || 0 : 0;
+		if (todayCount < COIN.help.perDay && COIN.help.reward > 0 && fromThem < HELP_PER_USER_DAY && (await isEstablished(trx, userId))) {
+			const r = await earnCoins(trx, hint.user_id, { reason: 'help', amount: COIN.help.reward, dedupe: `help:${hintId}:${userId}`, meta: { hint_id: hintId, from: userId } }, today);
 			rewarded = r.added > 0;
 		}
 		return { body: hint.body, kind: hint.kind, rewarded };

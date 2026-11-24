@@ -18,7 +18,8 @@ const int = (v: any, min: number, max: number) => {
 };
 const CARD_KINDS = ['truth', 'dare'];
 const CARD_STATUS = ['draft', 'approved', 'archived'];
-const ITEM_LANGS = ['vi', 'en'];
+// BCP-47, the same codes as locales[].language in nuxt.config.ts; a new language is added here and in the admin page
+const ITEM_LANGS = ['vi-VN', 'en-US'];
 
 export function registerAdminGemsContentRoutes(router: any, context: any) {
 	const { database, logger } = context;

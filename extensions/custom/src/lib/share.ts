@@ -10,6 +10,16 @@ import { readdirSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import { engagementOf } from './xp';
 import { starSummary } from './stars';
+import { BASE_LANG } from './extensive';
+
+/** Badge names in one language; a code with no row there is missing from the map (the caller falls back to badges.name_vi) */
+export async function badgeNames(db: any, codes: string[], lang: string) {
+	const out = new Map<string, string>();
+	if (!codes.length || lang === BASE_LANG) return out;
+	const rows = await db('badge_translations').select('code', 'name').where('lang', lang).whereIn('code', codes);
+	for (const r of rows) if (r.name) out.set(r.code, r.name);
+	return out;
+}
 
 export const SHARE_KINDS = ['badge', 'streak', 'stars', 'level'] as const;
 export type ShareKind = (typeof SHARE_KINDS)[number];
@@ -20,8 +30,13 @@ export const newShareId = () => Array.from(randomBytes(10), (b) => ALPHABET[b % 
 /** The facts of a share, read from the database; null when the learner has no such thing to share */
 export async function shareFacts(db: any, userId: string, kind: ShareKind, ref: string | null) {
 	if (kind === 'badge') {
-		const row = await db('user_badges as ub').join('badges as b', 'b.code', 'ub.badge_code').where({ 'ub.user_id': userId, 'ub.badge_code': ref }).select('b.code', 'b.name_vi', 'b.name_en', 'b.rarity', 'ub.serial_no', 'b.serial_max').first();
-		return row ? { code: row.code, name_vi: row.name_vi, name_en: row.name_en, rarity: row.rarity, serial_no: row.serial_no, serial_max: row.serial_max } : null;
+		const row = await db('user_badges as ub').join('badges as b', 'b.code', 'ub.badge_code').where({ 'ub.user_id': userId, 'ub.badge_code': ref }).select('b.code', 'b.name_vi', 'b.rarity', 'ub.serial_no', 'b.serial_max').first();
+		if (!row) return null;
+		// every language the badge has, so the card can be drawn in the learner's language later
+		const tr = await db('badge_translations').select('lang', 'name').where('code', row.code);
+		const names: Record<string, string> = { [BASE_LANG]: row.name_vi };
+		for (const t of tr) if (t.name) names[t.lang] = t.name;
+		return { code: row.code, names, rarity: row.rarity, serial_no: row.serial_no, serial_max: row.serial_max };
 	}
 	if (kind === 'streak') {
 		const e = await engagementOf(db, userId);
@@ -44,9 +59,10 @@ const esc = (s: string) => s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&l
 
 /** Title and the line under it, in the learner's language */
 export function shareText(kind: ShareKind, data: any, lang: string, name: string) {
-	const vi = lang === 'vi';
+	const vi = lang.startsWith('vi');
 	if (kind === 'badge') {
-		const nm = vi ? data.name_vi : data.name_en;
+		// new shares keep `names` by language; old ones keep name_vi / name_en
+		const nm = data.names ? data.names[lang] || data.names[BASE_LANG] : (vi ? data.name_vi : data.name_en || data.name_vi);
 		return { title: nm, line: data.serial_no ? `${vi ? 'Số' : 'No.'} ${data.serial_no}/${data.serial_max}` : (vi ? 'Huy hiệu sưu tầm' : 'Collected badge'), who: name };
 	}
 	if (kind === 'streak') return { title: vi ? `${data.streak} ngày liên tiếp` : `${data.streak}-day streak`, line: vi ? 'Luyện nghe mỗi ngày' : 'Listening practice, every day', who: name };

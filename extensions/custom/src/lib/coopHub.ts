@@ -12,14 +12,16 @@
  * The hook and the endpoints are separate bundles, so the registry lives on globalThis to be one for both.
  */
 import { randomUUID } from 'node:crypto';
-import { advanceDue, getState } from './coop';
+import { advanceDue, getState, sweepPresence } from './coop';
 
 type Sub = { client: any; user: string; since: number };
-type Hub = { rooms: Map<string, Set<Sub>>; timers: Map<string, ReturnType<typeof setTimeout>>; started: boolean; id: string; safety: ReturnType<typeof setInterval> | null };
+type Hub = { rooms: Map<string, Set<Sub>>; timers: Map<string, ReturnType<typeof setTimeout>>; started: boolean; id: string; safety: ReturnType<typeof setInterval> | null; presence?: ReturnType<typeof setInterval> | null };
 const g = globalThis as any;
 const hub: Hub = (g.__coopHub ||= { rooms: new Map(), timers: new Map(), started: false, id: randomUUID(), safety: null });
 const CHANNEL = 'coop_room';
 const SAFETY_MS = 30_000;
+const PRESENCE_SCAN_MS = 5_000;
+const BOOT_GRACE_MS = 60_000;
 
 const send = (client: any, payload: unknown) => { try { if (client.readyState === 1) client.send(JSON.stringify(payload)); } catch { /* socket gone */ } };
 
@@ -89,6 +91,18 @@ async function listen(db: any, logger?: any) {
 	}
 }
 
+/**
+ * A player with an open socket on this process is here, whatever the page's timers do (a tab hidden for minutes gets its
+ * timers throttled by the browser, so its HTTP pings can be late). The ping stays for a page whose socket is not up.
+ */
+export async function touchWatchers(db: any) {
+	const now = new Date();
+	for (const [roomId, subs] of hub.rooms) {
+		const users = [...subs].filter((s) => s.client.readyState === 1).map((s) => s.user);
+		if (users.length) await db('coop_members').where('room_id', roomId).whereIn('user_id', users).update({ last_seen: now });
+	}
+}
+
 /** Start once per process: the Postgres listener and the slow safety scan */
 export function startTicker(db: any, logger?: any) {
 	if (hub.started) return;
@@ -99,4 +113,13 @@ export function startTicker(db: any, logger?: any) {
 			try { if (await advanceDue(db, id)) await notify(db, id); } catch (e: any) { logger?.warn?.(`[coop] safety scan failed: ${String(e)}`); }
 		}
 	}, SAFETY_MS);
+	// who went silent leaves the room; not in the first minute, so a restart does not drop players before their pages ping again
+	const boot = Date.now();
+	hub.presence = setInterval(async () => {
+		try {
+			await touchWatchers(db);
+			if (Date.now() - boot < BOOT_GRACE_MS) return;
+			for (const id of await sweepPresence(db)) await notify(db, id);
+		} catch (e: any) { logger?.warn?.(`[coop] presence scan failed: ${String(e)}`); }
+	}, PRESENCE_SCAN_MS);
 }

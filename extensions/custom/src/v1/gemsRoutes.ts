@@ -19,11 +19,12 @@ import { ChestError, oddsOf, openChest, takeItem, useItem, type Drop } from '../
 import { listPacks, packCoins } from '../lib/gemOrders';
 import { HelpError, hintsFor, leaveHint, useHint } from '../lib/help';
 import { notify as coopNotify } from '../lib/coopHub';
-import { CoopError, answerCoop, chatCoop, createCoop, getState, joinCoop, leaveCoop, listCoop, lockCoop, nextCoop, playCoop, readyCoop, startCoop } from '../lib/coop';
+import { CoopError, answerCoop, chatCoop, createCoop, getState, joinCoop, leaveCoop, listCoop, lockCoop, nextCoop, pingCoop, playCoop, readyCoop, startCoop } from '../lib/coop';
 import { cancelQueue, joinQueue, matchStatus, sweepQueue } from '../lib/match';
+import { getCountry } from '../lib/country';
 import { joinVoice } from '../lib/voice';
 import { RoomError, answerRoom, createRoom, joinRoom, listRooms, roomView, sweepRooms } from '../lib/rooms';
-import { SHARE_KINDS, newShareId, ogPage, shareFacts, shareSvg, shareText, sharePng, type ShareKind } from '../lib/share';
+import { SHARE_KINDS, badgeNames, newShareId, ogPage, shareFacts, shareSvg, shareText, sharePng, type ShareKind } from '../lib/share';
 import { STAR_MODES } from '../lib/stars';
 import { getReceivingAccount } from '../lib/sepayBankAccount';
 import { addVat, breakdownFromPreTax } from '../lib/vat';
@@ -61,18 +62,16 @@ export function registerGemsRoutes(router: any, context: any) {
 		return !!u?.is_premium && (u.subscription_type === 'lifetime' || !u.premium_until || new Date(u.premium_until).getTime() > Date.now());
 	};
 	const firstName = (u: any) => [u?.first_name, String(u?.last_name || '').slice(0, 1)].filter(Boolean).join(' ') || 'Learner';
-	/** Names of items / chests in the learner's language, falling back to Vietnamese */
+	/** Names of items / chests in the learner's language, falling back to the base language */
 	const names = async (table: 'item_translations' | 'chest_translations', lang: string) => {
-		const short = lang.slice(0, 2);
-		const rows = await database(table).select('code', 'lang', 'name', 'body').whereIn('lang', [short, 'vi']);
+		const rows = await database(table).select('code', 'lang', 'name', 'body').whereIn('lang', [lang, BASE_LANG]);
 		const out = new Map<string, { name: string; body: string | null }>();
-		for (const r of rows.filter((x: any) => x.lang === 'vi')) out.set(r.code, { name: r.name, body: r.body });
-		for (const r of rows.filter((x: any) => x.lang === short && x.lang !== 'vi')) out.set(r.code, { name: r.name || out.get(r.code)?.name || r.code, body: r.body || out.get(r.code)?.body || null });
+		for (const r of rows.filter((x: any) => x.lang === BASE_LANG)) out.set(r.code, { name: r.name, body: r.body });
+		for (const r of rows.filter((x: any) => x.lang === lang && x.lang !== BASE_LANG)) out.set(r.code, { name: r.name || out.get(r.code)?.name || r.code, body: r.body || out.get(r.code)?.body || null });
 		return out;
 	};
-	/** 'vi-VN' (what the translation tables of Bạn có biết use) and 'vi' (what cards, items and chests use) */
+	/** 'vi-VN', 'en-US': the same code in every translation table */
 	const fullLang = (req: any) => langOf(req.query?.lang ?? req.body?.lang);
-	const langOfReq = (req: any) => fullLang(req).slice(0, 2);
 	const afterCommit = async (req: any, userId: string, premiumDays: number, key: string) => {
 		if (premiumDays > 0) await grantRewards(context, req.schema, userId, [{ kind: 'premium_day', days: premiumDays, key }]);
 	};
@@ -105,7 +104,7 @@ export function registerGemsRoutes(router: any, context: any) {
 	const dropsOf = (code: string): Promise<Drop[]> => database('chest_drops').select('item_code', 'weight', 'guaranteed', 'premium_alt').where('chest_code', code);
 
 	router.get('/chests', learner('chests', async (req, res, userId) => {
-		const lang = langOfReq(req);
+		const lang = fullLang(req);
 		const [chests, nm, item, bal] = await Promise.all([
 			database('chests').where('active', true).orderBy('tier'), names('chest_translations', lang), names('item_translations', lang),
 			walletOf(database, userId, 0),
@@ -130,25 +129,26 @@ export function registerGemsRoutes(router: any, context: any) {
 		if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(requestId)) return res.status(400).json({ success: false, code: 'BAD_REQUEST' });
 		const r = await openChest(database, userId, String(req.params.code), requestId, { premium: await isPremium(userId) });
 		if (!r.replay) await afterCommit(req, userId, r.premium_days, `chest:${requestId}`);
-		const item = await names('item_translations', langOfReq(req));
+		const item = await names('item_translations', fullLang(req));
 		return res.json({ success: true, data: { ...r, items: r.items.map((i) => ({ ...i, name: item.get(i.code)?.name || i.code })) } });
 	}));
 
 	router.get('/gems/bag', learner('chests', async (req, res, userId) => {
-		const lang = langOfReq(req);
+		const lang = fullLang(req);
 		const [rows, item, badges, wallet] = await Promise.all([
 			database('user_items').select('item_code').min('expires_at as expires_at').count('* as n').where('user_id', userId).whereNull('used_at')
 				.where((q: any) => q.whereNull('expires_at').orWhere('expires_at', '>', database.fn.now())).groupBy('item_code'),
 			names('item_translations', lang),
 			database('user_badges as ub').join('badges as b', 'b.code', 'ub.badge_code').where('ub.user_id', userId).orderBy('b.rarity', 'desc')
-				.select('b.code', 'b.name_vi', 'b.name_en', 'b.rarity', 'ub.serial_no', 'b.serial_max', 'ub.shown', 'ub.created_at'),
+				.select('b.code', 'b.name_vi', 'b.rarity', 'ub.serial_no', 'b.serial_max', 'ub.shown', 'ub.created_at'),
 			walletOf(database, userId, 0),
 		]);
+		const bn = await badgeNames(database, badges.map((b: any) => b.code), lang);
 		return res.json({
 			success: true, data: {
 				balance: wallet.coins,
 				items: rows.map((r: any) => ({ code: r.item_code, name: item.get(r.item_code)?.name || r.item_code, body: item.get(r.item_code)?.body || null, n: Number(r.n), expires_at: r.expires_at })),
-				badges: badges.map((b: any) => ({ code: b.code, name: lang === 'vi' ? b.name_vi : b.name_en || b.name_vi, rarity: b.rarity, serial_no: b.serial_no, serial_max: b.serial_max, shown: b.shown })),
+				badges: badges.map((b: any) => ({ code: b.code, name: bn.get(b.code) || b.name_vi, rarity: b.rarity, serial_no: b.serial_no, serial_max: b.serial_max, shown: b.shown })),
 			},
 		});
 	}, { balance: 0, items: [], badges: [] }));
@@ -223,7 +223,7 @@ export function registerGemsRoutes(router: any, context: any) {
 		if (!facts) return res.status(404).json({ success: false, code: 'NOTHING_TO_SHARE' });
 		const user = await database('directus_users').select('first_name', 'last_name').where('id', userId).first();
 		const id = newShareId();
-		const lang = langOfReq(req);
+		const lang = fullLang(req);
 		await database('shares').insert({ id, user_id: userId, kind, data: JSON.stringify({ facts, lang, name: firstName(user) }) });
 		const base = `${(process.env.PUBLIC_URL || siteOrigin()).replace(/\/+$/, '')}/v1/share/${id}`;
 		const ref = await database('directus_users').select('referral_code').where('id', userId).first().catch(() => null);
@@ -294,10 +294,10 @@ export function registerGemsRoutes(router: any, context: any) {
 			const [xp, badges] = await Promise.all([
 				database('user_xp').select('xp_total').where('user_id', id).first(),
 				database('user_badges as ub').join('badges as b', 'b.code', 'ub.badge_code').where('ub.user_id', id).whereNotNull('ub.shown').orderBy('ub.shown')
-					.select('b.code', 'b.name_vi', 'b.name_en', 'b.rarity', 'ub.serial_no', 'b.serial_max'),
+					.select('b.code', 'b.name_vi', 'b.rarity', 'ub.serial_no', 'b.serial_max'),
 			]);
-			const lang = langOfReq(req);
-			return res.json({ success: true, data: { name: firstName(u), level: levelOf(Number(xp?.xp_total) || 0).level, badges: badges.map((b: any) => ({ code: b.code, name: lang === 'vi' ? b.name_vi : b.name_en || b.name_vi, rarity: b.rarity, serial_no: b.serial_no, serial_max: b.serial_max })) } });
+			const bn = await badgeNames(database, badges.map((b: any) => b.code), fullLang(req));
+			return res.json({ success: true, data: { name: firstName(u), level: levelOf(Number(xp?.xp_total) || 0).level, badges: badges.map((b: any) => ({ code: b.code, name: bn.get(b.code) || b.name_vi, rarity: b.rarity, serial_no: b.serial_no, serial_max: b.serial_max })) } });
 		} catch (e) {
 			logger?.error?.(`[gems] profile failed: ${String(e)}`);
 			return res.status(500).json({ success: false, message: 'Server error' });
@@ -346,8 +346,10 @@ export function registerGemsRoutes(router: any, context: any) {
 		sweepQueue(database).catch(() => null);
 		return res.json({ success: true, data: { ...(await listCoop(database, userId)), balance: (await walletOf(database, userId, 0)).coins } });
 	}, { on: false }));
+	// Country of the learner, from the IP of the request (lib/country.ts); same-country learners are matched first
+	router.get('/country', learner(null, async (req, res, userId) => res.json({ success: true, data: await getCountry(database, userId, req) })));
 	// Tìm trận: join the queue of a fee, poll the status, leave
-	router.post('/match', learner('rooms', async (req, res, userId) => res.json({ success: true, data: await joinQueue(database, userId, Number(req.body?.fee), req.body?.mode === 'practice' ? 'practice' : 'duel') })));
+	router.post('/match', learner('rooms', async (req, res, userId) => { await getCountry(database, userId, req); return res.json({ success: true, data: await joinQueue(database, userId, Number(req.body?.fee), req.body?.mode === 'practice' ? 'practice' : 'duel') }); }));
 	router.get('/match', learner('rooms', async (_req, res, userId) => res.json({ success: true, data: await matchStatus(database, userId) })));
 	router.delete('/match', learner('rooms', async (_req, res, userId) => res.json({ success: true, data: await cancelQueue(database, userId) })));
 	router.post('/coop', learner('rooms', async (req, res, userId) => res.json({ success: true, data: { id: await createCoop(database, userId, { mode: req.body?.mode === 'duel' ? 'duel' : 'practice', fee: Number(req.body?.fee) }) } })));
@@ -368,6 +370,8 @@ export function registerGemsRoutes(router: any, context: any) {
 	act('next', (r, u, id) => nextCoop(database, u, id, Number(r.body?.idx)));
 	act('chat', (r, u, id) => chatCoop(database, u, id, String(r.body?.body || '')));
 	act('leave', (_r, u, id) => leaveCoop(database, u, id));
+	// presence: the page pings every 10 s (and says "bye" when the tab closes); no push, nothing changed for the other player
+	router.post('/coop/:id/ping', learner('rooms', async (req, res, userId) => res.json({ success: true, data: await pingCoop(database, userId, String(req.params.id), req.body?.bye === true) })));
 	act('voice', (_r, u, id) => joinVoice(database, u, id));
 
 	void BASE_LANG;

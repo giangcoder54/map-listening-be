@@ -18,8 +18,10 @@ const DEFAULTS = {
 	earn: {
 		/** A lesson finished the first time, and without a miss; free lessons pay more than Premium ones: free is where Kim cương are earned */
 		lesson: 70, lessonPremium: 30, perfect: 20, perfectPremium: 10,
-		/** A lesson done again: the first go of the day, then every later one (a day, per lesson) */
-		replay: 6, replayLater: 2,
+		/** A lesson done again: the first go of the day, then a later one, at most `replayLaterMax` a day per lesson */
+		replay: 6, replayLater: 2, replayLaterMax: 3,
+		/** Share (%) of a run's answers right without a hint for its lesson Kim cương: a run clicked through on hints pays nothing */
+		learnedPct: 50,
 		review: 10,
 		/** Trap right: the first time ever, then once a day per clip */
 		trap: 5, trapAgain: 1,
@@ -52,8 +54,8 @@ const DEFAULTS = {
 	help: { reward: 8, perDay: 20 },
 	/** Rooms: the default fee, the share the house keeps (never paid out), questions in a round */
 	room: { fee: 20, rakePct: 10, questions: 5 },
-	/** coop: deposit = Luyện cùng's deposit (given back when the room is finished, with the reward); duelSeconds = time to type the sentence after the clip; duelLead = ms from "ready" to the clip playing on both screens */
-	coop: { questions: 5, practiceQuestions: 3, reward: 10, perDay: 3, duelSeconds: 25, duelReveal: 5, deposit: 50, duelLead: 4000, readySeconds: 12 },
+	/** coop: deposit = Luyện cùng's deposit (given back when the room is finished, with the reward); duelSeconds = time to type the hidden phrase after the clip; duelLead = ms from "ready" to the clip playing on both screens */
+	coop: { questions: 5, practiceQuestions: 3, reward: 10, perDay: 3, duelSeconds: 12, duelReveal: 5, deposit: 50, duelLead: 4000, readySeconds: 12 },
 };
 type CoinNumbers = typeof DEFAULTS;
 
