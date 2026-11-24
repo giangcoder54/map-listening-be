@@ -28,7 +28,7 @@ export async function readClips(database: any, lessonIds: string[]) {
 		.select(
 			'c.id', 'c.lesson_id', 'c.step', 'c.role', 'c.focus_text', 'c.difficulty', 'c.sort', 'c.challenge_mode', 'c.answer', 'c.transcript',
 			'c.start_time', 'c.end_time', 'c.explanation_en', 'c.explanation_vi', 'c.playback_rate', 'c.sounds_like',
-			'c.explanation_image', 'c.explanation_video', 'c.answer_format', 'c.choices',
+			'c.explanation_image', 'c.explanation_video', 'c.answer_format', 'c.choices', 'c.star_on', 'c.star_win', 'c.star_lose',
 			'sv.id as video_id', 'sv.youtube_video_id', 'sv.title as video_title', 'sv.channel_name', 'sv.thumbnail_url',
 			'c.cues',
 			// Clips saved before cues: the lines of the video's transcript (ms) said in the segment

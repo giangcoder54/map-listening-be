@@ -6,7 +6,8 @@
  *   GET  /daily-review/status             {total, minutes, prompt, compact, skips} without building a session: what the popup asks on every page load
  *   POST /daily-review/answer             { kind, id, choice?, token?, typed?, gotit?, listens?, slow?, ms? } -> right or not, what to learn from it
  *   POST /daily-review/suspend            { kind, id }   "known, don't ask again": the card leaves review, nothing is deleted
- *   POST /daily-review/prompted           { action: 'later' | 'started' }   the popup was shown / answered
+ *   POST /daily-review/prompted           { action: 'shown' | 'later' | 'started' }   the popup was shown / answered
+ *   (the popup itself reads its question from GET /me/engagement `review`, no request of its own)
  *   POST /daily-review/add                { attempt_id, items: [{ kind, text, other?, sentence_n, real?, note?, skill?, wrong? }] }
  *                                         the result screen's "add to review": a word goes to user_words, the rest to il_cards
  *
@@ -25,15 +26,11 @@ import { masteryOf } from '../lib/review';
 import { readClips, wrongOf } from './lessonRoutes';
 import { cleanIpa, meaningFor, meaningPool, shorten } from '../lib/meanings';
 import { grantRewards, recordPractice, vnDay } from '../lib/xp';
+import { CAP, KINDS, SECONDS, reviewPrompt, type Kind } from '../lib/reviewDue';
 
 const clean = (v: unknown, max = 600) => String(v ?? '').slice(0, max);
-const KINDS = ['word', 'pattern', 'pair', 'spell', 'sentence', 'form'] as const;
-type Kind = (typeof KINDS)[number];
 /** Every card's schedule is a row of review_cards (user, kind, ref_id); what the card is about is in its own table */
 const CONTENT: Partial<Record<Kind, string>> = { word: 'user_words', pattern: 'il_cards', pair: 'il_cards', spell: 'il_cards' };
-/** The most of each kind in one session, so no kind crowds the rest out */
-const CAP: Record<Kind, number> = { word: 10, pattern: 8, pair: 6, spell: 3, sentence: 5, form: 5 };
-const SECONDS: Record<Kind, number> = { word: 12, pattern: 12, pair: 8, spell: 12, sentence: 15, form: 15 };
 const regexSafe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/'/g, "['’]").replace(/ /g, '\\s+');
 const shuffle = <T,>(a: T[]) => { const b = [...a]; for (let i = b.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [b[i], b[j]] = [b[j]!, b[i]!]; } return b; };
 const lev = (a: string, b: string) => {
@@ -294,16 +291,7 @@ export function registerReviewRoutes(router: any, context: any) {
 		const userId = userOf(req);
 		if (!userId) return res.status(401).json({ success: false, message: 'Unauthorized' });
 		const size = Math.max(1, Math.min(60, Number(req.query?.size) || 25));
-		const [rows, u] = await Promise.all([
-			database('review_cards').where('user_id', userId).where('due', '<=', database.fn.now()).whereNull('suspended_at').select('kind').count('* as n').groupBy('kind'),
-			database('directus_users').where('id', userId).first('review_prompted_on', 'review_skips'),
-		]);
-		const held = Object.fromEntries(KINDS.map((k) => [k, Math.min(Number(rows.find((r: any) => r.kind === k)?.n) || 0, CAP[k])])) as Record<Kind, number>;
-		const total = Math.min(size, KINDS.reduce((n, k) => n + held[k], 0));
-		const minutes = Math.max(1, Math.round(KINDS.reduce((n, k) => n + held[k] * SECONDS[k], 0) / 60));
-		const shownOn = u?.review_prompted_on ? new Date(u.review_prompted_on).toISOString().slice(0, 10) : null;
-		const skips = Number(u?.review_skips) || 0;
-		return res.json({ success: true, data: { total, minutes, prompt: total > 0 && shownOn !== vnDay() && skips < 3, compact: total > 0 && skips >= 3, skips } });
+		return res.json({ success: true, data: (await reviewPrompt(database, userId, size)).review });
 	}));
 
 	router.get('/daily-review', wrap('session', async (req, res) => {
@@ -341,7 +329,13 @@ export function registerReviewRoutes(router: any, context: any) {
 	router.post('/daily-review/prompted', wrap('prompted', async (req, res) => {
 		const userId = userOf(req);
 		if (!userId) return res.status(401).json({ success: false, message: 'Unauthorized' });
-		const later = req.body?.action === 'later';
+		const action = req.body?.action;
+		// 'shown': the popup came up, so it is not asked again today (any device); the "later" count is left as it is
+		if (action === 'shown') {
+			await database('directus_users').where('id', userId).update({ review_prompted_on: vnDay() });
+			return res.json({ success: true, data: null });
+		}
+		const later = action === 'later';
 		const u = await database('directus_users').where('id', userId).first('review_skips');
 		await database('directus_users').where('id', userId).update({ review_prompted_on: vnDay(), review_skips: later ? (Number(u?.review_skips) || 0) + 1 : 0 });
 		return res.json({ success: true, data: null });

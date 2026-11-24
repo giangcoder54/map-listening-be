@@ -37,7 +37,7 @@ import { CHALLENGE, beatsOf, cachedItemStats, challengeItems, lastClosedWeek, lo
 import { unlockBankVideo, unlockChallenge } from '../lib/coins';
 import { BANK, bankFormat, bankPrice, bankWrong, loadBankItems, type BankItem } from '../lib/bank';
 import { isPremiumUser } from '../lib/premium';
-import { STAR_MODES, STAR_PHASES, canAfford, playStar, starCheck, starSummary, starValue, starsUsed } from '../lib/stars';
+import { STAR_MODES, STAR_PHASES, canAfford, playStar, starCheck, starStakes, starSummary, starsUsed } from '../lib/stars';
 import { gemsOn } from '../lib/growthConfig';
 import { takeItem, useItem } from '../lib/chests';
 import { onAnswer as cardsOnAnswer } from '../lib/cards';
@@ -106,8 +106,9 @@ async function poolOf(database: any, g: LessonGraph, lesson: LessonRow, answerMo
 			tries: item.tries || 0,
 			clip: asked,
 			// Ngôi sao: what the question is worth, and whether it can take a star now (lib/stars.ts)
-			value: starValue(clip.difficulty, format),
-			star_ok: STAR_PHASES.includes(item.phase) && !item.result && !((Number(item.tries) || 0) > 0),
+			// A star only on the clips the team marked (listening_clips.star_on); value = won when right, lose = lost when wrong
+			...(() => { const s = starStakes(row, format); return { value: s.win, lose: s.lose }; })(),
+			star_ok: !!row.star_on && STAR_PHASES.includes(item.phase) && !item.result && !((Number(item.tries) || 0) > 0),
 		};
 	};
 	return { lesson, byId, clips: [...byId.values()].map((x) => x.clip), payload };
@@ -231,15 +232,15 @@ async function runOut(database: any, g: LessonGraph, run: any, starsOn = false) 
 		}
 	} else pools = await poolsOf(database, g, items.map((it) => it.lesson_id || run.lesson_id));
 	// Ngôi sao left in this run; null = no stars here (feature off, a guest, or a run that says nothing until its end)
-	let stars: { per_run: number; used: number; left: number; items: { shield: number; gold_star: number; extra_star: number } } | null = null;
+	let stars: { per_run: number; used: number; left: number; items: { shield: number; gold_star: number } } | null = null;
 	if (starsOn && run.user_id && STAR_MODES.includes(run.mode)) {
 		const used = await starsUsed(database, run.id);
 		const perRun = COIN.star.perRun + (Number(run.extra_stars) || 0);
 		// What the learner holds that goes with a star (Khien, Ngoi sao vang, Them 1 Ngoi sao)
 		const held = await database('user_items').select('item_code').count('* as n').where('user_id', run.user_id).whereNull('used_at')
-			.whereIn('item_code', ['shield', 'gold_star', 'extra_star']).where((q: any) => q.whereNull('expires_at').orWhere('expires_at', '>', database.fn.now())).groupBy('item_code');
+			.whereIn('item_code', ['shield', 'gold_star']).where((q: any) => q.whereNull('expires_at').orWhere('expires_at', '>', database.fn.now())).groupBy('item_code');
 		const n = (code: string) => Number(held.find((h: any) => h.item_code === code)?.n) || 0;
-		stars = { per_run: perRun, used, left: Math.max(0, perRun - used), items: { shield: n('shield'), gold_star: n('gold_star'), extra_star: n('extra_star') } };
+		stars = { per_run: perRun, used, left: Math.max(0, perRun - used), items: { shield: n('shield'), gold_star: n('gold_star') } };
 	}
 	// A question answered before (this run or another, the answer then shown) cannot take a star: the bet would be sure
 	const seen = stars ? await answeredClips(database, run.user_id, items.map((it) => it.clip_id)) : null;
@@ -515,6 +516,7 @@ export function registerRunRoutes(router: any, context: any) {
 				const trap = clipRow.role === 'trap';
 				// Ngôi sao: a bet on this answer (lib/stars.ts). One try, no hearts; the purse must cover what it can lose.
 				let starWorth = 0;
+				let starLose = 0;
 				// Items that go with a star: a gold star (x3 when right) and a shield (a miss costs nothing); each is used up with the star
 				let goldRow: any = null;
 				let shieldRow: any = null;
@@ -522,10 +524,13 @@ export function registerRunRoutes(router: any, context: any) {
 					if (body.star !== 'normal' && body.star !== 'gold') return { status: 409 as const, code: 'STAR_KIND' };
 					const check = starCheck({ on: gemsOn('stars', req.accountability), userId: learner.userId, mode: run.mode, phase: item.phase, tries: Number(item.tries) || 0, used: await starsUsed(trx, run.id), perRun: COIN.star.perRun + (Number(run.extra_stars) || 0) });
 					if (!check.ok) return { status: 409 as const, code: check.code };
+					if (!clipRow.star_on) return { status: 409 as const, code: 'STAR_CLIP' };
 					// Answered before: the answer was shown then, so the bet would be sure
 					if ((await answeredClips(trx, learner.userId!, [item.clip_id])).size) return { status: 409 as const, code: 'STAR_SEEN' };
-					starWorth = starValue(clipRow.difficulty, item.format);
-					if (!(await canAfford(trx, learner.userId!, starWorth))) return { status: 409 as const, code: 'STAR_POOR' };
+					const stakes = starStakes(clipRow, item.format);
+					starWorth = stakes.win;
+					starLose = stakes.lose;
+					if (!(await canAfford(trx, learner.userId!, starLose))) return { status: 409 as const, code: 'STAR_POOR' };
 					if (body.star === 'gold') {
 						goldRow = await takeItem(trx, learner.userId!, 'gold_star');
 						if (!goldRow) return { status: 409 as const, code: 'STAR_NO_ITEM' };
@@ -586,7 +591,7 @@ export function registerRunRoutes(router: any, context: any) {
 				}
 				// The star is settled with the answer: Kim cương won or lost, in the same transaction
 				const star = starWorth
-					? await playStar(trx, learner.userId!, { runId: run.id, clipId: item.clip_id, lessonId: lessonId as string, value: starWorth, correct, hint, today: vnDay(), perRun: COIN.star.perRun + (Number(run.extra_stars) || 0), kind: goldRow ? 'gold' : 'normal', shielded: !!shieldRow })
+					? await playStar(trx, learner.userId!, { runId: run.id, clipId: item.clip_id, lessonId: lessonId as string, value: starWorth, lose: starLose, correct, hint, today: vnDay(), perRun: COIN.star.perRun + (Number(run.extra_stars) || 0), kind: goldRow ? 'gold' : 'normal', shielded: !!shieldRow })
 					: null;
 				// The gold star goes once the star is played; the shield only when it saved a loss
 				if (star && goldRow) await useItem(trx, goldRow.id);

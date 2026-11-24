@@ -15,7 +15,7 @@
  */
 import { PRACTICE, UUID_RE, acceptOf, answerOf, practicePrefsOf } from '../lib/lessons';
 import { isPremiumUser } from '../lib/premium';
-import { dueReviews } from '../lib/reviewDue';
+import { reviewPrompt } from '../lib/reviewDue';
 import { DEFAULT_GOAL, TZ, XP, engagementOf, grantRewards, recordPractice } from '../lib/xp';
 
 export { TZ, XP };
@@ -86,12 +86,13 @@ export function registerEngagementRoutes(router: any, context: any) {
 		const userId = needUser(req, res);
 		if (!userId) return;
 		try {
-			const [engagement, due, phrasesDue] = await Promise.all([
+			// The daily review popup's question rides along (lib/reviewDue.ts), so the popup needs no request of its own
+			const [engagement, { due, review }, phrasesDue] = await Promise.all([
 				engagementOf(database, userId),
-				dueReviews(database, userId),
+				reviewPrompt(database, userId),
 				database('phrase_progress').where('user_id', userId).where('due', '<=', database.fn.now()).count('* as n').first(),
 			]);
-			return res.json({ success: true, data: { ...engagement, reviews_due: due, phrases_due: Number(phrasesDue?.n) || 0 } });
+			return res.json({ success: true, data: { ...engagement, user_id: userId, reviews_due: due, review, phrases_due: Number(phrasesDue?.n) || 0 } });
 		} catch (error) {
 			return fail(res, 'Load engagement', error);
 		}

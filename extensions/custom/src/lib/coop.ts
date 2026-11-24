@@ -682,8 +682,11 @@ export async function listCoop(db: any, userId: string) {
 		.where('r.phase_at', '>', new Date(Date.now() - 30 * 60_000))
 		.select('r.id', 'r.mode', 'r.fee', 'u.first_name', 'u.last_name', 'r.created_at').orderBy('r.created_at', 'desc').limit(20);
 	const mine = await db('coop_rooms as r').join('coop_members as m', 'm.room_id', 'r.id').where('m.user_id', userId).whereIn('r.status', ['waiting', 'playing']).first('r.id', 'r.status');
-	const inDuel = Number((await db('coop_members as m').join('coop_rooms as r', 'r.id', 'm.room_id').where({ 'r.mode': 'duel', 'r.status': 'playing' }).count('* as n').first())?.n) || 0;
-	const inQueue = Number((await db('match_queue').count('* as n').first())?.n) || 0;
+	// who is around, per mode: players in a room being played, and players waiting in the match queue
+	const playing: Record<string, number> = { duel: 0, practice: 0 };
+	for (const r of await db('coop_members as m').join('coop_rooms as r', 'r.id', 'm.room_id').where('r.status', 'playing').groupBy('r.mode').select('r.mode').count('* as n')) playing[r.mode] = Number(r.n) || 0;
+	const searching: Record<string, number> = { duel: 0, practice: 0 };
+	for (const q of await db('match_queue').groupBy('mode').select('mode').count('* as n')) searching[q.mode] = Number(q.n) || 0;
 	const recent = await db('coop_members as m').join('coop_rooms as r', 'r.id', 'm.room_id').where({ 'm.user_id': userId, 'r.mode': 'duel', 'r.status': 'done' }).orderBy('r.done_at', 'desc').limit(5).select('r.id', 'm.prize', 'm.score', 'r.fee');
 	const items = [];
 	for (const r of recent) {
@@ -692,7 +695,7 @@ export async function listCoop(db: any, userId: string) {
 	}
 	return {
 		waiting: waiting.map((w: any) => ({ id: w.id, host: nameOf(w), mode: w.mode, fee: w.fee })), mine: mine || null, reward: COIN.coop.reward, deposit: COIN.coop.deposit, per_day: COIN.coop.perDay,
-		fees: FEES, rake_pct: COIN.room.rakePct, online: inDuel + inQueue, recent: items,
+		fees: FEES, rake_pct: COIN.room.rakePct, playing, searching, recent: items,
 	};
 }
 

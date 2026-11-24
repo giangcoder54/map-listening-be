@@ -25,6 +25,7 @@ import { registerAdminVietsubRoutes } from './adminVietsubRoutes';
 import { registerAdminRuleRoutes } from './adminRuleRoutes';
 import { registerAdminPracticeRoutes } from './adminPracticeRoutes';
 import { registerAdminDykRoutes } from './adminDykRoutes';
+import { registerAdminStarRoutes } from './adminStarRoutes';
 import { registerDykRoutes } from './dykRoutes';
 import { registerEventRoutes } from './eventRoutes';
 import { registerPhraseRoutes } from './phraseRoutes';
@@ -333,6 +334,7 @@ export default defineEndpoint((router, context) => {
 	registerEventRoutes(router, context);
 	registerDykRoutes(router, context);
 	registerAdminDykRoutes(router, context);
+	registerAdminStarRoutes(router, context);
 	registerPhraseRoutes(router, context);
 	registerAdminPhraseRoutes(router, context);
 	registerAdminLibraryRoutes(router, context);

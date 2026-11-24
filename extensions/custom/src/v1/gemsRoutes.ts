@@ -5,17 +5,16 @@
  *   cards     GET /cards/today   POST /cards/draw   POST /cards/answer   POST /cards/skip   POST /cards/recovery/claim
  *   chests    GET /chests   GET /chests/:code/odds   POST /chests/:code/open   GET /gems/bag   POST /items/use
  *   purchase  GET /xu/packs   POST /coins/orders        (the order is paid and polled like a plan: /checkout/:id/status)
- *   share     POST /share   GET /share/:id.png   GET /share/:id   GET /gems/leaderboard   PUT /badges/shown   GET /u/:id
+ *   share     POST /share   GET /share/:id.png   GET /share/:id   PUT /badges/shown   GET /u/:id
  *   help      GET /help/hints?clip_id=   POST /help/hints   POST /help/hints/:id/use
  *   rooms     GET /rooms   POST /rooms   POST /rooms/:id/join   GET /rooms/:id   POST /rooms/:id/answer
  */
 import { COIN, CoinError, walletOf } from '../lib/coins';
 import { gemsOn, siteOrigin, type GemsFeature } from '../lib/growthConfig';
 import { BASE_LANG, langOf } from '../lib/extensive';
-import { vnDay } from '../lib/days';
 import { levelOf, grantRewards } from '../lib/xp';
 import { CardError, answerTruth, cardsState, claimRecovery, drawCard, skipDare } from '../lib/cards';
-import { ChestError, oddsOf, openChest, takeItem, useItem, type Drop } from '../lib/chests';
+import { ChestError, oddsOf, openChest, type Drop } from '../lib/chests';
 import { listPacks, packCoins } from '../lib/gemOrders';
 import { HelpError, hintsFor, leaveHint, useHint } from '../lib/help';
 import { notify as coopNotify } from '../lib/coopHub';
@@ -25,15 +24,11 @@ import { getCountry } from '../lib/country';
 import { joinVoice } from '../lib/voice';
 import { RoomError, answerRoom, createRoom, joinRoom, listRooms, roomView, sweepRooms } from '../lib/rooms';
 import { SHARE_KINDS, badgeNames, newShareId, ogPage, shareFacts, shareSvg, shareText, sharePng, type ShareKind } from '../lib/share';
-import { STAR_MODES } from '../lib/stars';
 import { getReceivingAccount } from '../lib/sepayBankAccount';
 import { addVat, breakdownFromPreTax } from '../lib/vat';
 import { newPaymentCode } from './paymentCode';
 
 const STATUS: Record<string, number> = { BAD_REQUEST: 400, NO_ROOM: 404, NO_CHEST: 404, NO_HINT: 404, NO_OPEN: 404 };
-
-/** Kim cương earned by learning: what the weekly ranking counts (not bought, not given, not luck) */
-const NOT_LEARNING = ['purchase', 'admin', 'refund', 'chargeback', 'chest', 'room_prize', 'premium_day', 'card_skip'];
 
 export function registerGemsRoutes(router: any, context: any) {
 	const { database, logger } = context;
@@ -115,7 +110,7 @@ export function registerGemsRoutes(router: any, context: any) {
 			if (c.once && opened.has(c.code)) continue;
 			const drops = await dropsOf(c.code);
 			data.push({
-				code: c.code, tier: c.tier, price: c.price, rolls: c.rolls, pity_n: c.pity_n, pity_item: c.pity_item ? item.get(c.pity_item)?.name || c.pity_item : null, once: c.once,
+				code: c.code, tier: c.tier, price: c.price, rolls: c.rolls, once: c.once,
 				name: nm.get(c.code)?.name || c.code, body: nm.get(c.code)?.body || null,
 				odds: oddsOf(drops).map((o) => ({ ...o, name: item.get(o.item_code)?.name || o.item_code })).sort((a, b) => b.pct - a.pct),
 				guaranteed: drops.filter((d) => d.guaranteed).map((d) => item.get(d.item_code)?.name || d.item_code),
@@ -152,26 +147,6 @@ export function registerGemsRoutes(router: any, context: any) {
 			},
 		});
 	}, { balance: 0, items: [], badges: [] }));
-
-	/** "Thêm 1 Ngôi sao": used before a run; that run has more stars */
-	router.post('/items/use', learner('chests', async (req, res, userId) => {
-		const code = String(req.body?.item_code || '');
-		if (code !== 'extra_star') return res.status(400).json({ success: false, code: 'BAD_REQUEST' });
-		const out = await database.transaction(async (trx: any) => {
-			const run = await trx('listening_runs').where({ id: String(req.body?.run_id || ''), user_id: userId, status: 'active' }).forUpdate().first();
-			if (!run || !STAR_MODES.includes(run.mode)) return null;
-			const row = await takeItem(trx, userId, 'extra_star');
-			if (!row) return 'none' as const;
-			const def = await trx('items').where('code', 'extra_star').first('params');
-			const n = Number((typeof def?.params === 'string' ? JSON.parse(def.params) : def?.params)?.n) || 1;
-			await useItem(trx, row.id);
-			await trx('listening_runs').where('id', run.id).update({ extra_stars: (Number(run.extra_stars) || 0) + n });
-			return { extra_stars: (Number(run.extra_stars) || 0) + n, stars_left: Math.max(0, COIN.star.perRun + (Number(run.extra_stars) || 0) + n - Number((await trx('star_uses').where('run_id', run.id).count('* as c').first())?.c || 0)) };
-		});
-		if (out === null) return res.status(400).json({ success: false, code: 'BAD_REQUEST' });
-		if (out === 'none') return res.status(409).json({ success: false, code: 'NO_ITEM' });
-		return res.json({ success: true, data: out });
-	}));
 
 	// ── P4: top-up ────────────────────────────────────────────────────────────────────────────
 	router.get('/xu/packs', async (req: any, res: any) => {
@@ -255,24 +230,6 @@ export function registerGemsRoutes(router: any, context: any) {
 			res.set('Cache-Control', 'public, max-age=3600');
 			return res.type('html').send(ogPage({ ...s.text, image: `${api}.png`, url: api, to: `${siteOrigin()}/?ref=share` }));
 		} catch { return res.status(500).end(); }
-	});
-
-	router.get('/gems/leaderboard', async (req: any, res: any) => {
-		try {
-			if (!gemsOn('share', req.accountability)) return res.json({ success: true, data: { on: false, rows: [] } });
-			const today = vnDay();
-			const d = new Date(`${today}T00:00:00Z`);
-			d.setUTCDate(d.getUTCDate() - ((d.getUTCDay() + 6) % 7));
-			const monday = d.toISOString().slice(0, 10);
-			const rows = await database('coin_events as e').join('directus_users as u', 'u.id', 'e.user_id')
-				.where('e.day', '>=', monday).where('e.amount', '>', 0).whereNotIn('e.reason', NOT_LEARNING).whereRaw('u.is_internal IS NOT TRUE')
-				.groupBy('u.id', 'u.first_name', 'u.last_name').select('u.id', 'u.first_name', 'u.last_name').sum('e.amount as total').orderBy('total', 'desc').limit(20);
-			const me = req.accountability?.user as string | undefined;
-			return res.json({ success: true, data: { on: true, week: monday, rows: rows.map((r: any, i: number) => ({ rank: i + 1, name: firstName(r), total: Number(r.total), you: r.id === me, id: r.id })) } });
-		} catch (e) {
-			logger?.error?.(`[gems] leaderboard failed: ${String(e)}`);
-			return res.status(500).json({ success: false, message: 'Server error' });
-		}
 	});
 
 	router.put('/badges/shown', learner('share', async (req, res, userId) => {

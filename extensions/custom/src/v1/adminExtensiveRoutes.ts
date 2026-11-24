@@ -13,6 +13,7 @@
  * Lessons are written by Claude (docs/giao-trinh/tools/el_write.py) and reviewed here. Publishing
  * checks every part has a question, every question 3 options and an answer, and a closing question.
  */
+import { wordKey } from '../lib/dict';
 import { EFFECTIVE } from '../lib/videoTags';
 import { BASE_LANG, linesIn, thumbOf } from '../lib/extensive';
 import { UUID_RE } from '../lib/lessons';
@@ -187,11 +188,14 @@ export function registerAdminExtensiveRoutes(router: any, context: any) {
 			if (segs.some((s) => !s.questions.length)) return bad(res, 'Publishing needs a question after every part');
 		}
 
-		const KIND_V = ['word', 'phrase'], KIND_N = ['person', 'org', 'place', 'culture', 'idiom'];
+		const KIND_V = ['word', 'phrase', 'grammar'], KIND_N = ['person', 'org', 'place', 'culture', 'idiom'];
 		const strs = (v: any) => (Array.isArray(v) ? v.map((x: any) => String(x ?? '').trim()).filter(Boolean).slice(0, 12) : []);
 		const vocab = (Array.isArray(b.vocab) ? b.vocab : []).map((v: any) => ({ term: String(v?.term || '').trim().slice(0, 120), forms: strs(v?.forms), kind: KIND_V.includes(v?.kind) ? v.kind : 'word',
 			meaning: String(v?.meaning || '').trim().slice(0, 300), at_start: v?.at_start ?? null, at_end: v?.at_end ?? null })).filter((v: any) => v.term);
 		if (vocab.some((v: any) => !v.meaning)) return bad(res, 'Every vocabulary item needs a meaning');
+		// A saved item is kept by its word key (letters, spaces, ' and - only, up to 60): a structure that cannot be keyed could not be saved for review
+		const unkeyed = vocab.find((v: any) => v.kind === 'grammar' && !wordKey(v.term));
+		if (unkeyed) return bad(res, `Structure “${unkeyed.term}” can only have letters, spaces, ' and -, up to 60 characters (write the pattern, e.g. “I reckon”)`);
 		const notes = (Array.isArray(b.notes) ? b.notes : []).map((n: any) => ({ term: String(n?.term || '').trim().slice(0, 120), forms: strs(n?.forms), kind: KIND_N.includes(n?.kind) ? n.kind : 'culture',
 			explain: String(n?.explain || '').trim().slice(0, 600), extra: n?.extra ? String(n.extra).trim().slice(0, 600) : null, before: !!n?.before })).filter((n: any) => n.term);
 		if (notes.some((n: any) => !n.explain)) return bad(res, 'Every note needs an explanation');

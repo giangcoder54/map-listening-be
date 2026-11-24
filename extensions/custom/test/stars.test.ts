@@ -12,7 +12,7 @@ import { createRequire } from 'node:module';
 import { readdirSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { COIN, applyCoinSettings, earnCoins } from '../src/lib/coins';
-import { canAfford, playStar, starCheck, starSummary, starValue, starsUsed } from '../src/lib/stars';
+import { canAfford, playStar, starCheck, starStakes, starSummary, starValue, starsUsed } from '../src/lib/stars';
 
 const PNPM = '/directus/node_modules/.pnpm';
 const knexDir = readdirSync(PNPM).find((d) => d.startsWith('knex@'));
@@ -56,16 +56,22 @@ afterEach(async () => { await trx.rollback(); applyCoinSettings(null); });
 
 describe('what a question is worth', () => {
 	test('by difficulty: easy, medium, hard; none is medium', () => {
-		assert.deepEqual([1, 2, 3, null].map((d) => starValue(d, 'type')), [5, 10, 15, 10]);
+		assert.deepEqual([1, 2, 3, null].map((d) => starValue(d, 'type')), [10, 20, 40, 20]);
 	});
 	test('a choice or a word bank is worth half', () => {
-		assert.deepEqual(['choice', 'bank', 'gap'].map((f) => starValue(3, f)), [8, 8, 15]);
-		assert.equal(starValue(1, 'choice'), 3);
+		assert.deepEqual(['choice', 'bank', 'gap'].map((f) => starValue(3, f)), [20, 20, 40]);
+		assert.equal(starValue(1, 'choice'), 5);
 	});
 	test('the numbers come from growth_settings', () => {
-		applyCoinSettings({ star: { medium: 20, pickPct: 25 } });
-		assert.equal(starValue(2, 'type'), 20);
-		assert.equal(starValue(2, 'choice'), 5);
+		applyCoinSettings({ star: { medium: 30, pickPct: 25 } });
+		assert.equal(starValue(2, 'type'), 30);
+		assert.equal(starValue(2, 'choice'), 8);
+	});
+	test('win by difficulty, loss is losePct % of it; a clip own numbers come first', () => {
+		assert.deepEqual(starStakes({ difficulty: 3 }, 'type'), { win: 40, lose: 30 });
+		assert.deepEqual(starStakes({ difficulty: 3, star_win: 60, star_lose: 40 }, 'type'), { win: 60, lose: 40 });
+		assert.deepEqual(starStakes({ difficulty: 3, star_win: 60 }, 'type'), { win: 60, lose: 45 });
+		assert.deepEqual(starStakes({ difficulty: 3, star_win: 60, star_lose: 40 }, 'choice'), { win: 30, lose: 20 });
 	});
 });
 

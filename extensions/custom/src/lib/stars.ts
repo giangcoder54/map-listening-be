@@ -29,6 +29,19 @@ export function starValue(difficulty: number | null | undefined, format: string,
 	return Math.max(1, Math.round(pick ? (base * rules.pickPct) / 100 : base));
 }
 
+/**
+ * What a starred question wins and loses. The clip's own star_win / star_lose (set in the admin) come
+ * first; else the win is by difficulty and the loss is `losePct` % of the win. A choice or a word bank
+ * scales both by `pickPct` %.
+ */
+export function starStakes(clip: { difficulty?: number | null; star_win?: number | null; star_lose?: number | null }, format: string, rules = COIN.star) {
+	const pick = format === 'choice' || format === 'bank' || format === 'tap';
+	const scale = (n: number) => Math.max(1, Math.round(pick ? (n * rules.pickPct) / 100 : n));
+	const win = Number(clip.star_win) > 0 ? scale(Number(clip.star_win)) : starValue(clip.difficulty, format, rules);
+	const lose = Number(clip.star_lose) > 0 ? scale(Number(clip.star_lose)) : Math.max(1, Math.round((win * rules.losePct) / 100));
+	return { win, lose };
+}
+
 export type StarRefusal = 'STARS_OFF' | 'STAR_GUEST' | 'STAR_MODE' | 'STAR_PHASE' | 'STAR_LATE' | 'STAR_NONE_LEFT';
 
 /** May this item take a star now (everything but the purse and the once-per-clip key, checked in playStar)? */
@@ -61,12 +74,13 @@ export async function canAfford(trx: any, userId: string, value: number) {
  * Settle a star once the answer is judged: one star_uses row, one ledger row (none when void).
  * Returns null when the question already took a star (the unique key): nothing is paid twice.
  */
-export async function playStar(trx: any, userId: string, a: { runId: string; clipId: string; lessonId: string | null; value: number; correct: boolean; hint: boolean; today: string; perRun?: number; kind?: 'normal' | 'gold'; shielded?: boolean }): Promise<(StarResult & { shield_used: boolean }) | null> {
+export async function playStar(trx: any, userId: string, a: { runId: string; clipId: string; lessonId: string | null; value: number; lose?: number; correct: boolean; hint: boolean; today: string; perRun?: number; kind?: 'normal' | 'gold'; shielded?: boolean }): Promise<(StarResult & { shield_used: boolean }) | null> {
 	// A gold star pays GOLD_MULT times when right; a shield turns a miss into nothing (the caller uses the item up)
 	const mult = a.kind === 'gold' ? GOLD_MULT : 1;
 	const shieldUsed = !!a.shielded && !a.hint && !a.correct;
 	const outcome: StarResult['outcome'] = a.hint || shieldUsed ? 'void' : a.correct ? 'right' : 'wrong';
-	const delta = outcome === 'right' ? a.value * mult : outcome === 'wrong' ? -a.value : 0;
+	const loss = a.lose ?? a.value;
+	const delta = outcome === 'right' ? a.value * mult : outcome === 'wrong' ? -loss : 0;
 	const row = await trx('star_uses')
 		.insert({ user_id: userId, run_id: a.runId, clip_id: a.clipId, lesson_id: a.lessonId, kind: a.kind || 'normal', value: a.value, outcome, delta, shielded: shieldUsed })
 		.onConflict(['user_id', 'clip_id']).ignore()
@@ -78,7 +92,7 @@ export async function playStar(trx: any, userId: string, a: { runId: string; cli
 		const meta = { star_id: starId, run_id: a.runId, clip_id: a.clipId };
 		const done = outcome === 'right'
 			? await earnCoins(trx, userId, { reason: 'star', amount: delta, dedupe: `star:${a.clipId}`, lessonId: a.lessonId, meta }, a.today)
-			: await spend(trx, userId, a.value, 'star', `star:${a.clipId}`, a.lessonId, a.today, meta);
+			: await spend(trx, userId, loss, 'star', `star:${a.clipId}`, a.lessonId, a.today, meta);
 		balance = done.coins;
 		const eventId = (done as any).eventId;
 		if (eventId) await trx('star_uses').where('id', starId).update({ coin_event_id: eventId });

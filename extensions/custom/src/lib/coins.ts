@@ -17,7 +17,8 @@ import { vnDay } from './days';
 const DEFAULTS = {
 	earn: {
 		/** A lesson finished the first time, and without a miss; free lessons pay more than Premium ones: free is where Kim cương are earned */
-		lesson: 70, lessonPremium: 30, perfect: 20, perfectPremium: 10,
+		/** 40 + 10 since 2026-11-24 (was 70 + 20): ~30 free lessons gave ~2,400 Kim cương, too much against a 100-Kim-cương lesson */
+		lesson: 40, lessonPremium: 30, perfect: 10, perfectPremium: 10,
 		/** A lesson done again: the first go of the day, then a later one, at most `replayLaterMax` a day per lesson */
 		replay: 6, replayLater: 2, replayLaterMax: 3,
 		/** Share (%) of a run's answers right without a hint for its lesson Kim cương: a run clicked through on hints pays nothing */
@@ -26,12 +27,20 @@ const DEFAULTS = {
 		/** Trap right: the first time ever, then once a day per clip */
 		trap: 5, trapAgain: 1,
 		skillTest: 50,
+		/**
+		 * Extensive / Intensive, a passage finished the first time (never a redo, never by minutes: a reward for time makes
+		 * people leave the audio running). `Good`: >= 80% right (Extensive, and not rated "little") or >= 80% of the sentences
+		 * heard at the first check (Intensive). `extensiveLevel`: the Level went up.
+		 */
+		extensive: 10, extensiveGood: 5, extensiveLevel: 20, intensive: 10, intensiveGood: 10,
 	},
 	/** Daily goal reached: Kim cương by the days in a row, and a one-off bonus at these lengths */
 	streakDay: [{ from: 30, xu: 20 }, { from: 7, xu: 15 }, { from: 1, xu: 10 }],
 	streakMilestone: { 7: 50, 30: 200, 100: 500, 365: 1500 } as Record<number, number>,
 	/** Unlock a lesson for good, by lesson kind */
 	unlock: { pattern: 100, trap: 100, mixed: 150 } as Record<string, number>,
+	/** Unlock an Extensive / Intensive lesson for good (lib/contentUnlocks.ts) */
+	unlockContent: { el: 50, il: 100 } as Record<string, number>,
 	/** Unlock a Phrase Lab phrase for good; it covers the phrase's AI checks */
 	phrase: 25,
 	/** A free phrase's AI check beyond the free ones of the day */
@@ -43,10 +52,11 @@ const DEFAULTS = {
 	/** A rule's test is free once a day; another go the same day costs this */
 	retest: 30,
 	/**
-	 * Ngôi sao (lib/stars.ts): stars a run has, what a question is worth by its difficulty, and the
-	 * share of that a choice or a word bank is worth (they are easier to hit by chance)
+	 * Ngôi sao (lib/stars.ts): stars a run has, what a starred question wins by its difficulty (the loss is
+	 * `losePct` % of it; a clip's own star_win / star_lose come first), and the share of that a choice or a
+	 * word bank is worth (they are easier to hit by chance)
 	 */
-	star: { perRun: 2, easy: 5, medium: 10, hard: 15, pickPct: 50 },
+	star: { perRun: 2, easy: 10, medium: 20, hard: 40, pickPct: 50, losePct: 75 },
 	/** Cards (dare or truth): Kim cuong to leave a dare that is not done, and a truth answered right; the way back when the purse is low (hear `need` right in a free lesson, take `prize`) */
 	card: { skip: 50, truthRight: 40 },
 	recovery: { below: 20, need: 10, prize: 50 },
@@ -110,7 +120,8 @@ export const streakDayXu = (days: number) => COIN.streakDay.find((s) => days >= 
 
 export type CoinReason = 'lesson' | 'perfect' | 'goal' | 'streak' | 'review' | 'ad' | 'unlock' | 'premium_day' | 'freeze' | 'retest' | 'refund' | 'admin' | 'trap' | 'streak_milestone' | 'skill_test' | 'replay' | 'phrase_unlock' | 'ai' | 'challenge' | 'bank'
 	// Kim cương v2 (2026-12-10_gems_v2_p0.sql)
-	| 'star' | 'chest' | 'card' | 'card_skip' | 'recovery' | 'purchase' | 'chargeback' | 'room_fee' | 'room_prize' | 'help' | 'coop';
+	| 'star' | 'chest' | 'card' | 'card_skip' | 'recovery' | 'purchase' | 'chargeback' | 'room_fee' | 'room_prize' | 'help' | 'coop'
+	| 'extensive' | 'intensive';
 export class CoinError extends Error {
 	constructor(public code: 'NOT_ENOUGH' | 'ALREADY' | 'MAX_FREEZES' | 'NOT_LOCKED') { super(code); }
 }
@@ -219,6 +230,18 @@ export async function unlockChallenge(db: any, userId: string, lessonId: string,
 		if (await trx('listening_unlocks').where({ user_id: userId, lesson_id: lessonId }).first('lesson_id')) throw new CoinError('ALREADY');
 		const paid = await spend(trx, userId, price, 'unlock', `unlock:${lessonId}`, lessonId, today);
 		await trx('listening_unlocks').insert({ user_id: userId, lesson_id: lessonId, source: 'coins', coin_event_id: paid.eventId });
+		return { price, coins: paid.coins };
+	});
+}
+
+/** Buy an Extensive ('el') or Intensive ('il') lesson for good (content_unlocks). The caller checked it is locked. */
+export async function unlockContent(db: any, userId: string, kind: 'el' | 'il', lessonId: string, today = vnDay()) {
+	const price = COIN.unlockContent[kind] ?? 100;
+	return db.transaction(async (trx: any) => {
+		await lockPurse(trx, userId);
+		if (await trx('content_unlocks').where({ user_id: userId, kind, lesson_id: lessonId }).first('lesson_id')) throw new CoinError('ALREADY');
+		const paid = await spend(trx, userId, price, 'unlock', `unlock:${kind}:${lessonId}`, null, today, { kind, lesson_id: lessonId });
+		await trx('content_unlocks').insert({ user_id: userId, kind, lesson_id: lessonId, source: 'coins', coin_event_id: paid.eventId });
 		return { price, coins: paid.coins };
 	});
 }

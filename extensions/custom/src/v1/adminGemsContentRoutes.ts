@@ -145,8 +145,6 @@ export function registerAdminGemsContentRoutes(router: any, context: any) {
 	const saveChest = async (code: string, b: any, create: boolean) => {
 		const price = int(b.price, 0, 1_000_000), rolls = int(b.rolls, 1, 20), tier = int(b.tier ?? 1, 0, 20);
 		if (price === null || rolls === null || tier === null) return { error: 'price, rolls, tier' };
-		const pityN = b.pity_n === '' || b.pity_n == null ? null : int(b.pity_n, 1, 1000);
-		if (b.pity_item && !(await database('items').where('code', b.pity_item).first('code'))) return { error: 'unknown pity item' };
 		const drops: any[] = Array.isArray(b.drops) ? b.drops : [];
 		const clean: any[] = [];
 		for (const d of drops) {
@@ -157,7 +155,7 @@ export function registerAdminGemsContentRoutes(router: any, context: any) {
 		}
 		if (!clean.some((d) => !d.guaranteed)) return { error: 'a chest needs at least one rolled drop' };
 		await database.transaction(async (trx: any) => {
-			const row = { price, rolls, tier, pity_n: pityN, pity_item: b.pity_item || null, once: !!b.once, active: b.active !== false };
+			const row = { price, rolls, tier, once: !!b.once, active: b.active !== false };
 			if (create) await trx('chests').insert({ code, ...row }); else await trx('chests').where('code', code).update(row);
 			await trx('chest_drops').where('chest_code', code).delete();
 			if (clean.length) await trx('chest_drops').insert(clean);

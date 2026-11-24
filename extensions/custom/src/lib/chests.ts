@@ -3,7 +3,7 @@
  *
  * roll() is pure: weights in, items out, the random function passed in (crypto.randomInt in
  * production, so a test can fix it). openChest() does the money and the items in one transaction:
- * spend, pity, roll, give, record. chest_opens.id is the client's request_id, so a double click
+ * spend, roll, give, record. chest_opens.id is the client's request_id, so a double click
  * opens once and the second call gets the first result back.
  */
 import { randomInt } from 'node:crypto';
@@ -29,10 +29,9 @@ export function pickWeighted<T extends { weight: number }>(list: T[], rand: Rand
 
 /**
  * What one opening gives: the guaranteed items, then `rolls` weighted rolls. A learner with Premium gets the
- * drop's premium_alt where it has one. Pity: when the opens without `pity.item` reach pity.n - 1, this one
- * holds it (the last roll turns into it). Returns the items and the pity counter after this opening.
+ * drop's premium_alt where it has one. Nothing is guaranteed beyond the `guaranteed` drops: no pity counter.
  */
-export function roll(drops: Drop[], rolls: number, o: { premium: boolean; rand: Rand; pity?: { n: number | null; item: string | null; misses: number } | null }) {
+export function roll(drops: Drop[], rolls: number, o: { premium: boolean; rand: Rand }) {
 	const swap = (d: Drop) => (o.premium && d.premium_alt ? d.premium_alt : d.item_code);
 	const items: string[] = drops.filter((d) => d.guaranteed).map(swap);
 	const pool = drops.filter((d) => !d.guaranteed);
@@ -40,20 +39,7 @@ export function roll(drops: Drop[], rolls: number, o: { premium: boolean; rand: 
 		const d = pickWeighted(pool, o.rand);
 		if (d) items.push(swap(d));
 	}
-	let pityHit = false;
-	const p = o.pity;
-	if (p && p.n && p.item) {
-		if (!items.includes(p.item) && p.misses + 1 >= p.n) {
-			// The last rolled item becomes the pity item (never a guaranteed one)
-			const rolled = items.length - drops.filter((d) => d.guaranteed).length;
-			if (rolled > 0) items[items.length - 1] = p.item;
-			else items.push(p.item);
-			pityHit = true;
-		}
-		const has = items.includes(p.item);
-		return { items, pityHit, misses: has ? 0 : p.misses + 1 };
-	}
-	return { items, pityHit, misses: 0 };
+	return { items };
 }
 
 /** Public odds: each drop's share of the rolls, in % with one decimal, for GET /chests/:code/odds */
@@ -77,7 +63,6 @@ export type ChestResult = {
 	chest: string;
 	price: number;
 	items: { code: string; kind: string; amount?: number; days?: number; badge?: string; serial_no?: number | null; also?: string }[];
-	pity: boolean;
 	balance: number;
 	premium_days: number;
 	replay?: boolean;
@@ -89,7 +74,7 @@ export class ChestError extends Error {
 
 /**
  * Open a chest. `free` = a prize (the price is not charged: a dare's chest reward). The item stays in the
- * learner's bag (shield, gold_star, extra_star) or is paid at once (gems, badge). A Premium day is only
+ * learner's bag (shield, gold_star) or is paid at once (gems, badge). A Premium day is only
  * counted here: the route gives it after the commit (grantRewards), as the other Premium days.
  */
 export async function openChest(db: any, userId: string, code: string, openId: string, o: { free?: boolean; premium: boolean; rand?: Rand; today?: string }): Promise<ChestResult> {
@@ -116,11 +101,8 @@ export async function openChest(db: any, userId: string, code: string, openId: s
 				throw e;
 			}
 		}
-		await trx('chest_pity').insert({ user_id: userId, chest_code: code }).onConflict(['user_id', 'chest_code']).ignore();
-		const pityRow = await trx('chest_pity').where({ user_id: userId, chest_code: code }).forUpdate().first();
 		const drops: Drop[] = await trx('chest_drops').select('item_code', 'weight', 'guaranteed', 'premium_alt').where('chest_code', code);
-		const out = roll(drops, Number(chest.rolls) || 1, { premium: o.premium, rand, pity: { n: chest.pity_n, item: chest.pity_item, misses: Number(pityRow.misses) || 0 } });
-		await trx('chest_pity').where({ user_id: userId, chest_code: code }).update({ misses: out.misses });
+		const out = roll(drops, Number(chest.rolls) || 1, { premium: o.premium, rand });
 
 		const items: ChestResult['items'] = [];
 		let premiumDays = 0;
@@ -133,7 +115,7 @@ export async function openChest(db: any, userId: string, code: string, openId: s
 			if (given.premiumDays) premiumDays += given.premiumDays;
 			items.push({ code: it.code, kind: it.kind, ...given.view });
 		}
-		const result: ChestResult = { open_id: openId, chest: code, price, items, pity: out.pityHit, balance: (await lockPurse(trx, userId)).coins, premium_days: premiumDays };
+		const result: ChestResult = { open_id: openId, chest: code, price, items, balance: (await lockPurse(trx, userId)).coins, premium_days: premiumDays };
 		await trx('chest_opens').insert({ id: openId, user_id: userId, chest_code: code, price, coin_event_id: eventId, result: JSON.stringify(result) });
 		return result;
 	});
@@ -176,7 +158,7 @@ export async function giveItem(trx: any, userId: string, it: any, o: { source: s
 		if (amount) await earnCoins(trx, userId, { reason: 'chest', amount, dedupe: `chest_item:${o.key}`, meta: { source: o.source, item: it.code, also: 'badge' } }, o.today);
 		return { view: { amount, also: 'badge_owned' }, premiumDays: 0 };
 	}
-	// shield, gold_star, extra_star: into the bag
+	// shield, gold_star: into the bag
 	const expires = it.expires_days ? new Date(Date.now() + Number(it.expires_days) * 86400_000) : null;
 	await trx('user_items').insert({ user_id: userId, item_code: it.code, expires_at: expires, source: o.source, source_id: o.sourceId });
 	return { view: {}, premiumDays: 0 };

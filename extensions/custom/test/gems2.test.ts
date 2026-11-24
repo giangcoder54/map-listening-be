@@ -87,17 +87,6 @@ describe('chests (pure)', () => {
 		assert.deepEqual(roll(only, 2, { premium: true, rand: lcg(1) }).items, ['a', 'a']);
 		assert.deepEqual(roll(only, 2, { premium: false, rand: lcg(1) }).items, ['c', 'c']);
 	});
-	test('pity: after n-1 openings without the item, the next one holds it, and the counter resets', () => {
-		const pity = { n: 4, item: 'c', misses: 0 };
-		let misses = 0; let hits = 0;
-		const rand = () => 0; // always the first drop, never c
-		for (let i = 0; i < 8; i++) {
-			const r = roll(drops, 1, { premium: false, rand, pity: { ...pity, misses } });
-			misses = r.misses;
-			if (r.items.includes('c')) hits++;
-		}
-		assert.equal(hits, 2, 'every 4th opening');
-	});
 	test('guaranteed items are always in', () => {
 		const g: Drop[] = [...drops, { item_code: 'g', weight: 1, guaranteed: true, premium_alt: null }];
 		assert.ok(roll(g, 1, { premium: false, rand: lcg(5) }).items.includes('g'));
