@@ -7,3 +7,4 @@
 2027-01-02_remove_premium.sql
 2027-01-03_chest_odds_platinum.sql
 2027-01-04_intensive_parts.sql
+2027-01-05_coop_voice_limit.sql

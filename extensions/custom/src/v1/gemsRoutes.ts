@@ -339,7 +339,7 @@ export function registerGemsRoutes(router: any, context: any) {
 	act('leave', (_r, u, id) => leaveCoop(database, u, id));
 	// presence: the page pings every 10 s (and says "bye" when the tab closes); no push, nothing changed for the other player
 	router.post('/coop/:id/ping', learner('rooms', async (req, res, userId) => res.json({ success: true, data: await pingCoop(database, userId, String(req.params.id), req.body?.bye === true) })));
-	act('voice', (_r, u, id) => joinVoice(database, u, id));
+	act('voice', (r, u, id) => joinVoice(database, u, id, r.body?.start === true));
 
 	void BASE_LANG;
 }
