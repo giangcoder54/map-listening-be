@@ -4,13 +4,13 @@
  *   /admin/gems/cards    Sự thật hay Thử thách: list (with how often drawn and done), create, edit, delete
  *   /admin/gems/chests   chests with their drops and what one opening is worth against its price; edit, create
  *   /admin/gems/items    items: worth, expiry, switch, names
- *   /admin/gems/packs    top-up packs
+ *   /admin/gems/packs    top-up packs (VND price; Polar product id for card payment, its USD price read from Polar)
  *   /admin/gems/orders   top-ups paid or waiting; POST .../chargeback takes the Kim cương back
- *   /admin/gems/premium  who still has Premium (the plans no longer sold), for T4.6
  */
 import { worthOf, type Drop } from '../lib/chests';
 import { chargebackCoinOrder, packCoins } from '../lib/gemOrders';
 import { CoinError } from '../lib/coins';
+import { polarPackProduct } from '../lib/polar';
 
 const int = (v: any, min: number, max: number) => {
 	const n = Number(v);
@@ -135,7 +135,7 @@ export function registerAdminGemsContentRoutes(router: any, context: any) {
 		]);
 		const values = Object.fromEntries(items.map((i: any) => [i.code, Number(i.value)]));
 		return chests.map((c: any) => {
-			const own = drops.filter((d: any) => d.chest_code === c.code).map((d: any) => ({ id: d.id, item_code: d.item_code, weight: Number(d.weight), guaranteed: d.guaranteed, premium_alt: d.premium_alt }));
+			const own = drops.filter((d: any) => d.chest_code === c.code).map((d: any) => ({ id: d.id, item_code: d.item_code, weight: Number(d.weight), guaranteed: d.guaranteed }));
 			const worth = worthOf(own as Drop[], Number(c.rolls), values);
 			return { ...c, drops: own, worth, worth_pct: c.price > 0 ? Math.round((worth / c.price) * 100) : null, names: Object.fromEntries(tr.filter((t: any) => t.code === c.code).map((t: any) => [t.lang, t.name || ''])) };
 		});
@@ -150,8 +150,7 @@ export function registerAdminGemsContentRoutes(router: any, context: any) {
 		for (const d of drops) {
 			const w = int(d.weight, 1, 1_000_000);
 			if (w === null || !(await database('items').where('code', d.item_code).first('code'))) return { error: `drop ${d.item_code}: weight or item` };
-			if (d.premium_alt && !(await database('items').where('code', d.premium_alt).first('code'))) return { error: `drop ${d.item_code}: unknown premium_alt` };
-			clean.push({ chest_code: code, item_code: d.item_code, weight: w, guaranteed: !!d.guaranteed, premium_alt: d.premium_alt || null });
+			clean.push({ chest_code: code, item_code: d.item_code, weight: w, guaranteed: !!d.guaranteed });
 		}
 		if (!clean.some((d) => !d.guaranteed)) return { error: 'a chest needs at least one rolled drop' };
 		await database.transaction(async (trx: any) => {
@@ -190,8 +189,23 @@ export function registerAdminGemsContentRoutes(router: any, context: any) {
 		const price = int(b.price_vnd, 1000, 100_000_000), coins = int(b.coins, 1, 10_000_000), bonus = int(b.bonus_pct ?? 0, 0, 500), sort = int(b.sort ?? 0, 0, 1000);
 		const first = Number(b.first_mult ?? 1);
 		if (price === null || coins === null || bonus === null || sort === null || !(first >= 1 && first <= 5)) return bad(res, 'price_vnd, coins, bonus_pct, first_mult (1-5), sort');
-		await database('xu_packs').insert({ code, price_vnd: price, coins, bonus_pct: bonus, first_mult: first, active: b.active !== false, sort }).onConflict('code').merge();
-		return res.json({ success: true });
+		const row: Record<string, unknown> = { code, price_vnd: price, coins, bonus_pct: bonus, first_mult: first, active: b.active !== false, sort };
+		// Card (Polar): the team pastes the product id, the USD price is read from Polar. Empty = bank transfer only.
+		// Left out of the body = unchanged.
+		if (b.polar_product_id !== undefined) {
+			const pid = String(b.polar_product_id ?? '').trim();
+			if (!pid) Object.assign(row, { polar_product_id: null, price_usd_cents: null });
+			else {
+				if (!/^[A-Za-z0-9-]{8,64}$/.test(pid)) return bad(res, 'Product id Polar không đúng dạng (copy ở Products → Catalogue → ⋯ → Copy Product ID).');
+				const other = await database('xu_packs').where('polar_product_id', pid).whereNot('code', code).first('code');
+				if (other) return bad(res, `Sản phẩm này đã gắn với gói ${other.code}.`);
+				const p = await polarPackProduct(pid);
+				if (!p.ok) return bad(res, p.error);
+				Object.assign(row, { polar_product_id: pid, price_usd_cents: p.priceCents });
+			}
+		}
+		await database('xu_packs').insert(row).onConflict('code').merge();
+		return res.json({ success: true, data: { price_usd_cents: row.price_usd_cents } });
 	}));
 	router.delete('/admin/gems/packs/:code', admin(async (req, res) => {
 		// Orders keep their pack_code: a pack is switched off, never deleted
@@ -202,7 +216,7 @@ export function registerAdminGemsContentRoutes(router: any, context: any) {
 	// ── orders ─────────────────────────────────────────────────────────────────────────────────
 	router.get('/admin/gems/orders', admin(async (_req, res) => {
 		const rows = await database('purchase_histories as p').join('directus_users as u', 'u.id', 'p.user').where('p.product_type', 'coins').orderBy('p.date_created', 'desc').limit(100)
-			.select('p.id', 'p.status', 'p.amount', 'p.coins', 'p.pack_code', 'p.transfer_code', 'p.date_created', 'p.date_transfer', 'u.email', 'u.gems_flagged');
+			.select('p.id', 'p.status', 'p.amount', 'p.currency', 'p.payment_method', 'p.coins', 'p.pack_code', 'p.transfer_code', 'p.date_created', 'p.date_transfer', 'u.email', 'u.gems_flagged');
 		return res.json({ success: true, data: rows });
 	}));
 	router.post('/admin/gems/orders/:id/chargeback', admin(async (req, res) => {
@@ -214,13 +228,4 @@ export function registerAdminGemsContentRoutes(router: any, context: any) {
 		}
 	}));
 
-	// ── Premium that is still running (T4.6) ──────────────────────────────────────────────────
-	router.get('/admin/gems/premium', admin(async (_req, res) => {
-		const row = await database('directus_users').where('is_premium', true).whereRaw('is_internal IS NOT TRUE')
-			.select(database.raw("count(*) FILTER (WHERE subscription_type = 'lifetime') AS lifetime"),
-				database.raw("count(*) FILTER (WHERE coalesce(subscription_type, '') <> 'lifetime' AND premium_until > now()) AS running"),
-				database.raw("min(premium_until) FILTER (WHERE coalesce(subscription_type, '') <> 'lifetime' AND premium_until > now()) AS next_end"),
-				database.raw("max(premium_until) FILTER (WHERE coalesce(subscription_type, '') <> 'lifetime' AND premium_until > now()) AS last_end")).first();
-		return res.json({ success: true, data: { lifetime: Number(row.lifetime), running: Number(row.running), next_end: row.next_end, last_end: row.last_end } });
-	}));
 }

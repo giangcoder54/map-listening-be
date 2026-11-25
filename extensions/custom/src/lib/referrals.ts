@@ -13,9 +13,9 @@
  *   - else, first paid order of that friend -> the referrer gets Premium days
  */
 import { customAlphabet } from 'nanoid';
-import { activatePremiumForUser } from '../utils';
+import { earnCoins } from './coins';
 import { growthConfig } from './growthConfig';
-import { notifyAdmin } from './sepay';
+import { notifyAdmin } from './telegram';
 import { fraudFlags } from './fraud';
 
 export const REF_CODE_RE = /^[a-z0-9][a-z0-9-]{2,30}[a-z0-9]$/;
@@ -138,8 +138,8 @@ const addDays = (date: Date, days: number) => new Date(date.getTime() + days * 8
  * A paid order of a referred user -> reward or commission. Idempotent: one row per order
  * (UNIQUE purchase_id), so a second "published" update of the same order does nothing.
  */
-export async function recordConversion(purchaseId: string, context: any, schema: any) {
-	const { database, logger, services } = context;
+export async function recordConversion(purchaseId: string, context: any) {
+	const { database, logger } = context;
 	const purchase = await database('purchase_histories').where('id', purchaseId).first();
 	if (!purchase || purchase.status !== 'published' || !purchase.user) return;
 	const amount = Number(purchase.amount) || 0;
@@ -200,36 +200,26 @@ export async function recordConversion(purchaseId: string, context: any, schema:
 		return;
 	}
 
-	// Suspended affiliate (e.g. for fraud): earns nothing, not even Premium days
+	// Suspended affiliate (e.g. for fraud): earns nothing, no reward either
 	if (await database('affiliates').where({ user_id: buyer.referred_by, status: 'suspended' }).first('id')) return;
 
-	// Normal inviter: Premium days, only for the friend's first paid order
+	// Normal inviter: Kim cương, only for the friend's first paid order
 	const earlier = await paidOrders(database, buyer.id).whereNot('id', purchaseId).first('id');
-	if (earlier || !cfg.referralRewardDays) return;
+	const coins = Math.round((Number(purchase.coins) || 0) * cfg.referralRewardPct / 100);
+	if (earlier || coins <= 0) return;
 
-	const referrer = await database('directus_users')
-		.select('id', 'is_premium', 'premium_until', 'subscription_type')
-		.where('id', buyer.referred_by)
-		.first();
-	if (!referrer) return;
-	const lifetime = referrer.subscription_type === 'lifetime' && referrer.is_premium;
-
-	await database('referral_conversions').insert({
-		...base,
-		kind: 'reward',
-		amount: 0,
-		reward_days: cfg.referralRewardDays,
-		status: lifetime ? 'void' : 'approved',
-	}).onConflict('purchase_id').ignore();
-	if (lifetime) return;
-
-	const current = referrer.is_premium && referrer.premium_until ? new Date(referrer.premium_until) : null;
-	const from = current && current.getTime() > Date.now() ? current : new Date();
-	const endDate = addDays(from, cfg.referralRewardDays).toISOString();
-	// UsersService: the role change clears the permission cache (see utils.ts)
-	const usersService = new services.UsersService({ schema, accountability: { admin: true } });
-	await activatePremiumForUser(referrer.id, endDate, referrer.subscription_type || 'premium', usersService, database, logger);
-	logger?.info?.(`[referral] ${referrer.id} earned ${cfg.referralRewardDays} Premium days (order ${purchaseId})`);
+	await database.transaction(async (trx: any) => {
+		const added = await trx('referral_conversions').insert({
+			...base,
+			kind: 'reward',
+			amount: 0,
+			reward_coins: coins,
+			status: 'approved',
+		}).onConflict('purchase_id').ignore().returning('id');
+		if (!added.length) return;
+		await earnCoins(trx, buyer.referred_by, { reason: 'referral', amount: coins, dedupe: `referral:${purchaseId}`, meta: { order_id: purchaseId } });
+		logger?.info?.(`[referral] ${buyer.referred_by} earned ${coins} Kim cương (order ${purchaseId})`);
+	});
 }
 
 /** Refunded order: its commission no longer counts (unless already paid out) */

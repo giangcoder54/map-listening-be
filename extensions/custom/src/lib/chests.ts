@@ -10,7 +10,7 @@ import { randomInt } from 'node:crypto';
 import { COIN, CoinError, earnCoins, lockPurse, spend } from './coins';
 import { vnDay } from './days';
 
-export type Drop = { item_code: string; weight: number; guaranteed: boolean; premium_alt: string | null };
+export type Drop = { item_code: string; weight: number; guaranteed: boolean };
 export type Rand = (n: number) => number;
 /** Whole number in [0, n) from the system's secure random */
 export const secureRand: Rand = (n) => randomInt(n);
@@ -28,16 +28,15 @@ export function pickWeighted<T extends { weight: number }>(list: T[], rand: Rand
 }
 
 /**
- * What one opening gives: the guaranteed items, then `rolls` weighted rolls. A learner with Premium gets the
- * drop's premium_alt where it has one. Nothing is guaranteed beyond the `guaranteed` drops: no pity counter.
+ * What one opening gives: the guaranteed items, then `rolls` weighted rolls. Nothing is guaranteed beyond the
+ * `guaranteed` drops: no pity counter.
  */
-export function roll(drops: Drop[], rolls: number, o: { premium: boolean; rand: Rand }) {
-	const swap = (d: Drop) => (o.premium && d.premium_alt ? d.premium_alt : d.item_code);
-	const items: string[] = drops.filter((d) => d.guaranteed).map(swap);
+export function roll(drops: Drop[], rolls: number, o: { rand: Rand }) {
+	const items: string[] = drops.filter((d) => d.guaranteed).map((d) => d.item_code);
 	const pool = drops.filter((d) => !d.guaranteed);
 	for (let i = 0; i < rolls; i++) {
 		const d = pickWeighted(pool, o.rand);
-		if (d) items.push(swap(d));
+		if (d) items.push(d.item_code);
 	}
 	return { items };
 }
@@ -64,7 +63,6 @@ export type ChestResult = {
 	price: number;
 	items: { code: string; kind: string; amount?: number; days?: number; badge?: string; serial_no?: number | null; also?: string }[];
 	balance: number;
-	premium_days: number;
 	replay?: boolean;
 };
 
@@ -74,10 +72,9 @@ export class ChestError extends Error {
 
 /**
  * Open a chest. `free` = a prize (the price is not charged: a dare's chest reward). The item stays in the
- * learner's bag (shield, gold_star) or is paid at once (gems, badge). A Premium day is only
- * counted here: the route gives it after the commit (grantRewards), as the other Premium days.
+ * learner's bag (shield, gold_star) or is paid at once (gems, badge).
  */
-export async function openChest(db: any, userId: string, code: string, openId: string, o: { free?: boolean; premium: boolean; rand?: Rand; today?: string }): Promise<ChestResult> {
+export async function openChest(db: any, userId: string, code: string, openId: string, o: { free?: boolean; rand?: Rand; today?: string } = {}): Promise<ChestResult> {
 	const rand = o.rand || secureRand;
 	const today = o.today || vnDay();
 	return db.transaction(async (trx: any) => {
@@ -101,21 +98,19 @@ export async function openChest(db: any, userId: string, code: string, openId: s
 				throw e;
 			}
 		}
-		const drops: Drop[] = await trx('chest_drops').select('item_code', 'weight', 'guaranteed', 'premium_alt').where('chest_code', code);
-		const out = roll(drops, Number(chest.rolls) || 1, { premium: o.premium, rand });
+		const drops: Drop[] = await trx('chest_drops').select('item_code', 'weight', 'guaranteed').where('chest_code', code);
+		const out = roll(drops, Number(chest.rolls) || 1, { rand });
 
 		const items: ChestResult['items'] = [];
-		let premiumDays = 0;
 		let n = 0;
 		for (const itemCode of out.items) {
 			const it = await trx('items').where('code', itemCode).first();
 			if (!it) continue;
 			n += 1;
 			const given = await giveItem(trx, userId, it, { source: 'chest', sourceId: openId, key: `${openId}:${n}`, today });
-			if (given.premiumDays) premiumDays += given.premiumDays;
 			items.push({ code: it.code, kind: it.kind, ...given.view });
 		}
-		const result: ChestResult = { open_id: openId, chest: code, price, items, balance: (await lockPurse(trx, userId)).coins, premium_days: premiumDays };
+		const result: ChestResult = { open_id: openId, chest: code, price, items, balance: (await lockPurse(trx, userId)).coins };
 		await trx('chest_opens').insert({ id: openId, user_id: userId, chest_code: code, price, coin_event_id: eventId, result: JSON.stringify(result) });
 		return result;
 	});
@@ -124,18 +119,14 @@ export async function openChest(db: any, userId: string, code: string, openId: s
 /**
  * Hand one item to a learner. Gems are paid into the purse (reason chest), a badge goes to the shelf
  * (numbered when it has a serial_max; one already owned or all numbers taken pays its worth in Kim
- * cương instead), a Premium day is only counted (the caller gives it after the commit); the rest go to
- * the bag with an expiry.
+ * cương instead); the rest go to the bag with an expiry.
  */
 export async function giveItem(trx: any, userId: string, it: any, o: { source: string; sourceId: string; key: string; today: string }) {
 	const params = (typeof it.params === 'string' ? JSON.parse(it.params) : it.params) || {};
 	if (it.kind === 'gems') {
 		const amount = Number(params.amount) || 0;
 		await earnCoins(trx, userId, { reason: 'chest', amount, dedupe: `chest_item:${o.key}`, meta: { source: o.source, item: it.code } }, o.today);
-		return { view: { amount }, premiumDays: 0 };
-	}
-	if (it.kind === 'premium_day') {
-		return { view: { days: Number(params.days) || 1 }, premiumDays: Number(params.days) || 1 };
+		return { view: { amount } };
 	}
 	if (it.kind === 'badge') {
 		const badge = await trx('badges').where('code', params.badge).first();
@@ -150,18 +141,18 @@ export async function giveItem(trx: any, userId: string, it: any, o: { source: s
 			}
 			if (!full) {
 				await trx('user_badges').insert({ user_id: userId, badge_code: badge.code, serial_no: serial });
-				return { view: { badge: badge.code, serial_no: serial }, premiumDays: 0 };
+				return { view: { badge: badge.code, serial_no: serial } };
 			}
 		}
 		// Already on the shelf, or every number is taken: what it is worth, in Kim cương
 		const amount = Number(it.value) || 0;
 		if (amount) await earnCoins(trx, userId, { reason: 'chest', amount, dedupe: `chest_item:${o.key}`, meta: { source: o.source, item: it.code, also: 'badge' } }, o.today);
-		return { view: { amount, also: 'badge_owned' }, premiumDays: 0 };
+		return { view: { amount, also: 'badge_owned' } };
 	}
 	// shield, gold_star: into the bag
 	const expires = it.expires_days ? new Date(Date.now() + Number(it.expires_days) * 86400_000) : null;
 	await trx('user_items').insert({ user_id: userId, item_code: it.code, expires_at: expires, source: o.source, source_id: o.sourceId });
-	return { view: {}, premiumDays: 0 };
+	return { view: {} };
 }
 
 /** A live (not used, not expired) item of a learner, locked for this transaction; null when none */

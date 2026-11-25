@@ -38,6 +38,7 @@
 		"link": "directus-extension link",
 		"validate": "directus-extension validate",
 		"add": "directus-extension add",
+		"test:payment": "esbuild test/payment.test.ts --bundle --platform=node --format=esm --outfile=test/.out/payment.test.mjs --log-level=warning && docker exec map-listening-api node --test /directus/extensions/custom/test/.out/payment.test.mjs",
 		"test:xp": "esbuild test/xp.test.ts --bundle --platform=node --format=esm --outfile=test/.out/xp.test.mjs --log-level=warning && docker exec map-listening-api node --test /directus/extensions/custom/test/.out/xp.test.mjs",
 		"test:gems": "esbuild test/gems.test.ts --bundle --platform=node --format=esm --outfile=test/.out/gems.test.mjs --log-level=warning && docker exec map-listening-api node --test /directus/extensions/custom/test/.out/gems.test.mjs",
 		"test:gems2": "esbuild test/gems2.test.ts --bundle --platform=node --format=esm --outfile=test/.out/gems2.test.mjs --log-level=warning && docker exec map-listening-api node --test /directus/extensions/custom/test/.out/gems2.test.mjs",

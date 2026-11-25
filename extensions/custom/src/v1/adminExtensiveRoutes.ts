@@ -65,7 +65,7 @@ export function registerAdminExtensiveRoutes(router: any, context: any) {
 				FROM el_attempts a WHERE a.lesson_id = l.id AND a.finished_at IS NOT NULL
 			) st ON true
 			WHERE ${where.join(' AND ')}
-			ORDER BY l.level, l.sort, l.date_created
+			ORDER BY ${req.query?.sort === 'level' ? 'l.level, l.sort, l.date_created' : 'l.date_created DESC, l.title'}
 			LIMIT ${limit} OFFSET ${(page - 1) * limit}`, params);
 		return res.json({ success: true, data: { items: rows.map((r: any) => ({ ...r, thumbnail: thumbOf(r), full_count: undefined })), total: rows[0]?.full_count || 0, page, limit } });
 	}));

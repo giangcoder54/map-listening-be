@@ -12,7 +12,6 @@
  * itself is premium, unless they bought it with Xu (listening_unlocks, lib/coins.ts).
  * Progress lives in listening_progress (one row per user x lesson).
  */
-import { isPremiumUser } from './premium';
 
 export type AnswerMode = 'one_answer' | 'per_clip';
 export type StepKey = 'type' | 'voice' | 'challenge' | 'more';
@@ -117,7 +116,7 @@ export function answerOf(
  * (locked) and count them in progress. Only public metadata is read here.
  */
 export async function loadLessonGraph(req: any, context: any) {
-	const { database, logger } = context;
+	const { database } = context;
 	const userId: string | null = req.accountability?.user ?? null;
 
 	const [groupRows, skillRows, lessonRows, groupTr, skillTr, clipRows] = await Promise.all([
@@ -196,12 +195,10 @@ export async function loadLessonGraph(req: any, context: any) {
 	const testedOut = new Set<string>();
 	const started = new Set<string>();
 	const unlocked = new Set<string>();
-	let premium = false;
 	if (userId) {
-		const [rows, buys, isPremium] = await Promise.all([
+		const [rows, buys] = await Promise.all([
 			database('listening_progress').select('lesson_id', 'status').where('user_id', userId),
 			database('listening_unlocks').select('lesson_id').where('user_id', userId),
-			isPremiumUser(database, userId, logger),
 		]);
 		for (const r of rows) {
 			if (r.status === 'in_progress') started.add(r.lesson_id);
@@ -209,15 +206,14 @@ export async function loadLessonGraph(req: any, context: any) {
 			if (r.status === 'tested_out') testedOut.add(r.lesson_id);
 		}
 		for (const r of buys) unlocked.add(r.lesson_id);
-		premium = isPremium;
 	}
 
 	const skillOf = (l: LessonRow) => skillById.get(l.skill_id)!;
 	const groupOf = (l: LessonRow) => groupById.get(skillOf(l).group_id)!;
-	/** Premium content: the lesson, its skill or its group. */
+	/** Paid content (costs Kim cương): the lesson, its skill or its group. */
 	const isPremiumContent = (l: LessonRow) => l.is_premium || skillOf(l).is_premium || groupOf(l).is_premium;
-	/** Open: free content, a Premium learner, or a lesson bought with Xu (kept after Premium ends) */
-	const isLocked = (l: LessonRow) => !premium && isPremiumContent(l) && !unlocked.has(l.id);
+	/** Open: free content, or a lesson bought with Kim cương */
+	const isLocked = (l: LessonRow) => isPremiumContent(l) && !unlocked.has(l.id);
 	const numberOf = (l: LessonRow) => (lessonsBySkill.get(l.skill_id) || []).findIndex((x) => x.id === l.id) + 1;
 	/**
 	 * The lessons of a rule open one after the other for a signed-in learner: a lesson opens
@@ -338,7 +334,7 @@ export async function loadLessonGraph(req: any, context: any) {
 		playable.find((l) => (UUID_RE.test(key) ? l.id === key : l.short_id === key)) || null;
 
 	return {
-		userId, premium, groups, groupById, skills, skillById, lessons: playable, lessonById, lessonsBySkill, clipStats,
+		userId, groups, groupById, skills, skillById, lessons: playable, lessonById, lessonsBySkill, clipStats,
 		done, started, testedOut, skillOf, groupOf, isPremiumContent, isLocked, isOrderLocked, ruleLockedBy, numberOf, lessonCard, nextOf, skillSummary, groupSummary, findLesson,
 	};
 }

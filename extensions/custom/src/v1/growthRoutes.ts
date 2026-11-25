@@ -16,7 +16,7 @@
 import { affiliateCountryAllowed, growthConfig, minPayout, siteOrigin } from '../lib/growthConfig';
 import { REF_CODE_RE, approvedAffiliate, maskEmail, ensureReferralCode, findReferrer, referrerDisplayName, codeTaken, changeReferralCode } from '../lib/referrals';
 import { publicCode, resolveCode } from '../lib/promotions';
-import { notifyAdmin } from '../lib/sepay';
+import { notifyAdmin } from '../lib/telegram';
 import { attachAttribution } from '../lib/attribution';
 
 const ANON_ID_RE = /^[A-Za-z0-9-]{16,64}$/;
@@ -40,18 +40,18 @@ async function inviteStats(database: any, userId: string) {
 	const [clicks, paying, rewards] = await Promise.all([
 		database('referral_clicks').where('referrer_id', userId).count('* as n').first(),
 		database('referral_conversions').where('referrer_id', userId).countDistinct('referred_user_id as n').first(),
-		database('referral_conversions').where({ referrer_id: userId, kind: 'reward', status: 'approved' }).sum('reward_days as n').first(),
+		database('referral_conversions').where({ referrer_id: userId, kind: 'reward', status: 'approved' }).sum('reward_coins as n').first(),
 	]);
 	return {
 		clicks: Number(clicks?.n) || 0,
 		paying: Number(paying?.n) || 0,
-		reward_days: Number(rewards?.n) || 0,
+		reward_coins: Number(rewards?.n) || 0,
 	};
 }
 
 /**
  * Affiliate numbers: only what earned a commission (friends who paid before the user was
- * an affiliate gave Premium days, they show on /invite instead)
+ * an affiliate gave Kim cương, they show on /invite instead)
  */
 async function affiliateStats(database: any, userId: string) {
 	const [clicks, sales] = await Promise.all([
@@ -64,15 +64,15 @@ async function affiliateStats(database: any, userId: string) {
 	]);
 	const rewards = await database('referral_conversions')
 		.where({ referrer_id: userId, kind: 'reward', status: 'approved' })
-		.select(database.raw('COUNT(DISTINCT referred_user_id)::int AS friends, COALESCE(SUM(reward_days), 0)::int AS days'))
+		.select(database.raw('COUNT(DISTINCT referred_user_id)::int AS friends, COALESCE(SUM(reward_coins), 0)::int AS coins'))
 		.first();
 	return {
 		clicks: Number(clicks?.n) || 0,
 		customers: Number(sales?.customers) || 0,
 		orders: Number(sales?.orders) || 0,
-		/** Friends who paid before the user became an affiliate (Premium days, not money) */
+		/** Friends who paid before the user became an affiliate (Kim cương, not money) */
 		reward_friends: Number(rewards?.friends) || 0,
-		reward_days: Number(rewards?.days) || 0,
+		reward_coins: Number(rewards?.coins) || 0,
 	};
 }
 
@@ -195,7 +195,7 @@ export function registerGrowthRoutes(router: any, context: any) {
 					code,
 					link: `${siteOrigin()}/?ref=${code}`,
 					discount_percent: cfg.referralDiscountPercent,
-					reward_days: cfg.referralRewardDays,
+					reward_pct: cfg.referralRewardPct,
 					stats,
 					affiliate_status: affiliate?.status || null,
 				},
@@ -333,7 +333,7 @@ export function registerGrowthRoutes(router: any, context: any) {
 				.where('r.referrer_id', userId);
 			const [rows, count, counts] = await Promise.all([
 				saleFilter(base(), status)
-					.select('r.kind', 'r.order_amount', 'r.amount', 'r.currency', 'r.rate', 'r.status', 'r.available_at', 'r.reward_days', 'r.date_created',
+					.select('r.kind', 'r.order_amount', 'r.amount', 'r.currency', 'r.rate', 'r.status', 'r.available_at', 'r.reward_coins', 'r.date_created',
 						'h.billing_cycle', 'b.first_name', 'b.last_name', 'b.email')
 					.orderBy('r.date_created', 'desc')
 					.limit(limit)
@@ -359,7 +359,7 @@ export function registerGrowthRoutes(router: any, context: any) {
 					amount: Number(r.amount) || 0,
 					currency: r.currency,
 					rate: r.rate != null ? Number(r.rate) : null,
-					reward_days: r.reward_days,
+					reward_coins: r.reward_coins,
 					available_at: r.available_at,
 					status: r.status === 'void' ? 'void'
 						: r.kind === 'reward' ? 'reward'

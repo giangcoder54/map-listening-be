@@ -188,7 +188,7 @@ export function registerLessonRoutes(router: any, context: any) {
 				const lesson = last ? g.lessonById.get(last.lesson_id) : null;
 				if (lesson && g.skillSummary(g.skillOf(lesson)).next) resume = { skill_id: lesson.skill_id };
 			}
-			return res.json({ success: true, data: { premium: g.premium, groups, resume } });
+			return res.json({ success: true, data: { groups, resume } });
 		} catch (error) {
 			return fail(res, 'Load groups', error);
 		}
@@ -224,7 +224,7 @@ export function registerLessonRoutes(router: any, context: any) {
 				...s,
 				lessons: (g.lessonsBySkill.get(s.id) || []).slice(0, PREVIEW_COUNT).map(g.lessonCard),
 			}));
-			return res.json({ success: true, data: { premium: g.premium, group: { ...summary, skills } } });
+			return res.json({ success: true, data: { group: { ...summary, skills } } });
 		} catch (error) {
 			return fail(res, 'Load group', error);
 		}
@@ -267,7 +267,7 @@ export function registerLessonRoutes(router: any, context: any) {
 					lessons_done: lessons.filter((l) => g.done.has(l.id)).length,
 					test: {
 						kind: allDone ? 'final' : 'skip',
-						available: open.length > 0 && (allDone || g.premium) && (g.premium || !g.ruleLockedBy(skill)),
+						available: open.length > 0 && allDone && !g.ruleLockedBy(skill),
 						size: Number(settings?.test_size) || 8,
 						pass: Math.round((Number(settings?.pass_ratio) || 0.8) * 100),
 						// A second go the same day costs Xu
@@ -278,7 +278,6 @@ export function registerLessonRoutes(router: any, context: any) {
 			return res.json({
 				success: true,
 				data: {
-					premium: g.premium,
 					skill: { ...g.skillSummary(skill), group: { id: group.id, name: group.name, slug: group.slug, answer_mode: group.answer_mode } },
 					lessons: lessons.map((l) => ({ ...g.lessonCard(l), titles: titlesOf(l.id) })),
 					standing,
@@ -325,7 +324,6 @@ export function registerLessonRoutes(router: any, context: any) {
 				success: true,
 				data: {
 					locked: !open,
-					premium: g.premium,
 					unlock: !open ? { price: COIN.unlock[lesson.kind || 'pattern'] ?? COIN.unlock.pattern } : null,
 					lesson: {
 						...g.lessonCard(lesson),

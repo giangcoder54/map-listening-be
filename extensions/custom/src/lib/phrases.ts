@@ -16,7 +16,6 @@
  */
 import { createEmptyCard, fsrs, generatorParameters, Rating, type Card, type Grade } from 'ts-fsrs';
 import { growthConfig } from './growthConfig';
-import { isPremiumUser } from './premium';
 import { XP } from './xp';
 
 export const TZ = 'Asia/Ho_Chi_Minh';
@@ -175,7 +174,7 @@ export const daysUntil = (date: Date | string) =>
  * premium phrases (locked).
  */
 export async function loadPhraseCatalog(req: any, context: any) {
-	const { database, logger } = context;
+	const { database } = context;
 	const userId: string | null = req.accountability?.user ?? null;
 	const cfg = growthConfig();
 
@@ -252,7 +251,6 @@ export async function loadPhraseCatalog(req: any, context: any) {
 			if (todayKey(new Date(r.learned_at)) === today) newToday++;
 		}
 	}
-	const premium = userId ? await isPremiumUser(database, userId, logger) : false;
 	/** Phrases bought with Xu: open for good, their AI checks included (lib/coins.ts unlockPhrase) */
 	const bought = new Set<string>(userId ? (await database('phrase_unlocks').where('user_id', userId).select('phrase_id').catch(() => [])).map((r: any) => r.phrase_id) : []);
 
@@ -265,13 +263,13 @@ export async function loadPhraseCatalog(req: any, context: any) {
 	 */
 	const isPremiumContent = (p: any) => !!(p.is_premium || typeById.get(p.type_id)?.is_premium || p.freq_tier === 4 || numberOf(p) > cfg.phraseFreePerType);
 	/** Learned phrases stay open (they were open when learned) */
-	const isLocked = (p: any) => !premium && !progress.has(p.id) && !bought.has(p.id) && isPremiumContent(p);
-	const newLimit = premium ? null : cfg.phraseFreeNewPerDay;
+	const isLocked = (p: any) => !progress.has(p.id) && !bought.has(p.id) && isPremiumContent(p);
+	const newLimit: number | null = cfg.phraseFreeNewPerDay;
 	/** A new phrase can be started today */
 	const canStartNew = () => newLimit === null || newToday < newLimit;
 
 	return {
-		userId, premium, cfg, types: [...typeById.values()], typeById, phrases: playable, byType, phraseTrById, clipsById,
+		userId, cfg, types: [...typeById.values()], typeById, phrases: playable, byType, phraseTrById, clipsById,
 		progress, bought, newToday, newLimit, numberOf, isPremiumContent, isLocked, canStartNew, typesOf, linkUsage,
 	};
 }

@@ -28,7 +28,7 @@
  *   sound       anything else: heard, known, not recognised
  * "Real word" and "rare word" come from the library's own subtitles (wordRank.ts, il_wordrank.py).
  */
-import { createEmptyCard, Rating } from 'ts-fsrs';
+import { Rating } from 'ts-fsrs';
 import { cardColumns, schedule } from './review';
 import { WORD_LIST } from './wordRank';
 
@@ -389,6 +389,8 @@ export function likelyUnknown(words: WordResult[]): string[] {
 		// A REAL word typed close to it (resize for reside): another word was heard, so ask "misheard or misspelt?" instead.
 		// A non-word typed close to a rare word (frount for frown) is the sound written down by a learner who does not know the word
 		.filter((x) => !(x.typed && isWord(bare(x.typed)) && lev(bare(x.w), bare(x.typed)) / Math.max(x.w.length, 1) <= 0.5))
+		// Only the ending differs (housemate for housemates): the word is known, its end was lost, whether or not the list has it
+		.filter((x) => !(x.typed && endingOff(bare(x.w), bare(x.typed))))
 		.map((x) => x.w))];
 }
 
@@ -469,13 +471,6 @@ export function reviewGrade(correct: boolean, listens: number, slow: boolean) {
 	if (slow || listens >= 3) return Rating.Hard;
 	if (listens === 2) return Rating.Good;
 	return Rating.Easy;
-}
-
-/** A new Review card: first review tomorrow */
-export function newCard(userId: string, sentenceId: string, label: Label, now = new Date()) {
-	const card = createEmptyCard(now);
-	card.due = new Date(now.getTime() + 24 * 3600 * 1000);
-	return { user_id: userId, kind: 'sentence', ref_id: sentenceId, label, ...cardColumns(card) };
 }
 
 export { schedule, cardColumns };

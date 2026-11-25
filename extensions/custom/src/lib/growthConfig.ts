@@ -34,8 +34,8 @@ const num = (column: string, env: string, fallback: number, min = 0, max = Numbe
 export const growthConfig = () => ({
 	/** % off the first order of a user who types someone's invite code */
 	referralDiscountPercent: num('referral_discount_percent', 'REFERRAL_DISCOUNT_PERCENT', 10, 0, 90),
-	/** Premium days a normal user earns for each invited friend who pays */
-	referralRewardDays: num('referral_reward_days', 'REFERRAL_REWARD_DAYS', 30, 0, 365),
+	/** Kim cương a normal user earns for an invited friend's first order, as a % of the Kim cương the friend bought */
+	referralRewardPct: num('referral_reward_pct', 'REFERRAL_REWARD_PCT', 30, 0, 100),
 	/** Commission % of an approved affiliate without their own rate */
 	affiliateDefaultRate: num('affiliate_default_rate', 'AFFILIATE_DEFAULT_RATE', 30, 0, 90),
 	/** Orders of a referred user earn commission for this many months after they came */

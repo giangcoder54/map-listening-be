@@ -8,8 +8,9 @@
  *   POST /daily-review/suspend            { kind, id }   "known, don't ask again": the card leaves review, nothing is deleted
  *   POST /daily-review/prompted           { action: 'shown' | 'later' | 'started' }   the popup was shown / answered
  *   (the popup itself reads its question from GET /me/engagement `review`, no request of its own)
- *   POST /daily-review/add                { attempt_id, items: [{ kind, text, other?, sentence_n, real?, note?, skill?, wrong? }] }
- *                                         the result screen's "add to review": a word goes to user_words, the rest to il_cards
+ *   POST /daily-review/spots              { attempt_id, op: add|remove|state, only?: [i], items: [{ kind, text, other?, sentence_n, real?, note?, skill?, wrong? }] }
+ *                                         the missed spots of an Intensive result, one card each: -> { states: [in|out|kept|none] }, aligned with items
+ *                                         (kept = already saved from another passage, never removed here)
  *
  * An exercise is easy first and harder as the learner gets it right (right_streak):
  *   0  hear it, choose among 2-3        1  hear it in another voice, choose        2+  hear it, type the word or phrase
@@ -25,12 +26,17 @@ import { mixUps } from '../lib/mixups';
 import { masteryOf } from '../lib/review';
 import { readClips, wrongOf } from './lessonRoutes';
 import { cleanIpa, meaningFor, meaningPool, shorten } from '../lib/meanings';
-import { grantRewards, recordPractice, vnDay } from '../lib/xp';
+import { recordPractice, vnDay } from '../lib/xp';
 import { CAP, KINDS, SECONDS, reviewPrompt, type Kind } from '../lib/reviewDue';
 
 const clean = (v: unknown, max = 600) => String(v ?? '').slice(0, max);
 /** Every card's schedule is a row of review_cards (user, kind, ref_id); what the card is about is in its own table */
 const CONTENT: Partial<Record<Kind, string>> = { word: 'user_words', pattern: 'il_cards', pair: 'il_cards', spell: 'il_cards' };
+/** A split structure's gap as it is saved (lib/dict.ts), and the most characters said between its two parts */
+const GAP = ' ... ';
+const GAP_MAX = 80;
+/** The database pattern of a phrase: a split structure = its parts in order within one line */
+const phraseRe = (f: string) => f.split(GAP).map(regexSafe).join(`\\M.{0,${GAP_MAX}}?\\m`);
 const regexSafe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/'/g, "['’]").replace(/ /g, '\\s+');
 const shuffle = <T,>(a: T[]) => { const b = [...a]; for (let i = b.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [b[i], b[j]] = [b[j]!, b[i]!]; } return b; };
 const lev = (a: string, b: string) => {
@@ -73,7 +79,7 @@ export function registerReviewRoutes(router: any, context: any) {
 			let at = Date.now();
 			try {
 				if (q) {
-					const re = `\m(${g.map(regexSafe).join('|')})\M`;
+					const re = `\m(${g.map(phraseRe).join('|')})\M`;
 					const { rows } = await database.raw(`
 						SELECT video_id, start_ms AS start, end_ms AS "end", text FROM transcript_lines
 						WHERE tsv @@ to_tsquery('simple', ?) AND text ~* ? AND end_ms - start_ms BETWEEN 1200 AND 8000
@@ -101,11 +107,21 @@ export function registerReviewRoutes(router: any, context: any) {
 		return row?.text ? String(row.text) : '';
 	};
 	/** The line with the phrase left out, for typing it in */
-	const blank = (text: string, forms: string[]) => {
-		const m = new RegExp(`(^|[^A-Za-z'’])(${forms.map(regexSafe).join('|')})(?![A-Za-z'’])`, 'i').exec(text);
-		if (!m) return { before: text, after: '', letters: 0 };
-		const at = m.index + m[1]!.length;
-		return { before: text.slice(0, at), after: text.slice(at + m[2]!.length), letters: m[2]!.replace(/\s+/g, ' ').length };
+	const blank = (text: string, forms: string[]): { before: string; mid?: string; after: string; letters: number } => {
+		const m = new RegExp(`(^|[^A-Za-z'’])(${forms.filter((f) => !f.includes(GAP)).map(regexSafe).join('|') || '(?!)'})(?![A-Za-z'’])`, 'i').exec(text);
+		if (m) {
+			const at = m.index + m[1]!.length;
+			return { before: text.slice(0, at), after: text.slice(at + m[2]!.length), letters: m[2]!.replace(/\s+/g, ' ').length };
+		}
+		// A split structure: two blanks, with what is said between them
+		for (const f of forms.filter((x) => x.includes(GAP))) {
+			const [a, b] = f.split(GAP).map(regexSafe);
+			const g = new RegExp(`(^|[^A-Za-z'’])(${a})(?![A-Za-z'’])([^]{0,${GAP_MAX}}?)(?<![A-Za-z'’])(${b})(?![A-Za-z'’])`, 'i').exec(text);
+			if (!g) continue;
+			const at = g.index + g[1]!.length;
+			return { before: text.slice(0, at), mid: g[3]!, after: text.slice(at + g[2]!.length + g[3]!.length + g[4]!.length), letters: g[2]!.length + g[4]!.length };
+		}
+		return { before: text, after: '', letters: 0 };
 	};
 	/** Wrong answers that could be heard for the word: common words that start alike and are near in length and spelling
 	 *  (reside: realize, reserve). The common words are the ones with a meaning in word_meanings, held in memory for an hour. */
@@ -416,7 +432,6 @@ export function registerReviewRoutes(router: any, context: any) {
 			attempts: 1,
 			xp: correct ? { reason: kind === 'word' ? 'word_review' : kind === 'form' ? 'review' : 'intensive_review', dedupe: `daily:${kind}:${id}:${vnDay()}`, lessonId: null } : null,
 		});
-		await grantRewards(context, req.schema, userId, won.rewards);
 		// What the learner sees after answering: how it is really said, the meaning, the sentence
 		let reveal: Record<string, unknown> = {};
 		if (kind === 'word') {
@@ -457,52 +472,66 @@ export function registerReviewRoutes(router: any, context: any) {
 		return { meaning, ipa: cleanIpa(row.doc.ipa || doc.ipa) };
 	};
 
-	router.post('/daily-review/add', wrap('add', async (req, res) => {
+	/** The missed spots of an Intensive result in Review. The page adds them all when a passage is finished; unticking one
+	 *  removes its card, ticking adds it again. `only`: the items `op` applies to (all when absent) */
+	router.post('/daily-review/spots', wrap('spots', async (req, res) => {
 		const userId = userOf(req);
 		const aid = String(req.body?.attempt_id || '');
-		if (!userId || !UUID_RE.test(aid)) return res.status(400).json({ success: false, message: 'Bad request' });
+		const op = String(req.body?.op || 'state');
+		if (!userId || !UUID_RE.test(aid) || !['add', 'remove', 'state'].includes(op)) return res.status(400).json({ success: false, message: 'Bad request' });
 		const a = await database('il_attempts').where({ id: aid, user_id: userId }).first();
 		if (!a) return res.status(404).json({ success: false, message: 'Not found' });
 		const lessonRow = await database('il_lessons as l').join('source_videos as sv', 'sv.id', 'l.source_video_id').select('sv.youtube_video_id as video_id').where('l.id', a.lesson_id).first();
 		const sentences = await database('il_sentences').where('lesson_id', a.lesson_id);
-		let added = 0;
-		for (const it of (Array.isArray(req.body?.items) ? req.body.items : []).slice(0, 80)) {
+		const here = new Set(sentences.map((s: any) => s.id));
+		const items = (Array.isArray(req.body?.items) ? req.body.items : []).slice(0, 80);
+		const only = Array.isArray(req.body?.only) ? new Set(req.body.only.map(Number)) : null;
+		/** What an item is saved as: the table, the columns that make it one card, the rest of a new row (null: it cannot be saved) */
+		const spotOf = (it: any) => {
 			const kind = String(it?.kind);
 			const s = sentences.find((x: any) => x.n === Number(it?.sentence_n));
-			if (!s || !['word', 'pattern', 'pair', 'spell'].includes(kind)) continue;
+			if (!s || !['word', 'pattern', 'pair', 'spell'].includes(kind)) return null;
 			const text = clean(it?.text, 80).trim();
 			const own = { sentence_id: s.id, video_id: lessonRow?.video_id ?? null, start_ms: s.start_ms, end_ms: s.end_ms };
 			if (kind === 'word') {
 				const word = wordKey(text);
-				if (!word) continue;
-				const d = await fromDict(word, clean(req.body?.lang, 8));
-				const made = await database('user_words').insert({
-					user_id: userId, word, shown: text.toLowerCase(), forms: [], meaning: d.meaning, ipa: d.ipa, source: 'intensive', source_id: s.id,
-					video_id: lessonRow?.video_id ?? null, start_ms: s.start_ms, end_ms: s.end_ms, example: s.text,
-				}).onConflict(['user_id', 'word']).ignore().returning('id');
-				added += made.length;
-				continue;
+				if (!word) return null;
+				return { table: 'user_words', where: { user_id: userId, word }, row: async () => {
+					const d = await fromDict(word, clean(req.body?.lang, 8));
+					return { shown: text.toLowerCase(), forms: [], meaning: d.meaning, ipa: d.ipa, source: 'intensive', source_id: s.id, video_id: own.video_id, start_ms: s.start_ms, end_ms: s.end_ms, example: s.text };
+				} };
 			}
 			const words = tokens(text);
-			if (!words.length) continue;
+			if (!words.length) return null;
 			let key = words.join(' ');
 			let shown = text;
 			let options: string[] = (Array.isArray(it?.wrong) ? it.wrong : []).map((w: unknown) => clean(w, 80)).filter(Boolean).slice(0, 3);
 			let real: string | null = clean(it?.real, 120) || null;
 			if (kind === 'pair') {
 				const other = tokens(clean(it?.other, 80)).join(' ');
-				if (!other || other === key) continue;
+				if (!other || other === key) return null;
 				const [a1, b1] = [key, other].sort();
 				options = [a1!, b1!];
 				real = key;
 				key = `${a1}|${b1}`;
 				shown = `${a1} / ${b1}`;
 			}
-			const made = await database('il_cards').insert({
-				user_id: userId, kind, key, shown, real, note: clean(it?.note, 300) || null, skill: clean(it?.skill, 60) || null, options: JSON.stringify(options), ...own,
-			}).onConflict(['user_id', 'kind', 'key']).ignore().returning('id');
-			added += made.length;
+			return { table: 'il_cards', where: { user_id: userId, kind, key }, row: async () => ({ shown, real, note: clean(it?.note, 300) || null, skill: clean(it?.skill, 60) || null, options: JSON.stringify(options), ...own }) };
+		};
+		/** The saved row came from this passage (only such a row may be removed here) */
+		const fromHere = (table: string, row: any) => (table === 'user_words' ? row.source === 'intensive' && here.has(row.source_id) : here.has(row.sentence_id));
+		const spots = items.map(spotOf);
+		for (const [i, p] of spots.entries()) {
+			if (!p || op === 'state' || (only && !only.has(i))) continue;
+			const row = await database(p.table).where(p.where).first();
+			if (op === 'add' && !row) await database(p.table).insert({ ...p.where, ...(await p.row()) }).onConflict(Object.keys(p.where)).ignore();
+			if (op === 'remove' && row && fromHere(p.table, row)) await database(p.table).where('id', row.id).delete();
 		}
-		return res.json({ success: true, data: { added } });
+		const states: string[] = [];
+		for (const p of spots) {
+			const row = p ? await database(p.table).where(p.where).first() : null;
+			states.push(!p ? 'none' : !row ? 'out' : fromHere(p.table, row) ? 'in' : 'kept');
+		}
+		return res.json({ success: true, data: { states } });
 	}));
 }

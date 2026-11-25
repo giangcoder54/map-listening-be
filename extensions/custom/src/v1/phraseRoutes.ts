@@ -13,7 +13,7 @@
  */
 import { Rating } from 'ts-fsrs';
 import { UUID_RE } from '../lib/lessons';
-import { grantRewards, recordPractice, vnDay } from '../lib/xp';
+import { recordPractice, vnDay } from '../lib/xp';
 import { aiConfigured } from '../lib/ai';
 import { COIN, CoinError, payAiCheck, refundAiCheck, unlockPhrase } from '../lib/coins';
 import { clipTranscripts } from '../lib/clipTranscript';
@@ -85,7 +85,7 @@ export function registerPhraseRoutes(router: any, context: any) {
 				success: true,
 				data: {
 					types,
-					me: c.userId ? { premium: c.premium, new_today: c.newToday, new_limit: c.newLimit, due, learned: c.progress.size, levels } : null,
+					me: c.userId ? { new_today: c.newToday, new_limit: c.newLimit, due, learned: c.progress.size, levels } : null,
 				},
 			});
 		} catch (error) {
@@ -120,7 +120,7 @@ export function registerPhraseRoutes(router: any, context: any) {
 				data: {
 					type: typeCard(type, locale),
 					phrases,
-					me: c.userId ? { premium: c.premium, new_today: c.newToday, new_limit: c.newLimit } : null,
+					me: c.userId ? { new_today: c.newToday, new_limit: c.newLimit } : null,
 				},
 			});
 		} catch (error) {
@@ -156,7 +156,7 @@ export function registerPhraseRoutes(router: any, context: any) {
 				database('phrases').select('roleplay').where('id', phrase.id).first(),
 			]);
 			const tr = pickTranslation(trRows, locale) || ({} as any);
-			const clipLimit = c.premium ? clips.length : c.cfg.phraseFreeClips;
+			const clipLimit = c.cfg.phraseFreeClips;
 			// The words of each clip shown, with a line or two of context before the phrase
 			const shown = clips.slice(0, clipLimit);
 			const cuts = await clipTranscripts(
@@ -249,7 +249,6 @@ export function registerPhraseRoutes(router: any, context: any) {
 				database('phrases').where('id', phrase.id).increment('learners_count', 1),
 			]);
 			const won = await recordPractice(database, userId, { attempts: 1, xp: { reason: 'phrase', dedupe: `phrase:${phrase.id}` } });
-			await grantRewards(context, req.schema, userId, won.rewards);
 			return res.json({ success: true, data: { level: 1, next_in_days: daysUntil(card.due), xp: won.xp, again: false } });
 		} catch (error) {
 			return fail(res, 'Finish lesson', error);
@@ -290,7 +289,7 @@ export function registerPhraseRoutes(router: any, context: any) {
 
 			const sameDay = `(date_created AT TIME ZONE '${TZ}')::date = (now() AT TIME ZONE '${TZ}')::date`;
 			// Premium or a phrase bought with Xu: the checks are in the price, a number a day per phrase
-			const covered = c.premium || c.bought.has(phrase.id);
+			const covered = c.bought.has(phrase.id);
 			const used = await database('phrase_roleplay_checks')
 				.where(covered ? { user_id: userId, phrase_id: phrase.id } : { user_id: userId, paid: false })
 				.whereRaw(sameDay)
@@ -298,7 +297,7 @@ export function registerPhraseRoutes(router: any, context: any) {
 			const limit = covered ? COIN.aiPerPhrasePerDay : COIN.aiFreePerDay;
 			const usedN = Number(used?.n) || 0;
 			if (covered && usedN >= limit) {
-				return res.status(429).json({ success: false, code: 'AI_LIMIT', data: { limit, premium: c.premium } });
+				return res.status(429).json({ success: false, code: 'AI_LIMIT', data: { limit } });
 			}
 			// A free phrase beyond the free checks of the day costs Xu, paid before the AI is called
 			const mustPay = !covered && usedN >= limit;
@@ -523,7 +522,6 @@ export function registerPhraseRoutes(router: any, context: any) {
 				attempts: 1,
 				xp: correct ? { reason: 'phrase_review', dedupe: `phrase_review:${phraseId}:${vnDay()}` } : null,
 			});
-			await grantRewards(context, req.schema, userId, won.rewards);
 			return res.json({
 				success: true,
 				data: {

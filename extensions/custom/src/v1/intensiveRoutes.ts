@@ -9,16 +9,18 @@
  *   POST /intensive/ladder                      { sentence_id, typed, used, done[], avoid[] } -> the narrowing ladder for a content key word still missed: a clear line with a blank ({ before, after }) and whether its meaning can be asked
  *   POST /intensive/ladder/clear                { sentence_id, typed, done[], heard } -> heard (typed the missing word)
  *   POST /intensive/ladder/meaning              { sentence_id, typed, choice? } -> options (no choice) or right (choice null = "I don't know": a new word)
- *   POST /intensive/ladder/skip | /ladder/practice | /attempts/:id/practice   closed without answering | a clip for a missed key word on the result | how that round went
+ *   POST /intensive/ladder/skip                     closed without answering
  *   POST /intensive/lessons/:key/feedback | /diag-vote   the result card (rating 1-3, tags, comment) | a thumb on one diagnosis *   GET  /intensive/lessons/:key/gist-answer    the answer, why, the sentences that hold it, key words by sentence
+ *   GET  /intensive/lessons/:key/vocab          the words, phrases and structures worth learning (il_vocab), asked for on the result
  *   POST /intensive/check                       { sentence_id, typed, round 1|2, listens, reveal?, slow_typed?, attempt_id? } -> the words right and
  *                                               wrong, the sentence, its traps with the real sound; round 1 also gives a first label per miss.
  *                                               reveal: false (round 1) returns only the score, the marks and a hint (the sentence up to the
  *                                               first word missed, the rest as stars); retry: true = a try after a hint, not saved
  *                                               (POST /intensive/slow takes `hinted`: word indices the hints gave away, never "speed")
- *   POST /intensive/slow                        { sentence_id, typed, slow_typed, unknown[], heard?, attempt_id? } -> the final labels;
+ *   POST /intensive/slow                        { sentence_id, typed, slow_typed, slow_from?, unknown[], heard?, attempt_id? } -> the final labels;
  *                                               `confirm` = misses to ask "misheard or misspelt?" about, `heard` the answers
- *                                               (a word right at 0.75x is "speed"); makes a Review card for a missed sentence
+ *                                               (a word right only after the 0.75x play is "speed";
+ *                                               slow_from = the try that play followed, absent = never played slow). Review cards are made per missed spot on the result (reviewRoutes.ts /daily-review/spots)
  *   POST /intensive/explain                     { sentences: [{ sentence_id, typed }], lang } -> per sentence and missed word: the IPA of it and of what
  *                                               was typed (dictionary), and the AI's one-line reason (diff, why). One AI call for the whole
  *                                               attempt; cached per sentence in il_explain when the AI answered (lib/ilExplain.ts)
@@ -30,15 +32,18 @@
  * Guests can play free passages; nothing is saved for them.
  */
 import { dueReviews } from '../lib/reviewDue';
-import { IL, FUNCTION_WORDS, LABELS, NOT_LISTENING, diffWords, hintOf, isRight, labelMisses, likelyUnknown, withChunks, rankOf, newCard, sameWord, toConfirm, type Heard, sentenceLabel, tokens, type Label, type Trap } from '../lib/intensive';
-import { meaningFor, meaningPool } from '../lib/meanings';
+import { sameAs } from '../lib/ilParts';
+import { IL, FUNCTION_WORDS, LABELS, diffWords, hintOf, isRight, labelMisses, likelyUnknown, withChunks, rankOf, sameWord, toConfirm, type Heard, sentenceLabel, tokens, type Label, type Trap } from '../lib/intensive';
+import { cleanIpa, meaningFor, meaningPool } from '../lib/meanings';
+import { wordKey } from '../lib/dict';
 import { thumbOf } from '../lib/extensive';
 import { TOPIC_JOINS, interestOf, lessonTopicSql, rankAll, topicsParam } from '../lib/recommend';
+import { searchLessonIds, searchWords } from '../lib/lessonSearch';
 import { UUID_RE } from '../lib/lessons';
 import { accessOf, type Access } from '../lib/contentUnlocks';
 import { COIN, CoinError, earnCoins, unlockContent, walletOf } from '../lib/coins';
 import { isStaff } from '../lib/staff';
-import { MAX_FREEZES, grantRewards, recordPractice, vnDay } from '../lib/xp';
+import { MAX_FREEZES, recordPractice, vnDay } from '../lib/xp';
 import { touchStudy } from '../lib/studyTime';
 import { aiConfigured } from '../lib/ai';
 import { bareKey, explainBatch, missWords, type BatchSentence, type ExplainItem } from '../lib/ilExplain';
@@ -73,14 +78,22 @@ export function registerIntensiveRoutes(router: any, context: any) {
 			.select('l.*', 'sv.youtube_video_id', 'sv.channel_name', 'sv.thumbnail_url')
 			.where((q: any) => (UUID_RE.test(key) ? q.where('l.id', key) : q.where('l.short_id', key).orWhere('l.slug', key))).first();
 	};
-	/** A sentence with its lesson, when the learner may play it (published, or an editor's preview) */
+	/** A sentence with its lesson, when the learner may play it: published (or an editor's preview), and open to them.
+	 *  A premium passage locked for them stays closed, unless they already have a go at it (opened while Premium) */
 	const sentenceOf = async (id: string, req: any) => {
 		if (!UUID_RE.test(id)) return null;
 		const s = await database('il_sentences as s').join('il_lessons as l', 'l.id', 's.lesson_id')
 			.select('s.*', 'l.status', 'l.is_premium').where('s.id', id).first();
 		if (!s) return null;
 		if (s.status !== 'published' && !isStaff(req.accountability)) return null;
+		if (!(await mayRead(req, s.lesson_id, s.is_premium))) return null;
 		return s;
+	};
+	const mayRead = async (req: any, lessonId: string, premium: boolean) => {
+		if (!premium || req.accountability?.admin || isStaff(req.accountability)) return true;
+		const userId = userOf(req);
+		if (!(await accessOf(database, userId, 'il', logger, [lessonId])).locked({ id: lessonId, is_premium: premium })) return true;
+		return !!userId && !!(await database('il_attempts').where({ user_id: userId, lesson_id: lessonId }).first('id'));
 	};
 	const ownAttempt = async (req: any, lessonId?: string) => {
 		const userId = userOf(req);
@@ -163,6 +176,8 @@ export function registerIntensiveRoutes(router: any, context: any) {
 		const focus = String(req.query?.focus || '');
 		if (focus) { where += ' AND l.focus = ?'; params.push(focus); }
 		if (String(req.query?.premium) === 'free') where += ' AND l.is_premium = false';
+		const words = searchWords(req.query?.q);
+		if (words.length) { where += ' AND l.id = ANY(?::uuid[])'; params.push(await searchLessonIds(database, 'il', langOf(req), words)); }
 		// Done or not: only a signed-in learner has a "done"
 		const status = userId ? String(req.query?.status || '') : '';
 		const outer = status === 'todo' ? ' WHERE x.done = false AND x.open = false' : status === 'done' ? ' WHERE x.done = true' : status === 'doing' ? ' WHERE x.done = false AND x.open = true' : '';
@@ -198,19 +213,26 @@ export function registerIntensiveRoutes(router: any, context: any) {
 		if (!l || (l.status !== 'published' && !staffPreview(req))) return res.status(404).json({ success: false, message: 'Not found' });
 		const acc = await accessOf(database, userId, 'il', logger, [l.id]);
 		const locked = acc.locked(l) && !req.accountability?.admin;
-		const sentences = locked ? [] : await database('il_sentences').select('id', 'n', 'start_ms', 'end_ms', 'text').where('lesson_id', l.id).orderBy('n');
+		const sentences = locked ? [] : await database('il_sentences').select('id', 'n', 'start_ms', 'end_ms', 'text', 'part').where('lesson_id', l.id).orderBy('n');
+		const same = sameAs(sentences);
+		// A whole video done part by part is picked up where it was left (a passage of one part always starts afresh)
+		const open = userId && sentences.some((s: any) => s.part > 1)
+			? await database('il_attempts as a').join('il_results as r', 'r.attempt_id', 'a.id').where({ 'a.user_id': userId, 'a.lesson_id': l.id }).whereNull('a.finished_at').first('a.id')
+			: null;
 		const tr = await trOf(l.id, langOf(req));
 		// The learner's last finished go: the page opens its result instead of a fresh start
 		const last = userId ? await database('il_attempts').where({ user_id: userId, lesson_id: l.id }).whereNotNull('finished_at').orderBy('finished_at', 'desc').first('seq') : null;
 		return res.json({ success: true, data: {
 			last_result: last?.seq ?? null,
+			open: !!open,
 			id: l.id, short_id: l.short_id, slug: l.slug, title: pickOr(tr, 'title', l.title), level: l.level, intro: pickOr(tr, 'intro', l.intro), focus: l.focus, channel: l.channel_name,
 			// "Khám phá": what the video teaches, shown on the result (not to a learner the passage is locked for)
 			explore: locked ? null : pickOr(tr, 'explore', l.explore ?? null),
 			video_id: l.youtube_video_id, start: l.start_ms, end: l.end_ms, is_premium: !!l.is_premium, locked, price: l.is_premium ? acc.price : null, status: l.status,
 			gist: { prompt: pickOr(tr, 'gist_prompt', l.gist_prompt), options: (l.gist_options as string[]).map((o, i) => pickOr(tr, `gist_o${i}`, o)) },
 			// The text of a sentence stays on the server until the learner has typed it
-			sentences: sentences.map((s: any) => ({ id: s.id, n: s.n, start: s.start_ms, end: s.end_ms, words: tokens(s.text).length })),
+			// same_as: the first sentence with the same words (a repeated line is typed once)
+			sentences: sentences.map((s: any, i: number) => ({ id: s.id, n: s.n, start: s.start_ms, end: s.end_ms, words: tokens(s.text).length, part: s.part, same_as: same[i] })),
 		} });
 	}));
 
@@ -220,6 +242,14 @@ export function registerIntensiveRoutes(router: any, context: any) {
 		const l = await findLesson(String(req.params.key));
 		if (!l || (l.status !== 'published' && !staffPreview(req))) return res.status(404).json({ success: false, message: 'Not found' });
 		if ((await accessOf(database, userId, 'il', logger, [l.id])).locked(l)) return res.status(403).json({ success: false, code: 'PREMIUM', message: 'Locked' });
+		// A whole video (more than one part) goes on from where it was left, unless the learner asks to start again
+		if (!req.body?.fresh && (await database('il_sentences').where('lesson_id', l.id).where('part', '>', 1).first('id'))) {
+			const a = await database('il_attempts').where({ user_id: userId, lesson_id: l.id }).whereNull('finished_at').orderBy('date_created', 'desc').first();
+			if (a) {
+				const { rows, subs } = await rowsOf(a, langOf(req));
+				if (rows.some(Boolean)) return res.json({ success: true, data: { attempt_id: a.id, seq: a.seq, resume: { rows, subs, gist_first: a.gist_choice ?? null } } });
+			}
+		}
 		// A fresh go drops the unfinished ones
 		await database('il_attempts').where({ user_id: userId, lesson_id: l.id }).whereNull('finished_at').delete();
 		const prev = await database('il_attempts').where({ user_id: userId, lesson_id: l.id }).max('seq as m').first();
@@ -264,10 +294,30 @@ export function registerIntensiveRoutes(router: any, context: any) {
 	router.get('/intensive/lessons/:key/gist-answer', wrap('gist-answer', async (req, res) => {
 		const l = await findLesson(String(req.params.key));
 		if (!l || (l.status !== 'published' && !staffPreview(req))) return res.status(404).json({ success: false, message: 'Not found' });
+		if (!(await mayRead(req, l.id, !!l.is_premium))) return res.status(403).json({ success: false, code: 'PREMIUM', message: 'Locked' });
 		const tr = await trOf(l.id, langOf(req));
 		const keys: Record<string, string[]> = {};
 		for (const s of await database('il_sentences').select('n', 'key_words').where('lesson_id', l.id)) if (s.key_words?.length) keys[String(s.n)] = s.key_words;
 		return res.json({ success: true, data: { answer: l.gist_answer, explain: pickOr(tr, 'gist_explain', l.gist_explain), sentences: l.gist_sentences || [], keys } });
+	}));
+
+	/** The passage's vocabulary, each item with the sentence it is heard in. It shows sentences' text, so the page asks for
+	 *  it on the result only */
+	router.get('/intensive/lessons/:key/vocab', wrap('vocab', async (req, res) => {
+		const l = await findLesson(String(req.params.key));
+		if (!l || (l.status !== 'published' && !staffPreview(req))) return res.status(404).json({ success: false, message: 'Not found' });
+		if (!(await mayRead(req, l.id, !!l.is_premium))) return res.status(403).json({ success: false, code: 'PREMIUM', message: 'Locked' });
+		const tr = await trOf(l.id, langOf(req));
+		const items = await database('il_vocab as v').join('il_sentences as s', function (this: any) { this.on('s.lesson_id', 'v.lesson_id').andOn('s.n', 'v.sentence_n'); })
+			.select('v.id', 'v.term', 'v.forms', 'v.kind', 'v.meaning', 's.id as sentence_id', 's.n', 's.text', 's.start_ms', 's.end_ms')
+			.where('v.lesson_id', l.id).orderBy('s.n').orderBy('v.date_created');
+		// A single word also shows how it sounds
+		const words = items.map((v: any) => wordKey(v.term)).filter((w: string | null): w is string => !!w && !w.includes(' '));
+		const ipa = new Map<string, string | null>((words.length ? await database('wiktionary_en').select('w', 'doc').whereIn('w', words) : []).map((r: any) => [r.w, cleanIpa(r.doc?.ipa)]));
+		return res.json({ success: true, data: items.map((v: any) => ({
+			id: v.id, term: v.term, forms: v.forms || [], kind: v.kind, meaning: pickOr(tr, `vocab:${v.id}`, v.meaning), ipa: ipa.get(wordKey(v.term) || '') ?? null,
+			sentence_id: v.sentence_id, n: v.n, example: v.text, start: v.start_ms, end: v.end_ms,
+		})) });
 	}));
 
 	// ── The narrowing ladder (before the answer is shown) ─────────────────────────────
@@ -275,7 +325,7 @@ export function registerIntensiveRoutes(router: any, context: any) {
 	// 0.75x: 1. hear a line of another video where it is said clearly and type the missing word (the line is shown with a
 	// blank: heard = only fast speech hides it); 2. if not, pick its meaning (knows it = knows the spelling, not the sound;
 	// wrong or "I don't know" = a new word). Small key words skip the ladder (their cause is known: they are reduced in fast
-	// speech) and go straight to practice. Stateless: each call sends the sentence, the last typed try, and `done` (words
+	// speech). Stateless: each call sends the sentence, the last typed try, and `done` (words
 	// already diagnosed in this passage, never asked twice).
 	const LADDER_MAX = 2;
 	const keyOf = (w: string) => w.toLowerCase().replace(/['’]/g, '');
@@ -288,8 +338,8 @@ export function registerIntensiveRoutes(router: any, context: any) {
 	};
 	type Cloze = { video_id: string; start: number; end: number; before: string; after: string };
 	/** A line of another video with the word in the middle (never the first or last word, so a cut cannot clip it), shown
-	 *  as before / after the blank. `clear`: said slowly. `avoid`: lines already tried ("video:start"). */
-	const clozeClip = async (word: string, notVideo: string, clear: boolean, avoid: string[] = []): Promise<Cloze | null> => {
+	 *  as before / after the blank, said slowly. `avoid`: lines already tried ("video:start"). */
+	const clozeClip = async (word: string, notVideo: string, avoid: string[] = []): Promise<Cloze | null> => {
 		const w = word.toLowerCase().replace(/[^a-z']/g, '').replace(/'/g, "['’]");
 		if (!w) return null;
 		const { rows } = await database.raw(`
@@ -305,7 +355,7 @@ export function registerIntensiveRoutes(router: any, context: any) {
 			if (/[\[\]♪]/.test(text) || avoid.includes(`${r.video_id}:${r.start}`)) continue;
 			const toks = text.split(' ');
 			if (toks.length < 4 || toks.length > 14) continue;
-			if (clear && toks.length / ((r.end - r.start) / 1000) > 3.0) continue;
+			if (toks.length / ((r.end - r.start) / 1000) > 3.0) continue;
 			const at = toks.map((t, i) => (keyOf(t.replace(/^[^A-Za-z0-9']+|[^A-Za-z0-9']+$/g, '')) === target ? i : -1)).filter((i) => i >= 0);
 			if (at.length !== 1 || at[0]! < 1 || at[0]! > toks.length - 2) continue;
 			const i = at[0]!;
@@ -336,7 +386,7 @@ export function registerIntensiveRoutes(router: any, context: any) {
 		if (used >= LADDER_MAX || (used === LADDER_MAX - 1 && gist.length && !gist.includes(Number(s.n)))) return res.json({ success: true, data: { available: false } });
 		const word = ladderWord(s, clean(req.body?.typed), done);
 		if (!word) return res.json({ success: true, data: { available: false } });
-		const clip = await clozeClip(word, await lessonVideo(s.lesson_id), true, Array.isArray(req.body?.avoid) ? req.body.avoid.slice(0, 20).map((x: unknown) => clean(x, 60)) : []);
+		const clip = await clozeClip(word, await lessonVideo(s.lesson_id), Array.isArray(req.body?.avoid) ? req.body.avoid.slice(0, 20).map((x: unknown) => clean(x, 60)) : []);
 		const meaning = !!(await askableMeaning(word, req));
 		return res.json({ success: true, data: { available: !!clip || meaning, clip, meaning } });
 	}));
@@ -381,25 +431,6 @@ export function registerIntensiveRoutes(router: any, context: any) {
 		if (word) await saveLadder(await ownAttempt(req, s.lesson_id), s.id, word, 'skipped');
 		return res.json({ success: true });
 	}));
-	/** "Practise the key words you missed" (result): another line with the word, said as people really say it, with a blank.
-	 *  The word must be a key word of that sentence; the learner has seen the answer by now, so it is not hidden. */
-	router.post('/intensive/ladder/practice', wrap('ladder-practice', async (req, res) => {
-		const s = await sentenceOf(String(req.body?.sentence_id || ''), req);
-		if (!s) return res.status(404).json({ success: false, message: 'Not found' });
-		const word = keyOf(clean(req.body?.word, 40));
-		if (!word || !(s.key_words || []).includes(word)) return res.status(422).json({ success: false, message: 'Not a key word of this sentence' });
-		const clip = await clozeClip(word, await lessonVideo(s.lesson_id), false, Array.isArray(req.body?.avoid) ? req.body.avoid.slice(0, 20).map((x: unknown) => clean(x, 60)) : []);
-		return res.json({ success: true, data: { clip, word } });
-	}));
-	/** How the practice round at the end went: { total, done, right } */
-	router.post('/intensive/attempts/:id/practice', wrap('practice', async (req, res) => {
-		const a = await ownAttempt(req);
-		if (!a) return res.json({ success: true });
-		const n = (v: unknown) => Math.max(0, Math.min(99, Math.round(Number(v) || 0)));
-		await database('il_attempts').where('id', a.id).update({ practice: JSON.stringify({ total: n(req.body?.total), done: n(req.body?.done), right: n(req.body?.right) }) });
-		return res.json({ success: true });
-	}));
-
 	// ── Why a learner missed words: the AI's reason per missed word, cached by sentence + typed answer + language ──
 	const explainHits = new Map<string, number[]>();
 	/** At most 40 AI calls per learner (or address) per 10 minutes; a cached answer costs nothing and is never counted */
@@ -427,7 +458,13 @@ export function registerIntensiveRoutes(router: any, context: any) {
 		const staff = isStaff(req.accountability);
 		const chunks = await chunksOf();
 		const rows = new Map<string, any>((await database('il_sentences as s').join('il_lessons as l', 'l.id', 's.lesson_id')
-			.select('s.id', 's.text', 's.traps', 'l.status').whereIn('s.id', ids)).filter((r: any) => r.status === 'published' || staff).map((r: any) => [r.id, r]));
+			.select('s.id', 's.text', 's.traps', 's.lesson_id', 'l.status', 'l.is_premium').whereIn('s.id', ids)).filter((r: any) => r.status === 'published' || staff).map((r: any) => [r.id, r]));
+		// Sentences of a passage locked for this learner are left out
+		const open = new Map<string, boolean>();
+		for (const r of [...rows.values()]) {
+			if (!open.has(r.lesson_id)) open.set(r.lesson_id, await mayRead(req, r.lesson_id, !!r.is_premium));
+			if (!open.get(r.lesson_id)) rows.delete(r.id);
+		}
 		const text = new Map<string, string>([...rows.values()].map((r: any) => [r.id, r.text]));
 		const saved = new Map<string, ExplainItem[]>((await database('il_explain').whereIn('sentence_id', ids).where({ lang }))
 			.map((r: any) => [`${r.sentence_id}|${r.typed_key}`, r.items]));
@@ -560,7 +597,12 @@ export function registerIntensiveRoutes(router: any, context: any) {
 		const known = new Set(words40(req.body?.known).map(bareOf));
 		const unknown: string[] = [...new Set([...words40(req.body?.unknown), ...likelyUnknown(first.words).filter((w) => !known.has(bareOf(w)))])];
 		const slow = slowTyped ? diffWords(s.text, slowTyped) : null;
+		// "speed" needs a real slow listen: `slow_from` is the try after which the sentence was first played at 0.75x. Without
+		// it the retry says nothing about speed; a word already right in that try was heard before the slow play
+		const slowFrom = typeof req.body?.slow_from === 'string' ? clean(req.body.slow_from) : null;
+		const heardSlow = slowFrom === null ? null : slow?.words ?? null;
 		const hinted: number[] = (Array.isArray(req.body?.hinted) ? req.body.hinted : []).map(Number).filter((n: number) => Number.isInteger(n) && n >= 0).slice(0, 80);
+		if (slowFrom !== null) diffWords(s.text, slowFrom).words.forEach((w, i) => { if (w.status === 'ok' || w.status === 'typo') hinted.push(i); });
 		// The learner's answers to "misheard or misspelt?": { word: 'spelling' | 'misheard' }
 		const heard: Record<string, Heard> = {};
 		for (const [w, h] of Object.entries(req.body?.heard && typeof req.body.heard === 'object' ? req.body.heard : {}).slice(0, 40)) {
@@ -568,8 +610,8 @@ export function registerIntensiveRoutes(router: any, context: any) {
 		}
 		const traps = trapsOf(s, await trOf(s.lesson_id, langOf(req)));
 		const marked = withChunks(traps, await chunksOf());
-		const confirm = toConfirm(labelMisses(s.text, marked, first.words, unknown, slow?.words ?? null, typed, hinted));
-		const raw = labelMisses(s.text, marked, first.words, unknown, slow?.words ?? null, typed, hinted, heard);
+		const confirm = toConfirm(labelMisses(s.text, marked, first.words, unknown, heardSlow, typed, hinted));
+		const raw = labelMisses(s.text, marked, first.words, unknown, heardSlow, typed, hinted, heard);
 		// The skill each miss points to: its name and how many lessons it has (only skills that are published)
 		const slugs = [...new Set(raw.map((m) => m.skill).filter((x): x is string => !!x))];
 		const skills: any[] = slugs.length ? (await database.raw(`
@@ -596,19 +638,13 @@ export function registerIntensiveRoutes(router: any, context: any) {
 			await database('il_results').where({ attempt_id: a.id, sentence_id: s.id, round: 1 })
 				.update({ unknown: JSON.stringify(unknown), slow_typed: slowTyped || null, labels: JSON.stringify(misses), marks: JSON.stringify(marks) });
 		}
-		// A missed sentence (not only unknown words) comes back as a Review card; one already held keeps its schedule
-		let cardMade = false;
-		if (userId && a && label && misses.some((m) => !NOT_LISTENING.includes(m.label))) {
-			const made = await database('review_cards').insert(newCard(userId, s.id, label)).onConflict(['user_id', 'kind', 'ref_id']).ignore().returning('ref_id');
-			cardMade = made.length > 0;
-		}
 		// The words worth asking "do you know it?" about: not linking / speed / weak / spelling misses (the word is known, only
 		// its sound was lost), not function words, not the 2,000 commonest words of the library
 		const ask = [...new Set(misses
 			.filter((m) => !['linking', 'speed', 'weak', 'spelling'].includes(m.label))
 			.map((m) => m.word)
 			.filter((w) => !FUNCTION_WORDS.has(w.replace(/'/g, '')) && rankOf(w) > 2000))];
-		return res.json({ success: true, data: { misses, label, unknown, ask, confirm, slow_right: slow?.right ?? null, slow_total: slow?.total ?? null, card: cardMade } });
+		return res.json({ success: true, data: { misses, label, unknown, ask, confirm, slow_right: slow?.right ?? null, slow_total: slow?.total ?? null } });
 	}));
 
 	/** A word heard in other videos of the library (other speakers): up to 5 subtitle lines, one per channel */
@@ -649,8 +685,8 @@ export function registerIntensiveRoutes(router: any, context: any) {
 		let xp = 0;
 		let gems = 0;
 		let firstTime = false;
-		if (!a.finished_at) {
-			await database('il_attempts').where('id', a.id).update({ finished_at: database.fn.now() });
+		// Only the request that closes the attempt counts it (a double click sends several)
+		if (!a.finished_at && (await database('il_attempts').where('id', a.id).whereNull('finished_at').update({ finished_at: database.fn.now() }))) {
 			const first = !(await database('il_attempts').where({ user_id: userId, lesson_id: a.lesson_id }).whereNotNull('finished_at').whereNot('id', a.id).first());
 			firstTime = first;
 			const won = await recordPractice(database, userId, {
@@ -660,7 +696,6 @@ export function registerIntensiveRoutes(router: any, context: any) {
 					: { reason: 'intensive', dedupe: `intensive:${a.lesson_id}:${vnDay()}`, lessonId: null, amount: IL.xpAgain },
 			});
 			xp = won.xp;
-			await grantRewards(context, req.schema, userId, won.rewards);
 			// Kim cương: the first finish of a passage (COIN.earn.intensive), more when most sentences were heard at the first check
 			if (first) {
 				const list = [...sentences.values()];
@@ -671,23 +706,18 @@ export function registerIntensiveRoutes(router: any, context: any) {
 				gems = base.added + extra.added;
 			}
 		}
-		const cards = Number((await database('review_cards as c').join('il_sentences as s', 's.id', 'c.ref_id')
-			.where({ 'c.user_id': userId, 'c.kind': 'sentence', 's.lesson_id': a.lesson_id }).count('* as n').first())?.n || 0);
 		// Each sentence's translation: the base (Vietnamese) in il_sentences.sub, another language in il_translations ('s<n>:sub');
 		// a missing one falls back to the base
 		const subs: Record<string, string> = {};
 		for (const s of await database('il_sentences').select('n', 'sub').where('lesson_id', a.lesson_id)) if (s.sub) subs[String(s.n)] = s.sub;
 		const tr = await trOf(a.lesson_id, langOf(req));
 		if (tr) for (const [k, v] of tr) if (/^s\d+:sub$/.test(k)) subs[k.slice(1, -4)] = v;
-		return res.json({ success: true, data: { gist_right: a.gist_right, gist: { first: a.gist_choice ?? null, second: a.gist_choice2 ?? null }, sentences: [...sentences.values()], labels, cards, xp, gems, first: firstTime, subs, ...(await mainOf(userId)) } });
+		return res.json({ success: true, data: { gist_right: a.gist_right, gist: { first: a.gist_choice ?? null, second: a.gist_choice2 ?? null }, sentences: [...sentences.values()], labels, xp, gems, first: firstTime, subs, ...(await mainOf(userId)) } });
 	}));
 
 	/** A finished go opened again (the result page, /listening-lab/intensive/<key>?result=<id>): each sentence as the
-	 *  result screen had it (what was typed, the check, the labels, the learner's marks), the time spent, the Review cards */
-	const attemptResult = async (req: any, res: any, a: any) => {
-		const userId = userOf(req);
-		if (!userId || !a || !a.finished_at) return res.status(404).json({ success: false, message: 'Not found' });
-		const lang = langOf(req);
+	 *  result screen had it (what was typed, the check, the labels, the learner's marks), the time spent, the translations */
+	const rowsOf = async (a: any, lang: string) => {
 		const tr = await trOf(a.lesson_id, lang);
 		const sentences = await database('il_sentences').where('lesson_id', a.lesson_id).orderBy('n');
 		const results = await database('il_results').where({ attempt_id: a.id, round: 1 });
@@ -706,13 +736,19 @@ export function registerIntensiveRoutes(router: any, context: any) {
 				typed: r.typed, slow_typed: r.slow_typed || '', listens: r.listens, marks: r.marks || [], ladder: r.ladder || null,
 				check: { right: d.right, total: d.total, ok: isRight(d), words: d.words, marks: d.marks, tail_gap: d.tailGap, text: s.text, labels: misses, sub, traps: trapsOf(s, tr),
 					slow: slow ? { right: slow.right, total: slow.total, words: slow.words, marks: slow.marks, tail_gap: slow.tailGap } : null },
-				slow: d.right < d.total || misses.length ? { misses, label: sentenceLabel(misses), unknown: r.unknown || [], ask: [], confirm: [], slow_right: slow?.right ?? null, slow_total: slow?.total ?? null, card: false } : null,
+				slow: d.right < d.total || misses.length ? { misses, label: sentenceLabel(misses), unknown: r.unknown || [], ask: [], confirm: [], slow_right: slow?.right ?? null, slow_total: slow?.total ?? null } : null,
 			};
 		});
-		const cards = Number((await database('review_cards as c').join('il_sentences as s', 's.id', 'c.ref_id')
-			.where({ 'c.user_id': userId, 'c.kind': 'sentence', 's.lesson_id': a.lesson_id }).count('* as n').first())?.n || 0);
-		const minutes = Math.max(1, Math.round((new Date(a.finished_at).getTime() - new Date(a.date_created).getTime()) / 60000));
-		return res.json({ success: true, data: { id: a.id, seq: a.seq, lesson_id: a.lesson_id, finished_at: a.finished_at, minutes, gist_right: a.gist_right, gist: { first: a.gist_choice ?? null, second: a.gist_choice2 ?? null }, rows, cards, subs, ...(await mainOf(userId!)) } });
+		return { rows, subs };
+	};
+	const attemptResult = async (req: any, res: any, a: any) => {
+		const userId = userOf(req);
+		if (!userId || !a || !a.finished_at) return res.status(404).json({ success: false, message: 'Not found' });
+		const { rows, subs } = await rowsOf(a, langOf(req));
+		const span = Math.max(1, Math.round((new Date(a.finished_at).getTime() - new Date(a.date_created).getTime()) / 60000));
+		// A whole video may be done over several days: never more than two minutes a sentence typed
+		const minutes = Math.min(span, Math.max(1, rows.filter(Boolean).length * 2));
+		return res.json({ success: true, data: { id: a.id, seq: a.seq, lesson_id: a.lesson_id, finished_at: a.finished_at, minutes, gist_right: a.gist_right, gist: { first: a.gist_choice ?? null, second: a.gist_choice2 ?? null }, rows, subs, ...(await mainOf(userId!)) } });
 	};
 	router.get('/intensive/attempts/:id', wrap('attempt', async (req, res) => attemptResult(req, res, await ownAttempt(req))));
 	/** The same by the learner's go number at the passage: /intensive/lessons/you-cant-unboil-an-egg/results/3 */

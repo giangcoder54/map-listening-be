@@ -71,7 +71,6 @@ export function registerAdminGrowthRoutes(router: any, context: any) {
 				(SELECT COUNT(*) FROM directus_users WHERE status = 'active')::int AS users,
 				(SELECT COUNT(*) FROM directus_users WHERE gl_created_at >= now() - interval '7 days')::int AS signups_7d,
 				(SELECT COUNT(*) FROM directus_users WHERE gl_created_at >= now() - interval '30 days')::int AS signups_30d,
-				(SELECT COUNT(*) FROM directus_users WHERE is_premium AND (premium_until IS NULL OR premium_until > now()))::int AS premium_users,
 				(SELECT COUNT(*) FROM purchase_histories WHERE status = 'published' AND amount > 0 AND coalesce(date_transfer, date_created) >= now() - interval '30 days')::int AS orders_30d,
 				(SELECT COUNT(*) FROM directus_users WHERE referred_by IS NOT NULL)::int AS referred_users,
 				(SELECT COUNT(*) FROM affiliates WHERE status = 'pending')::int AS affiliates_pending,

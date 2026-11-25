@@ -19,7 +19,6 @@
 import { COIN, CoinError, earnCoins, lockPurse, spend } from './coins';
 import { vnDay } from './days';
 import { levelOf } from './xp';
-import { isPremiumUser } from './premium';
 import { diffWords, isRight, tokens } from './intensive';
 import { FEES, split, type Member } from './rooms';
 import { isEstablished } from './trust';
@@ -64,7 +63,9 @@ export async function buildDictation(db: any, userIds: string[], n = COIN.coop.p
 	const exclude: string[] = (seen.rows || []).map((r: any) => r.id).filter(Boolean);
 	const out: DictQ[] = [];
 	const il = await db('il_sentences as s').join('il_lessons as l', 'l.id', 's.lesson_id').join('source_videos as sv', 'sv.id', 'l.source_video_id')
-		.where('l.status', 'published').whereNotNull('sv.youtube_video_id').whereRaw('s.end_ms - s.start_ms between 1500 and 8000').whereRaw('char_length(s.text) between 15 and 120')
+		.where('l.status', 'published').whereNotNull('sv.youtube_video_id')
+		// a whole video done in parts is not drawn from
+		.whereRaw('not exists (select 1 from il_sentences p where p.lesson_id = l.id and p.part > 1)').whereRaw('s.end_ms - s.start_ms between 1500 and 8000').whereRaw('char_length(s.text) between 15 and 120')
 		.modify((q: any) => { if (exclude.length) q.whereNotIn('s.id', exclude); })
 		.select('s.id', 's.text', 's.start_ms', 's.end_ms', 'sv.youtube_video_id', 'l.id as lesson')
 		.orderByRaw(`(s.traps::text not in ('[]','{}','null')) desc, random()`).limit(40);
@@ -98,14 +99,12 @@ async function seenRefs(db: any, userIds: string[]): Promise<string[]> {
 export type LessonPick = { id: string | null; prices: Record<string, number>; questions: DictQ[] };
 
 /**
- * The lesson for two players. A lesson costs a player its unlock price unless they have it (bought, or Premium); the pick
+ * The lesson for two players. A lesson costs a player its unlock price unless they bought it; the pick
  * prefers one both lack (both buy it), then one that one of them lacks, then one both have; never one a player cannot
  * pay for. Not a lesson whose sentences they typed in the last 30 days. With no such lesson: short random sentences, nobody pays.
  */
 export async function pickLesson(db: any, userIds: string[]): Promise<LessonPick> {
 	const n = COIN.coop.practiceQuestions;
-	const premium = new Set<string>();
-	for (const u of userIds) if (await isPremiumUser(db, u)) premium.add(u);
 	const own = new Map<string, Set<string>>(userIds.map((u) => [u, new Set<string>()]));
 	for (const r of await db('listening_unlocks').whereIn('user_id', userIds).select('user_id', 'lesson_id')) own.get(r.user_id)!.add(r.lesson_id);
 	const purse = new Map<string, number>();
@@ -129,7 +128,7 @@ export async function pickLesson(db: any, userIds: string[]): Promise<LessonPick
 		if (l.clips.length < Math.min(5, n)) continue;
 		const cost = l.paid ? COIN.unlock[l.kind] ?? COIN.unlock.pattern! : 0;
 		const prices: Record<string, number> = {};
-		for (const u of userIds) prices[u] = premium.has(u) || own.get(u)!.has(id) ? 0 : cost;
+		for (const u of userIds) prices[u] = own.get(u)!.has(id) ? 0 : cost;
 		if (userIds.some((u) => prices[u]! > (purse.get(u) ?? 0))) continue;
 		options.push({ id, prices, tier: userIds.filter((u) => prices[u]! > 0).length, clips: l.clips });
 	}
@@ -186,7 +185,9 @@ export async function buildCloze(db: any, userIds: string[], n = COIN.coop.quest
 	const exclude: string[] = (seen.rows || []).map((r: any) => r.id).filter(Boolean);
 	const out: ClozeQ[] = [];
 	const il = await db('il_sentences as s').join('il_lessons as l', 'l.id', 's.lesson_id').join('source_videos as sv', 'sv.id', 'l.source_video_id')
-		.where('l.status', 'published').whereNotNull('sv.youtube_video_id').whereRaw('s.end_ms - s.start_ms between 1500 and 9000').whereRaw('char_length(s.text) between 15 and 140')
+		.where('l.status', 'published').whereNotNull('sv.youtube_video_id')
+		// a whole video done in parts is not drawn from
+		.whereRaw('not exists (select 1 from il_sentences p where p.lesson_id = l.id and p.part > 1)').whereRaw('s.end_ms - s.start_ms between 1500 and 9000').whereRaw('char_length(s.text) between 15 and 140')
 		.whereRaw(`s.traps::text not in ('[]','{}','null')`)
 		.modify((q: any) => { if (exclude.length) q.whereNotIn('s.id', exclude); })
 		.select('s.id', 's.text', 's.traps', 's.start_ms', 's.end_ms', 'sv.youtube_video_id', 'l.id as lesson').orderByRaw('random()').limit(80);
@@ -677,17 +678,18 @@ export async function getState(db: any, userId: string, roomId: string, since = 
 	return out;
 }
 
-export async function listCoop(db: any, userId: string) {
-	const waiting = await db('coop_rooms as r').join('directus_users as u', 'u.id', 'r.host_id').where('r.status', 'waiting').where('r.auto', false).whereNot('r.host_id', userId)
+/** The lobby. A visitor (userId null) sees the rooms waiting and who is around, with no room or results of their own */
+export async function listCoop(db: any, userId: string | null) {
+	const waiting = await db('coop_rooms as r').join('directus_users as u', 'u.id', 'r.host_id').where('r.status', 'waiting').where('r.auto', false).modify((q: any) => { if (userId) q.whereNot('r.host_id', userId); })
 		.where('r.phase_at', '>', new Date(Date.now() - 30 * 60_000))
 		.select('r.id', 'r.mode', 'r.fee', 'u.first_name', 'u.last_name', 'r.created_at').orderBy('r.created_at', 'desc').limit(20);
-	const mine = await db('coop_rooms as r').join('coop_members as m', 'm.room_id', 'r.id').where('m.user_id', userId).whereIn('r.status', ['waiting', 'playing']).first('r.id', 'r.status');
+	const mine = !userId ? null : await db('coop_rooms as r').join('coop_members as m', 'm.room_id', 'r.id').where('m.user_id', userId).whereIn('r.status', ['waiting', 'playing']).first('r.id', 'r.status');
 	// who is around, per mode: players in a room being played, and players waiting in the match queue
 	const playing: Record<string, number> = { duel: 0, practice: 0 };
 	for (const r of await db('coop_members as m').join('coop_rooms as r', 'r.id', 'm.room_id').where('r.status', 'playing').groupBy('r.mode').select('r.mode').count('* as n')) playing[r.mode] = Number(r.n) || 0;
 	const searching: Record<string, number> = { duel: 0, practice: 0 };
 	for (const q of await db('match_queue').groupBy('mode').select('mode').count('* as n')) searching[q.mode] = Number(q.n) || 0;
-	const recent = await db('coop_members as m').join('coop_rooms as r', 'r.id', 'm.room_id').where({ 'm.user_id': userId, 'r.mode': 'duel', 'r.status': 'done' }).orderBy('r.done_at', 'desc').limit(5).select('r.id', 'm.prize', 'm.score', 'r.fee');
+	const recent = !userId ? [] : await db('coop_members as m').join('coop_rooms as r', 'r.id', 'm.room_id').where({ 'm.user_id': userId, 'r.mode': 'duel', 'r.status': 'done' }).orderBy('r.done_at', 'desc').limit(5).select('r.id', 'm.prize', 'm.score', 'r.fee');
 	const items = [];
 	for (const r of recent) {
 		const other = await db('coop_members as m').join('directus_users as u', 'u.id', 'm.user_id').where('m.room_id', r.id).whereNot('m.user_id', userId).first('m.score', 'u.first_name', 'u.last_name');

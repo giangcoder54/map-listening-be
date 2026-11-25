@@ -28,7 +28,7 @@ import {
 } from '../lib/runs';
 import { REVIEW } from '../lib/review';
 import { COIN, CoinError, buyFreeze, earnCoins, payRetest, streakDayXu, unlockLesson, walletOf, type CoinReason } from '../lib/coins';
-import { MAX_FREEZES, goalRunOf, grantRewards, lessonXp, recordPractice, vnDay, DEFAULT_GOAL } from '../lib/xp';
+import { MAX_FREEZES, goalRunOf, lessonXp, recordPractice, vnDay, DEFAULT_GOAL } from '../lib/xp';
 import { mixUps } from '../lib/mixups';
 import { mistakeOf, type Mistake } from '../lib/mistakes';
 import { normalizeAnswer } from './engagementRoutes';
@@ -36,7 +36,6 @@ import { subsOf } from '../lib/subs';
 import { CHALLENGE, beatsOf, cachedItemStats, challengeItems, lastClosedWeek, loadChallenges, priceOf, scoreOf, stateOf, withLessons, type ChallengeRow } from '../lib/challenges';
 import { unlockBankVideo, unlockChallenge } from '../lib/coins';
 import { BANK, bankFormat, bankPrice, bankWrong, loadBankItems, type BankItem } from '../lib/bank';
-import { isPremiumUser } from '../lib/premium';
 import { STAR_MODES, STAR_PHASES, canAfford, playStar, starCheck, starStakes, starSummary, starsUsed } from '../lib/stars';
 import { gemsOn } from '../lib/growthConfig';
 import { takeItem, useItem } from '../lib/chests';
@@ -436,12 +435,12 @@ export function registerRunRoutes(router: any, context: any) {
 			if (!skill) return res.status(404).json({ success: false, message: 'Skill not found' });
 			const open = (g.lessonsBySkill.get(skill.id) || []).filter((l) => !g.isLocked(l));
 			if (!open.length) return res.status(403).json({ success: false, code: 'PREMIUM_REQUIRED' });
-			// Skipping a rule is Premium; everyone takes the final test once every lesson is done
+			// The final test of a rule is taken once every lesson is done
 			const allDone = open.every((l) => g.done.has(l.id));
-			if (!g.premium && !allDone) return res.status(403).json({ success: false, code: 'FINISH_LESSONS_FIRST' });
-			// Premium skips a rule wherever it is on the path; a free learner's rule waits its turn
+			if (!allDone) return res.status(403).json({ success: false, code: 'FINISH_LESSONS_FIRST' });
+			// A rule waits its turn on the path
 			const ruleBy = g.ruleLockedBy(skill);
-			if (ruleBy && !g.premium) return res.status(403).json({ success: false, code: 'RULE_LOCKED', by: { name: ruleBy.name, slug: ruleBy.slug } });
+			if (ruleBy) return res.status(403).json({ success: false, code: 'RULE_LOCKED', by: { name: ruleBy.name, slug: ruleBy.slug } });
 
 			const today = vnDay();
 			const active = await database('listening_runs').where({ user_id: learner.userId, mode: 'skill_test', skill_id: skill.id, status: 'active' }).first('id');
@@ -635,8 +634,7 @@ export function registerRunRoutes(router: any, context: any) {
 					const c = await cardsOnAnswer(database, learner.userId, {
 						correct: !!out.data.correct, hint: out.hinted, phase: out.phase, difficulty: out.clipRow.difficulty ?? null, listens: out.listensUsed,
 						star: (out.data.star?.outcome as any) || null,
-					}, { freeLesson: !out.premiumLesson, premium: await isPremiumUser(database, learner.userId) });
-					if (c.premium_days) await grantRewards(context, req.schema, learner.userId, [{ kind: 'premium_day', days: c.premium_days, key: `card:${c.dare?.paid?.chest?.open_id || 'x'}` }]);
+					}, { freeLesson: !out.premiumLesson });
 					card = c.dare;
 				} catch (error) {
 					logger?.warn?.(`[cards] progress of ${learner.userId} not counted: ${String(error)}`);
@@ -645,8 +643,7 @@ export function registerRunRoutes(router: any, context: any) {
 			// A challenge says nothing until the end: right or wrong shows on the result screen
 			if (out.mode === 'challenge') {
 				if (learner.userId) {
-					const won = await recordPractice(database, learner.userId, { attempts: 1 });
-					await grantRewards(context, req.schema, learner.userId, won.rewards);
+					await recordPractice(database, learner.userId, { attempts: 1 });
 				}
 				return res.json({ success: true, data: { hidden: true, position: out.data.position, total: out.data.total, done: out.data.done } });
 			}
@@ -654,7 +651,6 @@ export function registerRunRoutes(router: any, context: any) {
 			if (learner.userId) {
 				const won = await recordPractice(database, learner.userId, { attempts: 1 });
 				rewards = won.rewards;
-				await grantRewards(context, req.schema, learner.userId, won.rewards);
 			}
 			if (out.first && learner.key) await registerLearner(database, out.lessonId, learner.userId, learner.anonymousId).catch(() => false);
 			// A trap answered right in a lesson or a review: Xu at once, once per clip a day
@@ -775,7 +771,6 @@ export function registerRunRoutes(router: any, context: any) {
 				xp.total += won.xp;
 				xp.kind = won.kind ?? (won.xp ? kind : xp.kind);
 				rewards = [...rewards, ...won.rewards];
-				if (userId) await grantRewards(context, req.schema, userId, won.rewards);
 			};
 
 			if (userId && closed.first) {
@@ -898,12 +893,12 @@ export function registerRunRoutes(router: any, context: any) {
 	type Card = ReturnType<typeof cardOf>;
 	/** One round as the pages show it, for this learner */
 	function cardOf(c: ChallengeRow, ctx: {
-		now: number; lastClosed: string | null; all: ChallengeRow[]; userId: string | null; premium: boolean;
+		now: number; lastClosed: string | null; all: ChallengeRow[]; userId: string | null;
 		unlocked: Set<string>; results: any[]; runs: any[];
 	}) {
 		const state = stateOf(c, ctx.now);
 		const passedRuns = new Set(ctx.runs.filter((r) => r.status === 'finished' && r.passed).map((r) => r.challenge_id));
-		const price = ctx.premium || ctx.unlocked.has(c.lesson_id) ? 0 : priceOf(c, ctx.lastClosed, ctx.now);
+		const price = ctx.unlocked.has(c.lesson_id) ? 0 : priceOf(c, ctx.lastClosed, ctx.now);
 		let blocked: null | 'SCHEDULED' | 'LOGIN_REQUIRED' = null;
 		if (state === 'scheduled') blocked = 'SCHEDULED';
 		else if (price > 0 && !ctx.userId) blocked = 'LOGIN_REQUIRED';
@@ -915,7 +910,7 @@ export function registerRunRoutes(router: any, context: any) {
 			participants, passed_count: Number(c.passed_count) || 0,
 			pass_rate: participants ? Math.round(((Number(c.passed_count) || 0) * 100) / participants) : null,
 			/** Xu to open it now (0: open), and whether Premium covers it */
-			price, premium: ctx.premium, blocked,
+			price, blocked,
 			/** The official go (while it was live) */
 			my: mine ? { score: Number(mine.score), total: Number(mine.total), passed: !!mine.passed } : null,
 			passed_any: passedRuns.has(c.id),
@@ -930,13 +925,12 @@ export function registerRunRoutes(router: any, context: any) {
 		const everything = all || await loadChallenges(database);
 		const weeks = new Set(rows.map((r) => r.week));
 		const ids = [...new Set([...rows.map((r) => r.id), ...everything.filter((r) => weeks.has(r.week)).map((r) => r.id)])];
-		const [premium, unlocks, results, runs] = await Promise.all([
-			learner.userId ? isPremiumUser(database, learner.userId) : false,
+		const [unlocks, results, runs] = await Promise.all([
 			learner.userId ? database('listening_unlocks').select('lesson_id').where('user_id', learner.userId).whereIn('lesson_id', rows.map((r) => r.lesson_id)) : [],
 			learner.key ? database('listening_challenge_results').select('challenge_id', 'score', 'total', 'passed').where('learner_key', learner.key).whereIn('challenge_id', ids) : [],
 			learner.key ? database('listening_runs').select('challenge_id', 'status', 'passed').where({ learner_key: learner.key, mode: 'challenge' }).whereIn('challenge_id', ids) : [],
 		]);
-		const ctx = { now, lastClosed: lastClosedWeek(everything, now), all: everything, userId: learner.userId, premium, unlocked: new Set<string>(unlocks.map((u: any) => u.lesson_id)), results, runs };
+		const ctx = { now, lastClosed: lastClosedWeek(everything, now), all: everything, userId: learner.userId, unlocked: new Set<string>(unlocks.map((u: any) => u.lesson_id)), results, runs };
 		return rows.map((c) => cardOf(c, ctx));
 	}
 
@@ -1045,15 +1039,14 @@ export function registerRunRoutes(router: any, context: any) {
 	/** What this learner may open, has done and others did, for a set of sentences */
 	async function bankCtx(req: any, clipIds: string[]) {
 		const learner = learnerOf(req);
-		const [premium, unlocks, mine, others, active] = await Promise.all([
-			learner.userId ? isPremiumUser(database, learner.userId) : false,
+		const [unlocks, mine, others, active] = await Promise.all([
 			learner.userId ? database('practice_video_unlocks').select('practice_id').where('user_id', learner.userId) : [],
 			learner.userId && clipIds.length ? database('practice_clip_progress').select('clip_id').where({ user_id: learner.userId, right_once: true }).whereIn('clip_id', clipIds) : [],
 			clipIds.length ? database('practice_clip_progress').select('clip_id').count('* as n').whereIn('clip_id', clipIds).groupBy('clip_id') : [],
 			learner.key && clipIds.length ? database('listening_runs').select('clip_id').where({ learner_key: learner.key, mode: 'bank', status: 'active' }).whereIn('clip_id', clipIds) : [],
 		]);
 		return {
-			userId: learner.userId, premium,
+			userId: learner.userId,
 			unlocked: new Set<string>(unlocks.map((u: any) => u.practice_id)),
 			done: new Set<string>(mine.map((m: any) => m.clip_id)),
 			learners: new Map<string, number>(others.map((o: any) => [o.clip_id, Number(o.n)])),
@@ -1064,7 +1057,7 @@ export function registerRunRoutes(router: any, context: any) {
 
 	/** One sentence as a card, for this learner */
 	function bankCardOf(it: BankItem, ctx: BankCtx) {
-		const locked = it.is_premium && !ctx.premium && !ctx.unlocked.has(it.practice_id);
+		const locked = it.is_premium && !ctx.unlocked.has(it.practice_id);
 		return {
 			id: it.id, n: it.n,
 			video: { short_id: it.video_short_id, title: it.video_title },
@@ -1074,7 +1067,7 @@ export function registerRunRoutes(router: any, context: any) {
 			own: it.lesson_kind === 'bank',
 			is_premium: it.is_premium, locked,
 			/** Xu to open its video now (0: open): all the video's sentences open together */
-			price: locked ? bankPrice(it) : 0, premium: ctx.premium,
+			price: locked ? bankPrice(it) : 0,
 			blocked: locked && !ctx.userId ? ('LOGIN_REQUIRED' as const) : null,
 			done: ctx.done.has(it.id),
 			learners: ctx.learners.get(it.id) || 0,

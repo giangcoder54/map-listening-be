@@ -20,7 +20,8 @@ import { cleanIpa, meaningFor } from '../lib/meanings';
 const SOURCES = ['extensive', 'intensive', 'dict'];
 const KNOWN_DAYS = 21;
 const clean = (v: unknown, max = 600) => String(v ?? '').slice(0, max);
-const intOr = (v: unknown) => (Number.isFinite(Number(v)) && v !== null && v !== '' ? Math.round(Number(v)) : null);
+/** A whole number the integer columns can hold; anything else is not kept */
+const intOr = (v: unknown) => (v !== null && v !== '' && Math.abs(Math.round(Number(v))) <= 2147483647 ? Math.round(Number(v)) : null);
 export function registerWordsRoutes(router: any, context: any) {
 	const { database, logger } = context;
 	const wrap = (what: string, handler: (req: any, res: any) => Promise<any>) => async (req: any, res: any) => {

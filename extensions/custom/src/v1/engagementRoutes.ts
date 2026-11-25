@@ -14,9 +14,8 @@
  * XP, streak, freezes and rewards: lib/xp.ts (rules, the ledger, the reads). Days are Vietnam days.
  */
 import { PRACTICE, UUID_RE, acceptOf, answerOf, practicePrefsOf } from '../lib/lessons';
-import { isPremiumUser } from '../lib/premium';
 import { reviewPrompt } from '../lib/reviewDue';
-import { DEFAULT_GOAL, TZ, XP, engagementOf, grantRewards, recordPractice } from '../lib/xp';
+import { DEFAULT_GOAL, TZ, XP, engagementOf, recordPractice } from '../lib/xp';
 
 export { TZ, XP };
 /** Days until the next review, by box (0 = just missed) */
@@ -318,7 +317,6 @@ export function registerEngagementRoutes(router: any, context: any) {
 		if (!userId) return;
 		const limit = Math.min(30, Math.max(1, Number(req.query.limit) || 15));
 		try {
-			const premium = await isPremiumUser(database, userId, logger);
 			const rows = await database('listening_reviews as r')
 				.join('listening_clips as c', 'c.id', 'r.clip_id')
 				.join('listening_lessons as l', 'l.id', 'c.lesson_id')
@@ -338,7 +336,7 @@ export function registerEngagementRoutes(router: any, context: any) {
 				.orderBy('r.due_at', 'asc')
 				.limit(limit * 2);
 			const items = rows
-				.filter((r: any) => premium || !r.premium_content)
+				.filter((r: any) => !r.premium_content)
 				.slice(0, limit)
 				.map((r: any) => {
 					const answer = answerOf(r, r.text, r.answer_mode === 'per_clip' ? 'per_clip' : 'one_answer');
@@ -386,7 +384,7 @@ export function registerEngagementRoutes(router: any, context: any) {
 				.where({ 'r.user_id': userId, 'r.clip_id': clipId })
 				.first();
 			if (!r) return res.status(404).json({ success: false, message: 'Not in your review list' });
-			if (r.premium_content && !(await isPremiumUser(database, userId, logger))) {
+			if (r.premium_content) {
 				return res.status(403).json({ success: false, code: 'PREMIUM_REQUIRED' });
 			}
 			const answer = answerOf(r, r.text, r.answer_mode === 'per_clip' ? 'per_clip' : 'one_answer');
@@ -429,7 +427,6 @@ export function registerEngagementRoutes(router: any, context: any) {
 				attempts: 1,
 				xp: correct ? { reason: 'review', dedupe: `review:${attempt.id}`, lessonId: r.lesson_id } : null,
 			});
-			await grantRewards(context, req.schema, userId, won.rewards);
 			return res.json({
 				success: true,
 				data: {

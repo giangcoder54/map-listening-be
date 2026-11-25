@@ -1,5 +1,6 @@
 import { pickPaymentCode } from '../v1/paymentCode'
 import { creditCoinOrder } from './gemOrders'
+import { notifyAdmin } from './telegram'
 
 export type SettleResult = 'activated' | 'already-settled' | 'no-match' | 'underpaid' | 'expired' | 'ignored'
 
@@ -11,30 +12,9 @@ export interface SepayTxInput {
   referenceCode?: string
 }
 
-let bot: any = null
-try {
-  if (process.env.TELEGRAM_BOT_TOKEN) {
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const TelegramBot = require('node-telegram-bot-api')
-    bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { polling: false })
-  }
-}
-catch {
-  bot = null
-}
-
-export function notifyAdmin(message: string) {
-  if (!bot)
-    return
-  const groupChatId = process.env.TELEGRAM_GROUP_ID || '-5020831863'
-  bot.sendMessage(groupChatId, message).catch(() => {})
-}
-
 /**
  * Khớp một giao dịch SePay báo về với đơn hàng `purchase_histories` đang `pending`,
- * và nếu đủ tiền thì đánh dấu `published` — hook có sẵn `purchase_histories.items.update`
- * (xem hook/index.ts) sẽ tự kích hoạt Premium, không cần gọi lại activatePremiumForUser
- * ở đây (tránh trùng logic ở hai chỗ).
+ * và nếu đủ tiền thì đánh dấu `published` rồi cộng Kim cương (lib/gemOrders.ts, một lần mỗi đơn).
  *
  * Idempotent: dùng `updateByQuery` với điều kiện `status = 'pending'` ngay trong câu
  * update, nên nếu SePay gọi lại webhook (retry) hoặc admin đã tự publish tay trước đó,
@@ -98,7 +78,7 @@ export async function settleSepayTransaction(tx: SepayTxInput, context: any): Pr
   if (!updatedIds || updatedIds.length === 0)
     return 'already-settled'
 
-  // A Kim cuong top-up: pay the coins now (once per order); the update hook would do it too
+  // Pay the Kim cuong now (once per order); the update hook would do it too
   if (order.product_type === 'coins') {
     await creditCoinOrder(context.database, order.id).catch((error: any) => logger.error(`[SePay] Credit of order ${paymentCode} failed: ${String(error)}`))
   }

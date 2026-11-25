@@ -34,6 +34,8 @@ const DEFAULTS = {
 		 */
 		extensive: 10, extensiveGood: 5, extensiveLevel: 20, intensive: 10, intensiveGood: 10,
 	},
+	/** The daily goal reached 7 (14, 21...) days in a row: this many Kim cương more (lib/xp.ts) */
+	goalWeek: 50,
 	/** Daily goal reached: Kim cương by the days in a row, and a one-off bonus at these lengths */
 	streakDay: [{ from: 30, xu: 20 }, { from: 7, xu: 15 }, { from: 1, xu: 10 }],
 	streakMilestone: { 7: 50, 30: 200, 100: 500, 365: 1500 } as Record<number, number>,
@@ -118,7 +120,7 @@ export function applyCoinSettings(input: unknown) {
 /** Xu for a day with the goal reached, by the days in a row (today included) */
 export const streakDayXu = (days: number) => COIN.streakDay.find((s) => days >= s.from)?.xu ?? 0;
 
-export type CoinReason = 'lesson' | 'perfect' | 'goal' | 'streak' | 'review' | 'ad' | 'unlock' | 'premium_day' | 'freeze' | 'retest' | 'refund' | 'admin' | 'trap' | 'streak_milestone' | 'skill_test' | 'replay' | 'phrase_unlock' | 'ai' | 'challenge' | 'bank'
+export type CoinReason = 'lesson' | 'perfect' | 'goal' | 'streak' | 'review' | 'ad' | 'unlock' | 'premium_day' | 'referral' | 'freeze' | 'retest' | 'refund' | 'admin' | 'trap' | 'streak_milestone' | 'skill_test' | 'replay' | 'phrase_unlock' | 'ai' | 'challenge' | 'bank'
 	// Kim cương v2 (2026-12-10_gems_v2_p0.sql)
 	| 'star' | 'chest' | 'card' | 'card_skip' | 'recovery' | 'purchase' | 'chargeback' | 'room_fee' | 'room_prize' | 'help' | 'coop'
 	| 'extensive' | 'intensive';

@@ -6,7 +6,7 @@
  *   POST /support         { email, name?, topic?, message, website (honeypot) }
  */
 import { createHash } from 'node:crypto';
-import { notifyAdmin } from '../lib/sepay';
+import { notifyAdmin } from '../lib/telegram';
 import { clientIp, isLimited } from '../lib/rateLimit';
 import { verifyTurnstile } from '../lib/turnstile';
 

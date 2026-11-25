@@ -1,8 +1,5 @@
 import { defineHook } from '@directus/extensions-sdk';
-import { registerCronjob } from './cronjob_check_transactions/cronjob_check_transactions';
-import { calculateEndDate, activatePremiumForUser, purchaseCycle } from '../utils';
 import { registerSepayRawBody } from './sepayRawBody';
-import { downgradeExpiredPremium } from '../lib/premium';
 import { registerLessonReadyCheck } from './lessonReadyCheck';
 import { registerLessonTextCase } from './lessonTextCase';
 import { registerEditorScope } from './editorScope';
@@ -15,12 +12,10 @@ import { sweepRooms } from '../lib/rooms';
 import { sweepCoop } from '../lib/coop';
 import { drop as coopDrop, startTicker as startCoopTicker, subscribe as coopSubscribe } from '../lib/coopHub';
 import { nightlyCoinJob } from '../lib/coinLedger';
-import { notifyAdmin } from '../lib/sepay';
+import { notifyAdmin } from '../lib/telegram';
 
 export default defineHook((registerEvents, context) => {
 	const { filter, action } = registerEvents;
-	const { services } = context;
-	const { ItemsService } = services;
 
 	// Giữ raw body cho webhook SePay (bắt buộc để xác thực HMAC-SHA256)
 	registerSepayRawBody(registerEvents, context);
@@ -30,9 +25,6 @@ export default defineHook((registerEvents, context) => {
 
 	// User made without a role (e.g. in the Directus admin): Free User
 	registerDefaultRole(registerEvents, context);
-
-	// Mỗi giờ: Premium hết hạn -> role Free User
-	registerEvents.schedule('15 * * * *', async () => { await downgradeExpiredPremium(context); });
 
 	// Referral / affiliate numbers edited in Directus (growth_settings): no restart needed
 	refreshGrowthConfig(context.database, context.logger);
@@ -53,54 +45,14 @@ export default defineHook((registerEvents, context) => {
 	action('websocket.close', ({ client }: any) => coopDrop(client));
 	registerEvents.schedule('*/10 * * * *', async () => { await sweepCoop(context.database).catch(() => 0); await sweepRooms(context.database).catch((e: any) => context.logger?.warn?.(`[rooms] sweep failed: ${String(e)}`)); });
 
-	// Register cronjob check transactions
-	// registerCronjob(registerEvents, context);
-
-	action('purchase_histories.items.update', async (meta, hookContext) => {
-		if (meta.payload && meta.payload.status === 'published' && meta.keys && meta.keys.length > 0) {
-			try {
-				const purchaseHistoryService = new ItemsService('purchase_histories', {
-					schema: hookContext.schema,
-					accountability: { admin: true },
-				});
-				// UsersService: the role change clears the permission cache (see utils.ts)
-				const usersService = new services.UsersService({
-					schema: hookContext.schema,
-					accountability: { admin: true },
-				});
-
-				for (const id of meta.keys) {
-					const purchase = await purchaseHistoryService.readOne(id, { fields: ['*', 'user.*'] });
-					if (purchase && purchase.status === 'published') {
-						const customerId = typeof purchase.user === 'object' ? purchase.user?.id : purchase.user;
-						// A Kim cuong top-up pays its coins, never a Premium plan (lib/gemOrders.ts, once per order)
-						if (customerId && purchase.product_type === 'coins') {
-							await creditCoinOrder(context.database, id).catch((error: any) =>
-								context.logger?.error(`[gems] Credit of order ${id} failed: ${String(error)}`));
-							await recordConversion(id, context, hookContext.schema).catch((error: any) =>
-								context.logger?.error(`[referral] Conversion of order ${id} failed: ${String(error)}`));
-							continue;
-						}
-						if (customerId) {
-							const amount = purchase.amount || 0;
-							const cycle = purchaseCycle(purchase.billing_cycle, amount);
-							const endDate = calculateEndDate(new Date(), cycle);
-							await activatePremiumForUser(
-								customerId,
-								endDate,
-								purchase.type || 'pro',
-								usersService,
-								context.database,
-								context.logger
-							);
-							// Referred buyer: reward the inviter / commission for the affiliate
-							await recordConversion(id, context, hookContext.schema).catch((error: any) =>
-								context.logger?.error(`[referral] Conversion of order ${id} failed: ${String(error)}`));
-						}
-					}
-				}
-			} catch (error: any) {
-				context.logger?.error(`[Manual Update] Error processing premium activation: ${String(error)}`);
+	// An order marked paid (by hand in the admin, or by a webhook): its Kim cương are paid once
+	action('purchase_histories.items.update', async (meta) => {
+		if (meta.payload && meta.payload.status === 'published' && meta.keys?.length) {
+			for (const id of meta.keys.map(String)) {
+				await creditCoinOrder(context.database, id).catch((error: any) =>
+					context.logger?.error(`[gems] Credit of order ${id} failed: ${String(error)}`));
+				await recordConversion(id, context).catch((error: any) =>
+					context.logger?.error(`[referral] Conversion of order ${id} failed: ${String(error)}`));
 			}
 		}
 		// Order refunded by hand (bank transfer): its commission no longer counts

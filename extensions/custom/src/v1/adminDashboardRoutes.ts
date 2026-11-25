@@ -449,11 +449,6 @@ export function registerAdminDashboardRoutes(router: any, context: any) {
 				SELECT count(*) AS n FROM directus_users GROUP BY gl_created_at HAVING count(*) >= 3
 			) x
 		`)).rows[0].n;
-		const premium = (await database.raw(`
-			SELECT count(*)::int AS n FROM directus_users
-			WHERE status = 'active' AND NOT is_internal AND is_premium AND (premium_until IS NULL OR premium_until > now())
-		`)).rows[0].n;
-
 		const [journey, landing, steps, retention, eventsSince, northStar, releases, practiceStats] = await Promise.all([
 			visitorJourney(from, today), landingFunnel(from, today), lessonSteps(from, today), comingBack(today),
 			database('learning_events').where('human', true).min('day as d').first().then((r: any) => (r?.d ? vnDay(new Date(r.d)) : null)),
@@ -480,7 +475,6 @@ export function registerAdminDashboardRoutes(router: any, context: any) {
 				previous_daily: all.slice(0, days),
 				sales: now,
 				previous_sales: before,
-				premium_users: premium,
 				month: { month, days: monthDays, elapsed, goals },
 				funnel,
 				popular_lessons: popular,

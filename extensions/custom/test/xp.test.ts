@@ -15,8 +15,9 @@ import { readdirSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import {
 	GOAL_DAYS_FOR_REWARD, LEVELS, MAX_FREEZES, XP,
-	engagementOf, grantRewards, lessonXp, levelOf, recordPractice, type NewReward,
+	engagementOf, lessonXp, levelOf, recordPractice, type NewReward,
 } from '../src/lib/xp';
+import { COIN } from '../src/lib/coins';
 
 // knex as Directus has it: pnpm keeps it (and pg next to it) in /directus/node_modules/.pnpm
 const PNPM = '/directus/node_modules/.pnpm';
@@ -40,11 +41,11 @@ const gain = (n: number, amount = 10) =>
 	recordPractice(trx, user, { attempts: 1, xp: { reason: 'review', dedupe: `test:${++seq}`, amount } }, day(n));
 /** An answer that wins nothing: still a practice day */
 const miss = (n: number) => recordPractice(trx, user, { attempts: 1 }, day(n));
-/** Reach a goal of `goal` XP on day n, 10 XP at a time: the Premium days it gave */
+/** Reach a goal of `goal` XP on day n, 10 XP at a time: the goal rewards it gave */
 const reachGoal = async (n: number, goal = 30) => {
 	const rewards: NewReward[] = [];
 	for (let xp = 0; xp < goal; xp += 10) rewards.push(...(await gain(n)).rewards);
-	return rewards.filter((r) => r.kind === 'premium_day');
+	return rewards.filter((r) => r.kind === 'goal_gems');
 };
 
 /** A lesson: group, skill, lesson */
@@ -191,14 +192,16 @@ describe('Streak freezes', () => {
 });
 
 describe(`${GOAL_DAYS_FOR_REWARD}-day reward`, () => {
-	test(`the ${GOAL_DAYS_FOR_REWARD}th goal day in a row gives a Premium day, once`, async () => {
+	test(`the ${GOAL_DAYS_FOR_REWARD}th goal day in a row pays Kim cuong, once`, async () => {
 		for (let n = 0; n < GOAL_DAYS_FOR_REWARD - 1; n++) assert.deepEqual(await reachGoal(n), [], `day ${n}`);
 		const won = await reachGoal(GOAL_DAYS_FOR_REWARD - 1);
-		assert.deepEqual(won, [{ kind: 'premium_day', days: 1, key: `premium:${day(GOAL_DAYS_FOR_REWARD - 1)}` }]);
+		assert.deepEqual(won, [{ kind: 'goal_gems', days: 0, coins: COIN.goalWeek, key: `goal:${day(GOAL_DAYS_FOR_REWARD - 1)}` }]);
+		const paid = await trx('coin_events').where({ user_id: user, dedupe_key: `goal_week:${day(GOAL_DAYS_FOR_REWARD - 1)}` });
+		assert.deepEqual(paid.map((r: any) => Number(r.amount)), [COIN.goalWeek]);
 		assert.deepEqual((await gain(GOAL_DAYS_FOR_REWARD - 1)).rewards, [], 'more XP the same day');
 		const e = await eng(GOAL_DAYS_FOR_REWARD - 1);
 		assert.equal(e.goal_days, GOAL_DAYS_FOR_REWARD);
-		assert.equal(e.rewards_new.filter((r: any) => r.kind === 'premium_day').length, 1);
+		assert.equal(e.rewards_new.filter((r: any) => r.kind === 'goal_gems').length, 1);
 	});
 
 	test('the 14th day gives another one', async () => {
@@ -257,46 +260,3 @@ describe('Levels', () => {
 	});
 });
 
-describe('Premium day given', () => {
-	/** Directus' users service, recording what it is asked to write */
-	const servicesSpy = () => {
-		const calls: any[] = [];
-		class UsersService { async updateOne(id: string, data: any) { calls.push({ id, data }); } }
-		return { calls, services: { UsersService } };
-	};
-	const reward: NewReward = { kind: 'premium_day', days: 1, key: `premium:${day(0)}` };
-	const logger = { info() {}, warn() {}, error() {} };
-	const DAY_MS = 86400_000;
-
-	test('a free learner: Premium from now for a day', async () => {
-		const { calls, services } = servicesSpy();
-		await grantRewards({ database: trx, services, logger }, null, user, [reward]);
-		const end = new Date(calls.at(-1).data.premium_until).getTime();
-		assert.ok(Math.abs(end - (Date.now() + DAY_MS)) < 60_000);
-		assert.equal(calls.at(-1).data.is_premium, true);
-	});
-
-	test('Premium already running: a day added at its end', async () => {
-		const until = new Date(Date.now() + 10 * DAY_MS);
-		await trx('directus_users').where('id', user).update({ is_premium: true, premium_until: until, subscription_type: 'pro' });
-		const { calls, services } = servicesSpy();
-		await grantRewards({ database: trx, services, logger }, null, user, [reward]);
-		assert.equal(new Date(calls.at(-1).data.premium_until).getTime(), until.getTime() + DAY_MS);
-		assert.equal(calls.at(-1).data.subscription_type, 'pro', 'the plan stays');
-	});
-
-	test('a lifetime member: nothing to add, the reward is kept at 0 days', async () => {
-		await trx('directus_users').where('id', user).update({ is_premium: true, premium_until: null, subscription_type: 'lifetime' });
-		await trx('user_rewards').insert({ user_id: user, kind: 'premium_day', dedupe_key: reward.key, days: 1 });
-		const { calls, services } = servicesSpy();
-		await grantRewards({ database: trx, services, logger }, null, user, [reward]);
-		assert.equal(calls.length, 0);
-		assert.equal((await trx('user_rewards').where('user_id', user).first()).days, 0);
-	});
-
-	test('a freeze alone gives no Premium', async () => {
-		const { calls, services } = servicesSpy();
-		await grantRewards({ database: trx, services, logger }, null, user, [{ kind: 'freeze', days: 0, key: 'freeze:1' }]);
-		assert.equal(calls.length, 0);
-	});
-});

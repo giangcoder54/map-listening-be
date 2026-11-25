@@ -126,10 +126,10 @@ const rewardView = (r: any) => (r && typeof r === 'object' ? r : {});
 
 /**
  * Pay a card's reward once (the draw id is the key): { coins }, { item } (into the bag) or { chest } (opened
- * for free). Returns what was given and the Premium days to hand out after the commit.
+ * for free). Returns what was given.
  */
-export async function payReward(trx: any, userId: string, drawId: string, reward: any, o: { premium: boolean; today: string }) {
-	const out: { coins: number; item: string | null; chest: any | null; premium_days: number } = { coins: 0, item: null, chest: null, premium_days: 0 };
+export async function payReward(trx: any, userId: string, drawId: string, reward: any, o: { today: string }) {
+	const out: { coins: number; item: string | null; chest: any | null } = { coins: 0, item: null, chest: null };
 	if (reward?.coins) {
 		const r = await earnCoins(trx, userId, { reason: 'card', amount: Number(reward.coins), dedupe: `card:${drawId}`, meta: { card_draw_id: drawId } }, o.today);
 		out.coins = r.added;
@@ -139,9 +139,7 @@ export async function payReward(trx: any, userId: string, drawId: string, reward
 		if (it) { await giveItem(trx, userId, it, { source: 'card', sourceId: drawId, key: `card:${drawId}`, today: o.today }); out.item = it.code; }
 	}
 	if (reward?.chest) {
-		const res = await openChest(trx, userId, String(reward.chest), drawId, { free: true, premium: o.premium, today: o.today });
-		out.chest = res;
-		out.premium_days = res.premium_days;
+		out.chest = await openChest(trx, userId, String(reward.chest), drawId, { free: true, today: o.today });
 	}
 	return out;
 }
@@ -223,7 +221,7 @@ export async function drawCard(db: any, userId: string, o: { kind: 'truth' | 'da
 	return drawView(db, d, o.lang);
 }
 
-export async function answerTruth(db: any, userId: string, o: { choice: number; premium: boolean; lang: string; today?: string }) {
+export async function answerTruth(db: any, userId: string, o: { choice: number; lang: string; today?: string }) {
 	const today = o.today || vnDay();
 	const done = await db.transaction(async (trx: any) => {
 		await lockPurse(trx, userId);
@@ -236,7 +234,7 @@ export async function answerTruth(db: any, userId: string, o: { choice: number; 
 		if (!Number.isInteger(o.choice) || o.choice < 0 || o.choice > 2) throw new CardError('BAD_REQUEST');
 		const correct = o.choice === right;
 		await trx('card_draws').where('id', d.id).update({ status: 'done', correct, done_at: trx.fn.now() });
-		const paid = correct ? await payReward(trx, userId, d.id, card.reward, { premium: o.premium, today }) : null;
+		const paid = correct ? await payReward(trx, userId, d.id, card.reward, { today }) : null;
 		return { id: d.id as string, correct, paid };
 	});
 	return { ...done, view: await drawView(db, await db('card_draws').where('id', done.id).first(), o.lang) };
@@ -262,9 +260,9 @@ export async function skipDare(db: any, userId: string, today = vnDay()) {
  * Every answer of the Listening Lab goes through here (after the answer is saved): a dare open counts it when it
  * fits the goal, and a learner low on Kim cương counts toward the way back (right answers in a free lesson).
  */
-export async function onAnswer(db: any, userId: string, ev: AnswerEv, ctx: { freeLesson: boolean; premium: boolean }, today = vnDay()) {
+export async function onAnswer(db: any, userId: string, ev: AnswerEv, ctx: { freeLesson: boolean }, today = vnDay()) {
 	return db.transaction(async (trx: any) => {
-		const result: { dare: null | { progress: number; goal_n: number; done: boolean; paid?: any }; premium_days: number } = { dare: null, premium_days: 0 };
+		const result: { dare: null | { progress: number; goal_n: number; done: boolean; paid?: any } } = { dare: null };
 		const d = await trx('card_draws as d').join('cards as c', 'c.id', 'd.card_id')
 			.where({ 'd.user_id': userId, 'd.status': 'open', 'd.kind': 'dare' }).select('d.id', 'd.progress', 'd.goal_n', 'c.goal', 'c.reward').forUpdate('d').first();
 		if (d && matches(d.goal, ev)) {
@@ -272,9 +270,8 @@ export async function onAnswer(db: any, userId: string, ev: AnswerEv, ctx: { fre
 			const goal = Number(d.goal_n) || Number(d.goal?.n) || 1;
 			const done = progress >= goal;
 			await trx('card_draws').where('id', d.id).update(done ? { progress, status: 'done', correct: true, done_at: trx.fn.now() } : { progress });
-			const paid = done ? await payReward(trx, userId, d.id, d.reward, { premium: ctx.premium, today }) : undefined;
+			const paid = done ? await payReward(trx, userId, d.id, d.reward, { today }) : undefined;
 			result.dare = { progress, goal_n: goal, done, paid };
-			result.premium_days = paid?.premium_days || 0;
 		}
 		if (ev.correct && !ev.hint && ctx.freeLesson) {
 			const purse = await trx('user_xp').select('coins').where('user_id', userId).first();

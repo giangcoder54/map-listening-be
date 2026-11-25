@@ -25,8 +25,33 @@ export async function listPacks(db: any, userId: string | null) {
 			code: p.code, price_vnd: Number(p.price_vnd), coins: Number(p.coins), bonus_pct: Number(p.bonus_pct), first_mult: Number(p.first_mult),
 			total, first_total: first && Number(p.first_mult) > 1 ? firstCoins(p) : null,
 			per_lesson_vnd: Math.round((Number(p.price_vnd) / total) * 100),
+			// Card price through Polar (USD cents); null = this pack is sold by bank transfer only
+			price_usd_cents: p.polar_product_id && p.price_usd_cents ? Number(p.price_usd_cents) : null,
 		};
 	});
+}
+
+/** Anti-spam: how many unpaid orders still alive one learner may hold, and how long an order counts as alive */
+export const ORDER_LIMIT = 5;
+export const ORDER_MINUTES = 15;
+
+/**
+ * Minutes this learner must wait before opening another order, 0 = may open now. Only orders still alive count:
+ * pending, made in the last ORDER_MINUTES and not past expire_time (a Polar checkout lives longer on Polar's side,
+ * it counts the same 15 minutes as a bank order).
+ */
+export async function orderWait(db: any, userId: string, now = Date.now()) {
+	const rows = await db('purchase_histories').where({ user: userId, product_type: 'coins', status: 'pending' })
+		.where('date_created', '>', new Date(now - ORDER_MINUTES * 60_000))
+		.where((q: any) => q.whereNull('expire_time').orWhere('expire_time', '>', new Date(now)))
+		.select('date_created', 'expire_time');
+	if (rows.length < ORDER_LIMIT) return 0;
+	const ends = rows.map((r: any) => {
+		const byAge = new Date(r.date_created).getTime() + ORDER_MINUTES * 60_000;
+		return r.expire_time ? Math.min(byAge, new Date(r.expire_time).getTime()) : byAge;
+	}).sort((a: number, b: number) => a - b);
+	// A place frees up when enough of the oldest have ended
+	return Math.max(1, Math.ceil((ends[rows.length - ORDER_LIMIT] - now) / 60_000));
 }
 
 /**

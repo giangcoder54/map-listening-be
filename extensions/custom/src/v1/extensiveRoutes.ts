@@ -18,15 +18,15 @@
  *
  * Guests can play free lessons; nothing is saved for them. A premium lesson needs Premium or Kim cương (lib/contentUnlocks.ts).
  */
+import { searchLessonIds, searchWords } from '../lib/lessonSearch';
 import { BASE_LANG, EL, RESUME_DAYS, SELF_RATINGS, isGood, langOf, levelRowOf, linesIn, moveAfter, thumbOf, type SelfRating } from '../lib/extensive';
 import { UUID_RE } from '../lib/lessons';
 import { wordKey } from '../lib/dict';
 import { cleanIpa } from '../lib/meanings';
-import { isPremiumUser } from '../lib/premium';
 import { accessOf, type Access } from '../lib/contentUnlocks';
 import { COIN, CoinError, earnCoins, unlockContent, walletOf } from '../lib/coins';
 import { isStaff } from '../lib/staff';
-import { MAX_FREEZES, grantRewards, recordPractice, vnDay } from '../lib/xp';
+import { MAX_FREEZES, recordPractice, vnDay } from '../lib/xp';
 import { addStudySeconds } from '../lib/studyTime';
 import { interestOf, rankAll, topicsParam } from '../lib/recommend';
 
@@ -94,13 +94,12 @@ export function registerExtensiveRoutes(router: any, context: any) {
 	};
 	const meOf = async (userId: string | null) => {
 		if (!userId) return null;
-		const [row, week, all, premium] = await Promise.all([
+		const [row, week, all] = await Promise.all([
 			levelRowOf(database, userId),
 			weekSeconds(userId),
 			database.raw(`SELECT coalesce(sum(listened_s), 0)::int AS s, count(*)::int AS n FROM el_attempts WHERE user_id = ? AND finished_at IS NOT NULL`, [userId]),
-			isPremiumUser(database, userId, logger),
 		]);
-		return { level: row.level, source: row.source, intro_seen: !!row.intro_seen, week_s: week.s, week_n: week.n, total_s: all.rows[0].s, total_n: all.rows[0].n, premium };
+		return { level: row.level, source: row.source, intro_seen: !!row.intro_seen, week_s: week.s, week_n: week.n, total_s: all.rows[0].s, total_n: all.rows[0].n };
 	};
 
 	router.get('/extensive/home', wrap('home', async (req, res) => {
@@ -132,6 +131,8 @@ export function registerExtensiveRoutes(router: any, context: any) {
 		const level = Number(req.query?.level) || 0;
 		if (level >= 1 && level <= 10) { where += ' AND l.level = ?'; params.push(level); }
 		if (req.query?.topic) { where += ' AND l.topic = ?'; params.push(String(req.query.topic)); }
+		const words = searchWords(req.query?.q);
+		if (words.length) { where += ' AND l.id = ANY(?::uuid[])'; params.push(await searchLessonIds(database, 'el', reqLang(req), words)); }
 		// Filters on the finished card (done is computed inside the subquery): not heard / heard, free only
 		const status = String(req.query?.status || '');
 		const outer: string[] = [];
@@ -200,8 +201,9 @@ export function registerExtensiveRoutes(router: any, context: any) {
 			id: l.id, short_id: l.short_id, title: pickOr(tr, 'title', l.title), level: l.level, topic: l.topic, intro: pickOr(tr, 'intro', l.intro), listen_for: pickOr(tr, 'listen_for', l.listen_for),
 			channel: l.channel_name, video_title: l.video_title, video_id: l.youtube_video_id, start: l.start_ms, end: l.end_ms,
 			is_premium: !!l.is_premium, locked, price: l.is_premium ? acc.price : null, status: l.status,
-			segments: segments.map((s: any) => ({ n: s.n, start: s.start_ms, end: s.end_ms, questions: questions.filter((x: any) => x.segment_id === s.id).map(q) })),
-			final: final ? q(final) : null,
+			// A locked lesson shows its parts only: no question until it is open to this learner
+			segments: segments.map((s: any) => ({ n: s.n, start: s.start_ms, end: s.end_ms, questions: locked ? [] : questions.filter((x: any) => x.segment_id === s.id).map(q) })),
+			final: final && !locked ? q(final) : null,
 			lines: locked ? [] : linesIn(l.transcript, l.start_ms, l.end_ms),
 			// What to colour in the subtitles (the meanings come with /after)
 			marks: [...vocab.map((v: any) => ({ k: 'v', id: v.id, forms: [v.term, ...(v.forms || [])] })), ...notes.map((n: any) => ({ k: 'n', id: n.id, forms: [n.term, ...(n.forms || [])] }))],
@@ -243,7 +245,11 @@ export function registerExtensiveRoutes(router: any, context: any) {
 		if (!UUID_RE.test(id) || !Number.isInteger(choice)) return res.status(400).json({ success: false, message: 'Bad answer' });
 		const q = await database('el_questions as q').join('el_lessons as l', 'l.id', 'q.lesson_id').join('source_videos as sv', 'sv.id', 'l.source_video_id')
 			.select('q.*', 'l.is_premium', 'l.status', 'sv.transcript').where('q.id', id).first();
-		if (!q) return res.status(404).json({ success: false, message: 'Not found' });
+		if (!q || (q.status !== 'published' && !isStaff(req.accountability))) return res.status(404).json({ success: false, message: 'Not found' });
+		// The answer, why and the subtitle line are the lesson's content: only for a learner the lesson is open to
+		if (!req.accountability?.admin && (await accessOf(database, userOf(req), 'el', logger, [q.lesson_id])).locked({ id: q.lesson_id, is_premium: q.is_premium })) {
+			return res.status(403).json({ success: false, code: 'PREMIUM', message: 'Locked' });
+		}
 		const right = choice === q.answer;
 		const attempt = await ownAttempt(req);
 		if (attempt && attempt.lesson_id === q.lesson_id && !attempt.finished_at) {
@@ -251,10 +257,9 @@ export function registerExtensiveRoutes(router: any, context: any) {
 			await database.raw(`UPDATE el_attempts SET answers = answers || jsonb_build_object(?::text, jsonb_build_object('choice', ?::int, 'right', ?::boolean))
 				WHERE id = ? AND NOT jsonb_exists(answers, ?)`, [id, choice, right, attempt.id, id]);
 		}
-		const lines = q.answer_start != null ? linesIn(q.transcript, q.answer_start, q.answer_end ?? q.answer_start + 1) : [];
 		return res.json({ success: true, data: {
 			right, answer: q.answer, explain: pickOr(await trOf(q.lesson_id, reqLang(req)), `q:${id}:explain`, q.explain),
-			line: lines.length ? { start: Math.min(...lines.map((c) => c.start)), end: Math.max(...lines.map((c) => c.end)), text: lines.map((c) => c.text).join(' ') } : null,
+			line: answerLine(q, q.transcript),
 		} });
 	}));
 
@@ -273,6 +278,20 @@ export function registerExtensiveRoutes(router: any, context: any) {
 		return res.json({ success: true, data: null });
 	}));
 
+	/** The subtitle line(s) that hold a question's answer */
+	const answerLine = (q: any, transcript: any) => {
+		const lines = q.answer_start != null ? linesIn(transcript, q.answer_start, q.answer_end ?? q.answer_start + 1) : [];
+		return lines.length ? { start: Math.min(...lines.map((c) => c.start)), end: Math.max(...lines.map((c) => c.end)), text: lines.map((c) => c.text).join(' ') } : null;
+	};
+	/** The questions answered wrong in one go: the result lists them even after a reload */
+	const missedOf = async (answers: Record<string, any>, lessonId: string) => {
+		const ids = Object.keys(answers).filter((id) => !answers[id]?.right);
+		if (!ids.length) return [];
+		const rows = await database('el_questions as q').join('el_lessons as l', 'l.id', 'q.lesson_id').join('source_videos as sv', 'sv.id', 'l.source_video_id')
+			.select('q.id', 'q.answer', 'q.answer_start', 'q.answer_end', 'sv.transcript').where('q.lesson_id', lessonId).whereIn('q.id', ids);
+		return rows.map((q: any) => ({ question_id: q.id, answer: q.answer, line: answerLine(q, q.transcript) }));
+	};
+
 	router.post('/extensive/attempts/:id/finish', wrap('finish', async (req, res) => {
 		const userId = userOf(req)!;
 		const a = await ownAttempt(req);
@@ -284,18 +303,24 @@ export function registerExtensiveRoutes(router: any, context: any) {
 		const answers = a.answers || {};
 		const right = Object.values(answers).filter((x: any) => x?.right).length;
 		const total = a.total || Object.keys(answers).length;
+		const missed = await missedOf(answers, a.lesson_id);
 
 		// A redo counts the minutes only: no XP, no Level move
 		if (a.kind === 'redo' && !a.finished_at) {
-			await database('el_attempts').where('id', a.id).update({ right_count: right, total, self_rating: rating, listened_s: listened, finished_at: database.fn.now(), move: 0 });
-			await recordPractice(database, userId, { attempts: total, noTime: true });
-			await addStudySeconds(database, userId, listened);
+			// Only the request that closes the attempt counts it (a double click sends several)
+			const claimed = await database('el_attempts').where('id', a.id).whereNull('finished_at').update({ right_count: right, total, self_rating: rating, listened_s: listened, finished_at: database.fn.now(), move: 0 });
+			if (claimed) {
+				await recordPractice(database, userId, { attempts: total, noTime: true });
+				await addStudySeconds(database, userId, listened);
+			}
 			const w = await weekSeconds(userId);
-			return res.json({ success: true, data: { right, total, self_rating: rating, move: 0, level_before: null, level_after: null, xp: 0, week_s: w.s, next: [], redo: true } });
+			return res.json({ success: true, data: { right, total, self_rating: rating, move: 0, level_before: null, level_after: null, xp: 0, week_s: w.s, next: [], redo: true, missed } });
 		}
 		const result = await database.transaction(async (trx: any) => {
 			if (a.finished_at) return { move: a.move || 0, before: null, after: null, again: true };
-			await trx('el_attempts').where('id', a.id).update({ right_count: right, total, self_rating: rating, listened_s: listened, finished_at: trx.fn.now() });
+			// Claim it: a second request sent at the same time waits here, finds it finished and moves nothing
+			const claimed = await trx('el_attempts').where('id', a.id).whereNull('finished_at').update({ right_count: right, total, self_rating: rating, listened_s: listened, finished_at: trx.fn.now() });
+			if (!claimed) return { move: 0, before: null, after: null, again: true };
 			await levelRowOf(trx, userId);
 			const row = await trx('el_levels').where('user_id', userId).forUpdate().first();
 			const move = await moveAfter(trx, userId, row.level, { id: a.id, level: a.level, ratio: total ? right / total : 0, rating });
@@ -321,7 +346,6 @@ export function registerExtensiveRoutes(router: any, context: any) {
 					: { reason: 'extensive', dedupe: `extensive:${a.lesson_id}:${vnDay()}`, lessonId: null, amount: EL.xpAgain },
 			});
 			xp = won.xp;
-			await grantRewards(context, req.schema, userId, won.rewards);
 			// Kim cương: the first finish of a lesson, by result and not by minutes (COIN.earn.extensive*)
 			if (first) {
 				const good = isGood(total ? right / total : 0, rating);
@@ -341,7 +365,7 @@ export function registerExtensiveRoutes(router: any, context: any) {
 			ORDER BY x.done, (x.topic IS NOT DISTINCT FROM ?) DESC, abs(x.level - ?), random() LIMIT 3`, [a.lesson_id, level - 1, level + 1, lesson.topic, level]);
 		const acc = await accessOf(database, userId, 'el', logger, rows.map((r: any) => r.id));
 		const week = await weekSeconds(userId);
-		return res.json({ success: true, data: { right, total, self_rating: rating, move: result.move, level_before: result.before, level_after: result.after, xp, gems, week_s: week.s, next: rows.map((r: any) => card(r, acc)) } });
+		return res.json({ success: true, data: { right, total, self_rating: rating, move: result.move, level_before: result.before, level_after: result.after, xp, gems, week_s: week.s, next: rows.map((r: any) => card(r, acc)), missed } });
 	}));
 
 	router.post('/extensive/lessons/:key/unlock', wrap('unlock', async (req, res) => {

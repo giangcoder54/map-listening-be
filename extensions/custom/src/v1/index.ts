@@ -25,6 +25,8 @@ import { registerAdminVietsubRoutes } from './adminVietsubRoutes';
 import { registerAdminRuleRoutes } from './adminRuleRoutes';
 import { registerAdminPracticeRoutes } from './adminPracticeRoutes';
 import { registerAdminDykRoutes } from './adminDykRoutes';
+import { registerAdminQuoteRoutes } from './adminQuoteRoutes';
+import { registerQuoteRoutes } from './quoteRoutes';
 import { registerAdminStarRoutes } from './adminStarRoutes';
 import { registerDykRoutes } from './dykRoutes';
 import { registerEventRoutes } from './eventRoutes';
@@ -41,6 +43,7 @@ import { registerFriendsRoutes } from './friendsRoutes';
 import { registerReviewRoutes } from './reviewRoutes';
 import { registerInterestRoutes } from './interestRoutes';
 import { registerAdminIntensiveRoutes } from './adminIntensiveRoutes';
+import { registerAdminIlVocabRoutes } from './adminIlVocabRoutes';
 import { staffRole } from '../lib/staff';
 import { clientIp, isLimited } from '../lib/rateLimit';
 import { verifyTurnstile } from '../lib/turnstile';
@@ -334,6 +337,8 @@ export default defineEndpoint((router, context) => {
 	registerEventRoutes(router, context);
 	registerDykRoutes(router, context);
 	registerAdminDykRoutes(router, context);
+	registerQuoteRoutes(router, context);
+	registerAdminQuoteRoutes(router, context);
 	registerAdminStarRoutes(router, context);
 	registerPhraseRoutes(router, context);
 	registerAdminPhraseRoutes(router, context);
@@ -348,6 +353,7 @@ export default defineEndpoint((router, context) => {
 	registerReviewRoutes(router, context);
 	registerInterestRoutes(router, context);
 	registerAdminIntensiveRoutes(router, context);
+	registerAdminIlVocabRoutes(router, context);
 
 	// =====================================================================
 	// POST /phrase-requests -> gợi ý cụm từ muốn có bài luyện (phải đăng nhập, không lưu ai gửi)

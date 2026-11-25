@@ -73,23 +73,18 @@ describe('what counts toward a dare', () => {
 
 describe('chests (pure)', () => {
 	const drops: Drop[] = [
-		{ item_code: 'a', weight: 70, guaranteed: false, premium_alt: null },
-		{ item_code: 'b', weight: 25, guaranteed: false, premium_alt: null },
-		{ item_code: 'c', weight: 5, guaranteed: false, premium_alt: 'a' },
+		{ item_code: 'a', weight: 70, guaranteed: false },
+		{ item_code: 'b', weight: 25, guaranteed: false },
+		{ item_code: 'c', weight: 5, guaranteed: false },
 	];
 	test('10,000 rolls land within 1% of the weights', () => {
 		const rand = lcg(11); const n: Record<string, number> = { a: 0, b: 0, c: 0 };
-		for (let i = 0; i < 10000; i++) for (const it of roll(drops, 1, { premium: false, rand }).items) n[it]!++;
+		for (let i = 0; i < 10000; i++) for (const it of roll(drops, 1, { rand }).items) n[it]!++;
 		assert.ok(Math.abs(n.a! / 100 - 70) < 1.5 && Math.abs(n.b! / 100 - 25) < 1.5 && Math.abs(n.c! / 100 - 5) < 1, JSON.stringify(n));
 	});
-	test('a learner with Premium gets the replacement instead of the free-lesson item', () => {
-		const only: Drop[] = [{ item_code: 'c', weight: 1, guaranteed: false, premium_alt: 'a' }];
-		assert.deepEqual(roll(only, 2, { premium: true, rand: lcg(1) }).items, ['a', 'a']);
-		assert.deepEqual(roll(only, 2, { premium: false, rand: lcg(1) }).items, ['c', 'c']);
-	});
 	test('guaranteed items are always in', () => {
-		const g: Drop[] = [...drops, { item_code: 'g', weight: 1, guaranteed: true, premium_alt: null }];
-		assert.ok(roll(g, 1, { premium: false, rand: lcg(5) }).items.includes('g'));
+		const g: Drop[] = [...drops, { item_code: 'g', weight: 1, guaranteed: true }];
+		assert.ok(roll(g, 1, { rand: lcg(5) }).items.includes('g'));
 	});
 	test('odds and worth', () => {
 		assert.deepEqual(oddsOf(drops).map((o) => o.pct), [70, 25, 5]);
@@ -137,23 +132,23 @@ describe('chests with the database', () => {
 	test('opening takes the price, gives the items, and a double click opens once', async () => {
 		await fund(user, 1000);
 		const id = randomUUID();
-		const r = await openChest(trx, user, 'bronze', id, { premium: false, today: DAY });
+		const r = await openChest(trx, user, 'bronze', id, { today: DAY });
 		assert.equal(r.price, 150);
 		assert.equal(r.items.length, 2);
-		const again = await openChest(trx, user, 'bronze', id, { premium: false, today: DAY });
+		const again = await openChest(trx, user, 'bronze', id, { today: DAY });
 		assert.equal(again.replay, true);
 		assert.equal(await trx('chest_opens').where('user_id', user).count('* as n').first().then((x: any) => Number(x.n)), 1);
 		assert.equal(await purse(user), await ledger(user), 'the purse matches the ledger');
 	});
 	test('not enough Kim cuong: refused, nothing taken', async () => {
 		await fund(user, 100);
-		await assert.rejects(openChest(trx, user, 'bronze', randomUUID(), { premium: false, today: DAY }), (e: any) => e instanceof ChestError && e.code === 'NOT_ENOUGH');
+		await assert.rejects(openChest(trx, user, 'bronze', randomUUID(), { today: DAY }), (e: any) => e instanceof ChestError && e.code === 'NOT_ENOUGH');
 		assert.equal(await purse(user), 100);
 	});
 	test('the welcome chest is free and opens once per account', async () => {
-		const r = await openChest(trx, user, 'newbie', randomUUID(), { premium: false, today: DAY });
+		const r = await openChest(trx, user, 'newbie', randomUUID(), { today: DAY });
 		assert.equal(r.price, 0);
-		await assert.rejects(openChest(trx, user, 'newbie', randomUUID(), { premium: false, today: DAY }), (e: any) => e.code === 'ONCE');
+		await assert.rejects(openChest(trx, user, 'newbie', randomUUID(), { today: DAY }), (e: any) => e.code === 'ONCE');
 		assert.equal(await purse(user), 100, 'its guaranteed 100 Kim cuong');
 		assert.equal(await purse(user), await ledger(user));
 	});
@@ -224,7 +219,7 @@ describe('cards with the database', () => {
 		await trx('cards').whereNot('id', cid).update({ status: 'archived' });
 		await drawCard(trx, user, { kind: 'dare', pick: 0, lang: 'vi-VN', today: DAY, rand: lcg(1) });
 		const ev = { correct: true, hint: false, phase: 'practice', difficulty: 2, listens: 1, star: null as any };
-		const ctx = { freeLesson: false, premium: false };
+		const ctx = { freeLesson: false };
 		assert.equal((await onAnswer(trx, user, ev, ctx, DAY)).dare!.progress, 1);
 		assert.equal((await onAnswer(trx, user, { ...ev, correct: false }, ctx, DAY)).dare, null);
 		await onAnswer(trx, user, ev, ctx, DAY);
@@ -240,10 +235,10 @@ describe('cards with the database', () => {
 		assert.equal((d as any).correct_index, undefined, 'the answer is not sent with the question');
 		const dyk = await trx('dyk_cards').where('status', 'approved').first();
 		const rightIndex = Number((await trx('card_draws as w').join('cards as c', 'c.id', 'w.card_id').join('dyk_cards as k', trx.raw("k.id::text = c.source->>'dyk_card_id'")).where('w.user_id', user).first('k.correct')).correct);
-		const r = await answerTruth(trx, user, { choice: rightIndex, premium: false, lang: 'vi-VN', today: DAY });
+		const r = await answerTruth(trx, user, { choice: rightIndex, lang: 'vi-VN', today: DAY });
 		assert.equal(r.correct, true);
 		assert.equal(await purse(user), 40);
-		await assert.rejects(answerTruth(trx, user, { choice: rightIndex, premium: false, lang: 'vi-VN', today: DAY }), (e: any) => e.code === 'ALREADY');
+		await assert.rejects(answerTruth(trx, user, { choice: rightIndex, lang: 'vi-VN', today: DAY }), (e: any) => e.code === 'ALREADY');
 		assert.ok(dyk);
 	});
 	test('skipping a dare costs Kim cuong; too few and it stays', async () => {
@@ -256,14 +251,14 @@ describe('cards with the database', () => {
 	});
 	test('the way back: 10 right answers in free lessons while low, then take 50 once', async () => {
 		const ev = { correct: true, hint: false, phase: 'practice', difficulty: 1, listens: 1, star: null as any };
-		for (let i = 0; i < 12; i++) await onAnswer(trx, user, ev, { freeLesson: true, premium: false }, DAY);
+		for (let i = 0; i < 12; i++) await onAnswer(trx, user, ev, { freeLesson: true }, DAY);
 		assert.equal((await trx('recovery_progress').where('user_id', user).first()).n, COIN.recovery.need);
 		assert.equal((await claimRecovery(trx, user, DAY)).added, 50);
 		await assert.rejects(claimRecovery(trx, user, DAY), (e: any) => e.code === 'ALREADY');
 	});
 	test('a learner with plenty of Kim cuong gets no way-back progress', async () => {
 		await fund(user, 500);
-		await onAnswer(trx, user, { correct: true, hint: false, phase: 'practice', difficulty: 1, listens: 1, star: null }, { freeLesson: true, premium: false }, DAY);
+		await onAnswer(trx, user, { correct: true, hint: false, phase: 'practice', difficulty: 1, listens: 1, star: null }, { freeLesson: true }, DAY);
 		assert.equal(await trx('recovery_progress').where('user_id', user).first(), undefined);
 	});
 });

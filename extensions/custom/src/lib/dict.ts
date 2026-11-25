@@ -2,8 +2,9 @@
 export function wordKey(raw: string): string | null {
 	let s = raw.trim().toLowerCase().replace(/[’‘]/g, "'").replace(/\s+/g, ' ');
 	try { s = decodeURIComponent(s); } catch { return null; }
-	s = s.replace(/^[^a-z]+|[^a-z]+$/g, '');
-	if (!s || s.length > 60 || !/^[a-z][a-z' -]*$/.test(s)) return null;
+	// A split structure writes its gap as " ... " (not only ... but also)
+	s = s.replace(/\s*(\.{3}|…)\s*/g, ' ... ').replace(/^[^a-z]+|[^a-z]+$/g, '');
+	if (!s || s.length > 60 || !/^[a-z][a-z' -]*( \.\.\. [a-z][a-z' -]*)*$/.test(s)) return null;
 	return s;
 }
 

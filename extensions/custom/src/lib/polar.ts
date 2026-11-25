@@ -25,33 +25,6 @@ export function polarSiteUrl() {
   return (process.env.POLAR_SITE_URL || 'https://guidelingo.com').replace(/\/+$/, '')
 }
 
-/** billing_cycle (số tháng, 0 = lifetime) -> product id trên Polar */
-const PRODUCT_ENV_BY_CYCLE: Record<number, string> = {
-  1: 'POLAR_PRODUCT_MONTHLY',
-  12: 'POLAR_PRODUCT_YEARLY',
-  0: 'POLAR_PRODUCT_LIFETIME',
-}
-
-export function polarProductForCycle(cycle: number): string | null {
-  const envName = PRODUCT_ENV_BY_CYCLE[cycle]
-  return (envName && process.env[envName]) || null
-}
-
-/**
- * Số tháng một đơn Polar mua được. Ưu tiên metadata `duration_month` đặt trên product
- * (Polar gửi kèm trong webhook); thiếu thì dò ngược theo product id trong env.
- */
-export function polarCycleForProduct(productId: string | undefined, metadata: any): number | null {
-  const fromMeta = metadata?.duration_month
-  if (fromMeta !== undefined && fromMeta !== null && fromMeta !== '' && Number.isFinite(Number(fromMeta)))
-    return Number(fromMeta)
-  for (const [cycle, envName] of Object.entries(PRODUCT_ENV_BY_CYCLE)) {
-    if (productId && process.env[envName] === productId)
-      return Number(cycle)
-  }
-  return null
-}
-
 export async function polarRequest(path: string, init: { method?: string, body?: any } = {}) {
   const token = process.env.POLAR_ACCESS_TOKEN
   if (!token)
@@ -77,6 +50,28 @@ export async function polarRequest(path: string, init: { method?: string, body?:
   if (!res.ok)
     throw new Error(`Polar ${init.method || 'GET'} ${path} -> ${res.status}: ${typeof data === 'string' ? data : JSON.stringify(data)}`)
   return data
+}
+
+/**
+ * A Polar product as a Kim cương pack needs it: one-time, one fixed USD price. Read when the team saves the
+ * pack's product id in the admin, so the price shown on /pricing is the price Polar charges.
+ */
+export async function polarPackProduct(productId: string): Promise<{ ok: true, priceCents: number, name: string } | { ok: false, error: string }> {
+  let p: any
+  try {
+    p = await polarRequest(`/v1/products/${encodeURIComponent(productId)}`)
+  }
+  catch (e: any) {
+    return { ok: false, error: /-> 404/.test(String(e?.message)) ? 'Không tìm thấy sản phẩm này trên Polar (kiểm tra sandbox/production).' : `Không đọc được sản phẩm từ Polar: ${String(e?.message || e).slice(0, 200)}` }
+  }
+  if (p?.is_recurring)
+    return { ok: false, error: 'Sản phẩm này là gói định kỳ (Recurring). Gói Kim cương phải là One-time purchase.' }
+  if (p?.is_archived)
+    return { ok: false, error: 'Sản phẩm này đã bị lưu trữ (archived) trên Polar.' }
+  const price = (p?.prices || []).find((x: any) => !x.is_archived && x.amount_type === 'fixed' && String(x.price_currency || 'usd').toLowerCase() === 'usd')
+  if (!price || !(Number(price.price_amount) > 0))
+    return { ok: false, error: 'Sản phẩm cần một giá cố định (Fixed price) bằng USD.' }
+  return { ok: true, priceCents: Number(price.price_amount), name: String(p.name || '') }
 }
 
 /**

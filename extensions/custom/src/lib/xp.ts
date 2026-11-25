@@ -8,7 +8,7 @@
  *   3. the day row: + XP, + attempts, today's daily goal
  *   4. lifetime XP; a freeze per 200 XP (2 held at most)
  *   5. the 7th daily goal in a row (14th, 21st...): a Premium day
- * Premium days are given after the commit (grantRewards): Directus' users service is not in
+ * Kim cương of a reward are paid in the same transaction:
  * the transaction.
  *
  * Reads: engagementOf() for the header pill and the profile, a handful of small rows.
@@ -21,8 +21,7 @@
  *   Phrase Lab: +20 a phrase learned the first time, +5 a phrase review right (once a day per phrase).
  *   Days are Vietnam days.
  */
-import { activatePremiumForUser } from '../utils';
-import { COIN } from './coins';
+import { COIN, earnCoins } from './coins';
 import { touchStudy } from './studyTime';
 
 import { TZ, vnDay } from './days';
@@ -32,9 +31,8 @@ export { TZ, vnDay };
 export const XP = { lesson: 20, lessonRevealed: 10, replay: 5, review: 5, lessonTest: 10, skillTest: 30, phrase: 20, phraseReview: 5, extensive: 20, intensive: 20, intensiveReview: 5, wordReview: 5 };
 /** Streak freezes held at most; they are bought with Xu (lib/coins.ts) */
 export const MAX_FREEZES = 2;
-/** Daily goal reached this many days in a row: REWARD_PREMIUM_DAYS of Premium */
+/** Daily goal reached this many days in a row: COIN.goalWeek Kim cương */
 export const GOAL_DAYS_FOR_REWARD = 7;
-export const REWARD_PREMIUM_DAYS = 1;
 /** Lifetime XP where each level starts (level 1 at 0): about 3, 10, 20, 35, 55, 80, 120 lessons */
 export const LEVELS = [0, 60, 200, 400, 700, 1100, 1600, 2400];
 /** The daily goal of a learner who never chose one: 2 lessons */
@@ -42,8 +40,8 @@ export const DEFAULT_GOAL = 40;
 
 /** amount: when the rule's XP depends on how it was won (a lesson with an answer looked at) */
 export type XpRule = { reason: 'lesson' | 'replay' | 'review' | 'lesson_test' | 'skill_test' | 'phrase' | 'phrase_review' | 'extensive' | 'intensive' | 'intensive_review' | 'word_review'; dedupe: string; lessonId?: string | null; amount?: number };
-/** key: the user_rewards dedupe key (premium:<day> | freeze:<n>) */
-export type NewReward = { kind: 'premium_day' | 'freeze'; days: number; key: string };
+/** key: the user_rewards dedupe key (goal:<day> | freeze:<n>) */
+export type NewReward = { kind: 'goal_gems' | 'freeze'; days: number; coins?: number; key: string };
 
 const AMOUNT: Record<XpRule['reason'], number> = { lesson: XP.lesson, replay: XP.replay, review: XP.review, lesson_test: XP.lessonTest, skill_test: XP.skillTest, phrase: XP.phrase, phrase_review: XP.phraseReview, extensive: XP.extensive, intensive: XP.intensive, intensive_review: XP.intensiveReview, word_review: XP.wordReview };
 
@@ -143,50 +141,27 @@ export async function recordPractice(database: any, userId: string, opts: { atte
 			const total = (Number(acc.xp_total) || 0) + won;
 			await trx('user_xp').where('user_id', userId).update({ xp_total: total, date_updated: trx.fn.now() });
 
-			// Today's goal just reached: the 7th (14th...) goal day in a row gives a Premium day
+			// Today's goal just reached: the 7th (14th...) goal day in a row pays Kim cương
 			const xpBefore = Number(before?.xp) || 0;
 			if (xpBefore < goal && xpBefore + won >= goal) {
 				const days = await trx('user_daily_stats').select('day', 'xp', 'goal').where('user_id', userId)
 					.where('day', '>', addDays(today, -400)).orderBy('day', 'desc');
 				const run = runOf(days.map((d: any) => ({ day: dayOf(d.day), ok: d.xp >= d.goal })), today);
-				if (run > 0 && run % GOAL_DAYS_FOR_REWARD === 0) {
+				if (run > 0 && run % GOAL_DAYS_FOR_REWARD === 0 && COIN.goalWeek > 0) {
+					const key = `goal:${today}`;
 					const added = await trx('user_rewards')
-						.insert({ user_id: userId, kind: 'premium_day', dedupe_key: `premium:${today}`, days: REWARD_PREMIUM_DAYS })
+						.insert({ user_id: userId, kind: 'goal_gems', dedupe_key: key, days: 0, coins: COIN.goalWeek })
 						.onConflict(['user_id', 'dedupe_key']).ignore()
 						.returning('id');
-					if (added.length) rewards.push({ kind: 'premium_day', days: REWARD_PREMIUM_DAYS, key: `premium:${today}` });
+					if (added.length) {
+						await earnCoins(trx, userId, { reason: 'goal', amount: COIN.goalWeek, dedupe: `goal_week:${today}` }, today);
+						rewards.push({ kind: 'goal_gems', days: 0, coins: COIN.goalWeek, key });
+					}
 				}
 			}
 		}
 		return { xp: won, rewards };
 	});
-}
-
-/**
- * Premium days won (after recordPractice committed): added to the end of their current
- * Premium, or from now. A lifetime member has nothing to add: the reward stays at 0 days.
- */
-export async function grantRewards(context: any, schema: any, userId: string, rewards: NewReward[]) {
-	const won = rewards.filter((r) => r.kind === 'premium_day');
-	const days = won.reduce((n, r) => n + r.days, 0);
-	if (!days) return;
-	const { database, logger, services } = context;
-	try {
-		const u = await database('directus_users').select('is_premium', 'premium_until', 'subscription_type').where('id', userId).first();
-		if (!u) return;
-		if (u.is_premium && (u.subscription_type === 'lifetime' || !u.premium_until)) {
-			await database('user_rewards').where({ user_id: userId, kind: 'premium_day' }).whereIn('dedupe_key', won.map((r) => r.key)).update({ days: 0 });
-			return;
-		}
-		const current = u.is_premium && u.premium_until ? new Date(u.premium_until) : null;
-		const from = current && current.getTime() > Date.now() ? current : new Date();
-		const end = new Date(from.getTime() + days * 86400_000).toISOString();
-		const usersService = new services.UsersService({ schema, accountability: { admin: true } });
-		await activatePremiumForUser(userId, end, u.subscription_type || 'premium', usersService, database, logger);
-		logger?.info?.(`[xp] ${userId} won ${days} Premium day(s) for ${GOAL_DAYS_FOR_REWARD} goal days in a row`);
-	} catch (error) {
-		logger?.error?.(`[xp] Premium reward for ${userId} not given: ${String(error)}`);
-	}
 }
 
 /** Header pill and profile: today, this week, streak, level, freezes, rewards not shown yet */
@@ -202,7 +177,7 @@ export async function engagementOf(database: any, userId: string, today = vnDay(
 		database('user_daily_stats').select('day', 'xp', 'attempts', 'goal', 'frozen').where('user_id', userId)
 			.where('day', '>', addDays(today, -400)).orderBy('day', 'desc'),
 		database('directus_users').select('daily_goal').where('id', userId).first(),
-		database('user_rewards').select('id', 'kind', 'days').where('user_id', userId).whereNull('seen_at').orderBy('id'),
+		database('user_rewards').select('id', 'kind', 'days', 'coins').where('user_id', userId).whereNull('seen_at').orderBy('id'),
 	]);
 	const rows = days.map((d: any) => ({ ...d, day: dayOf(d.day) }));
 	const todayRow = rows.find((d: any) => d.day === today);
@@ -225,12 +200,12 @@ export async function engagementOf(database: any, userId: string, today = vnDay(
 		freeze_price: COIN.freeze,
 		coins: Number(acc.coins) || 0,
 		// What Xu are earned and spent on, for the header's Xu explainer
-		coin_rules: { earn: COIN.earn, unlock: COIN.unlock, phrase: COIN.phrase, ai_check: COIN.aiCheck, streak_day: COIN.streakDay, streak_milestone: COIN.streakMilestone, freeze: COIN.freeze, retest: COIN.retest },
+		coin_rules: { earn: COIN.earn, unlock: COIN.unlock, phrase: COIN.phrase, ai_check: COIN.aiCheck, streak_day: COIN.streakDay, streak_milestone: COIN.streakMilestone, goal_week: COIN.goalWeek, freeze: COIN.freeze, retest: COIN.retest },
 		// Days in a row with the daily goal reached (today counts once reached)
 		goal_days: goalRun,
 		goal_met_today: xpToday >= goal,
 		reward_every: GOAL_DAYS_FOR_REWARD,
-		rewards_new: rewards.map((r: any) => ({ id: Number(r.id), kind: r.kind, days: r.days })),
+		rewards_new: rewards.map((r: any) => ({ id: Number(r.id), kind: r.kind, days: r.days, coins: r.coins ?? null })),
 	};
 }
 

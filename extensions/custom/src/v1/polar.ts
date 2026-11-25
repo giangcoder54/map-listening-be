@@ -1,31 +1,26 @@
+import { createHash } from 'node:crypto'
 import type { Router } from 'express'
-import { notifyAdmin } from '../lib/sepay'
-import { resolveCode } from '../lib/promotions'
+import { notifyAdmin } from '../lib/telegram'
 import { voidConversion } from '../lib/referrals'
+import { chargebackCoinOrder, orderWait, packCoins } from '../lib/gemOrders'
+import { gemsOn } from '../lib/growthConfig'
 import {
-  polarCycleForProduct,
-  polarProductForCycle,
   polarRequest,
   polarSiteUrl,
   verifyPolarSignature,
 } from '../lib/polar'
 
 /**
- * Thanh toán thẻ quốc tế qua Polar.
+ * Thanh toán thẻ quốc tế qua Polar: chỉ bán gói Kim cương.
  *
- *   POST /v1/polar/checkout       -> tạo phiên thanh toán Polar, trả URL để FE chuyển khách sang
+ *   POST /v1/polar/coins/checkout -> tạo phiên thanh toán cho một gói (xu_packs.polar_product_id, mua một lần), trả URL
  *   GET  /v1/polar/checkout/:id   -> trạng thái đơn của phiên đó (trang /checkout/success hỏi vòng)
  *   POST /v1/polar-webhook        -> Polar báo đơn đã trả tiền / đã hoàn tiền
  *
- * Mỗi lần Polar thu tiền (mua lần đầu hay tự gia hạn) là một dòng `purchase_histories`
- * chuyển `pending` -> `published`; hook có sẵn `purchase_histories.items.update`
- * (hook/index.ts) tự kích hoạt Premium như luồng SePay, không lặp lại logic ở đây.
- *
- * Với đơn Polar: `transfer_code` = id phiên checkout (lần mua đầu) hoặc id order (lần gia
- * hạn), `amount` / `price_original` tính bằng CENT theo `currency` (thường là 'usd').
+ * Đơn là một dòng `purchase_histories` chuyển `pending` -> `published`; Kim cương được cộng một lần
+ * (lib/gemOrders.ts). Với đơn Polar: `transfer_code` = id phiên checkout (hoặc id order khi trả qua link
+ * không có đơn chờ), `amount` / `price_original` tính bằng CENT.
  */
-
-const LIFETIME = 0
 
 function adminItems(context: any, schema: any, collection: string) {
   const { ItemsService } = context.services
@@ -44,66 +39,76 @@ async function resolveUserId(order: any, database: any): Promise<string | null> 
   return row?.id || null
 }
 
-async function settlePolarOrder(order: any, context: any): Promise<string> {
-  const { database, getSchema, logger } = context
-
-  const userId = await resolveUserId(order, database)
-  if (!userId) {
-    notifyAdmin(`⚠️ Polar: order ${order.id} đã trả tiền nhưng KHÔNG xác định được user.\nEmail: ${order?.customer?.email}`)
-    return 'no-user'
+/** The Kim cương pack an order bought: its metadata (set on our checkout), else its product id */
+async function packOfOrder(order: any, database: any) {
+  const code = order?.metadata?.pack_code
+  if (code) {
+    const byCode = await database('xu_packs').where('code', String(code)).first()
+    if (byCode)
+      return byCode
   }
+  const productId = order?.product_id || order?.product?.id
+  return productId ? database('xu_packs').where('polar_product_id', String(productId)).first() : null
+}
 
-  const cycle = polarCycleForProduct(order.product_id || order.product?.id, order.product?.metadata)
-  if (cycle === null) {
-    notifyAdmin(`⚠️ Polar: order ${order.id} thuộc product ${order.product_id} chưa có duration_month (metadata hoặc env POLAR_PRODUCT_*).`)
-    return 'unknown-product'
-  }
+const usd = (cents: any, currency: any) => `${(Number(cents || 0) / 100).toFixed(2)} ${String(currency || 'usd').toUpperCase()}`
 
-  // Lần mua đầu khớp với dòng pending tạo lúc checkout (theo id phiên). Đơn tự gia hạn
-  // không được khớp theo checkout_id — có thể nó vẫn mang id phiên gốc, và dòng đó đã
-  // published từ lần đầu, sẽ bị nhận nhầm là "đã xử lý".
-  const isFirstPurchase = !order.billing_reason || ['purchase', 'subscription_create'].includes(order.billing_reason)
-  const keys = (isFirstPurchase ? [order.checkout_id, order.id] : [order.id]).filter(Boolean)
+/** The same Polar order always gets the same uuid */
+function idOfPolarOrder(orderId: string) {
+  const h = createHash('sha256').update(`polar:${orderId}`).digest('hex')
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-5${h.slice(13, 16)}-8${h.slice(17, 20)}-${h.slice(20, 32)}`
+}
 
-  const schema = await getSchema()
+/**
+ * A paid Kim cương order: its row goes pending -> published through ItemsService, so the hook
+ * purchase_histories.items.update pays the Kim cương once (lib/gemOrders.ts creditCoinOrder), as for a bank transfer.
+ */
+async function settleCoinOrder(order: any, pack: any, userId: string, context: any): Promise<string> {
+  const schema = await context.getSchema()
   const purchases = adminItems(context, schema, 'purchase_histories')
-
+  const keys = [order.checkout_id, order.id].filter(Boolean)
   const found = await purchases.readByQuery({
-    filter: { transfer_code: { _in: keys }, payment_method: { _eq: 'polar' } },
+    filter: { transfer_code: { _in: keys }, payment_method: { _eq: 'polar' }, product_type: { _eq: 'coins' } },
     limit: 1,
     fields: ['id', 'status'],
   })
   let row = found && found[0] ? found[0] : null
-
   if (row && row.status !== 'pending')
     return 'already-settled'
-
   if (!row) {
-    const plan = await database('plans').where('code', order.metadata?.plan_code || 'premium').first('id', 'code')
-    const id = await purchases.createOne({
-      user: userId,
-      plan_id: plan?.id || null,
-      billing_cycle: cycle,
-      amount: order.total_amount,
-      price_original: order.subtotal_amount ?? order.total_amount,
-      currency: String(order.currency || 'usd').toLowerCase(),
-      status: 'pending',
-      payment_method: 'polar',
-      transfer_code: order.id,
-      type: plan?.code || 'premium',
-      auto_renew: cycle !== LIFETIME,
-    })
-    row = { id, status: 'pending' }
+    // Paid without our checkout (e.g. a shared Polar link): the order still pays the pack it bought
+    // The row's id comes from the Polar order id: webhooks arriving together can only make one row
+    const id = idOfPolarOrder(order.id)
+    try {
+      await purchases.createOne({
+        id,
+        user: userId,
+        amount: order.total_amount,
+        price_original: order.subtotal_amount ?? order.total_amount,
+        currency: String(order.currency || 'usd').toLowerCase(),
+        status: 'pending',
+        payment_method: 'polar',
+        transfer_code: order.id,
+        type: 'gems',
+        product_type: 'coins',
+        pack_code: pack.code,
+        coins: packCoins(pack),
+      })
+      row = { id, status: 'pending' }
+    }
+    catch (error) {
+      row = await context.database('purchase_histories').where('id', id).first('id', 'status')
+      if (!row)
+        throw error
+      if (row.status !== 'pending')
+        return 'already-settled'
+    }
   }
-
-  // Điều kiện status = 'pending' nằm ngay trong câu update: Polar gửi lại webhook thì lần
-  // sau không còn dòng pending nào, không kích hoạt hai lần.
   const updated = await purchases.updateByQuery(
     { filter: { id: { _eq: row.id }, status: { _eq: 'pending' } } },
     {
       status: 'published',
       amount: order.total_amount,
-      // Tax Polar collected for the buyer's country: no commission on it
       vat_amount: Number(order.tax_amount) || 0,
       price_subtotal: order.net_amount ?? null,
       date_transfer: new Date().toISOString(),
@@ -111,110 +116,100 @@ async function settlePolarOrder(order: any, context: any): Promise<string> {
   )
   if (!updated || updated.length === 0)
     return 'already-settled'
-
-  const money = `${(Number(order.total_amount || 0) / 100).toFixed(2)} ${String(order.currency || 'usd').toUpperCase()}`
-  logger.info(`[Polar] Order ${order.id} (${order.billing_reason}) -> kích hoạt Premium ${cycle === LIFETIME ? 'trọn đời' : `${cycle} tháng`} cho ${userId}`)
-  notifyAdmin(`✅ Polar: ${order.billing_reason === 'subscription_cycle' ? 'gia hạn' : 'thanh toán'} THÀNH CÔNG\nOrder: ${order.id}\nSố tiền: ${money}\nEmail: ${order?.customer?.email || ''}`)
+  context.logger.info(`[Polar] Order ${order.id} -> Kim cương gói ${pack.code} cho ${userId}`)
+  notifyAdmin(`✅ Polar: nạp Kim cương THÀNH CÔNG\nGói: ${pack.code}\nOrder: ${order.id}\nSố tiền: ${usd(order.total_amount, order.currency)}\nEmail: ${order?.customer?.email || ''}`)
   return 'activated'
 }
 
+async function settlePolarOrder(order: any, context: any): Promise<string> {
+  const { database } = context
+
+  const userId = await resolveUserId(order, database)
+  if (!userId) {
+    notifyAdmin(`⚠️ Polar: order ${order.id} đã trả tiền nhưng KHÔNG xác định được user.\nEmail: ${order?.customer?.email}`)
+    return 'no-user'
+  }
+
+  // A renewal of a subscription is never a Kim cương order, whatever product it carries
+  const fromSubscription = !!order.subscription_id || String(order.billing_reason || '').startsWith('subscription')
+  const pack = fromSubscription ? null : await packOfOrder(order, database)
+  if (pack)
+    return settleCoinOrder(order, pack, userId, context)
+
+  notifyAdmin(`⚠️ Polar: order ${order.id} đã trả tiền nhưng không thuộc gói Kim cương nào (product ${order.product_id}).\nEmail: ${order?.customer?.email || ''}`)
+  return 'unknown-product'
+}
+
 async function recordPolarRefund(order: any, context: any) {
-  const { getSchema, logger } = context
-  const schema = await getSchema()
-  const purchases = adminItems(context, schema, 'purchase_histories')
+  const { logger } = context
   const keys = [order.id, order.checkout_id].filter(Boolean)
   const fullRefund = order.status === 'refunded'
 
-  if (fullRefund) {
-    await purchases.updateByQuery(
-      { filter: { transfer_code: { _in: keys }, payment_method: { _eq: 'polar' } } },
-      { status: 'refunded' },
-    )
-    // Its affiliate commission (if not paid out yet) no longer counts
-    const rows = await context.database('purchase_histories').whereIn('transfer_code', keys).where('payment_method', 'polar').select('id')
-    await voidConversion(context.database, rows.map((r: any) => r.id))
+  // Kim cương: a full refund takes them back (what was spent becomes debt, the account is flagged)
+  const coinRows = await context.database('purchase_histories').whereIn('transfer_code', keys).where({ payment_method: 'polar', product_type: 'coins' }).select('id', 'status')
+  if (coinRows.length) {
+    let note = 'Hoàn một phần: Kim cương KHÔNG bị thu hồi, xử lý tay ở /admin/gems-content nếu cần.'
+    if (fullRefund) {
+      for (const r of coinRows) {
+        try {
+          const c = await chargebackCoinOrder(context.database, r.id)
+          note = `Đã thu hồi ${c.taken} Kim cương${c.debt ? `, còn nợ ${c.debt}` : ''}; tài khoản bị gắn cờ.`
+        }
+        catch {
+          // Never credited (or taken back already): only the order's status changes
+          await context.database('purchase_histories').where('id', r.id).update({ status: 'refunded' })
+          note = 'Đơn chưa cộng Kim cương hoặc đã thu hồi trước đó.'
+        }
+      }
+      await voidConversion(context.database, coinRows.map((r: any) => r.id))
+    }
+    logger.warn(`[Polar] Order ${order.id} (Kim cương) hoàn ${usd(order.refunded_amount, order.currency)}`)
+    notifyAdmin(`↩️ Polar: đơn Kim cương ${order.id} đã HOÀN ${usd(order.refunded_amount, order.currency)} (${fullRefund ? 'toàn phần' : 'một phần'}).\nEmail: ${order?.customer?.email || ''}\n${note}`)
+    return
   }
 
-  // Thu hồi Premium vẫn để admin làm tay: một user có thể còn đơn khác đang hiệu lực.
-  const refunded = `${(Number(order.refunded_amount || 0) / 100).toFixed(2)} ${String(order.currency || 'usd').toUpperCase()}`
-  logger.warn(`[Polar] Order ${order.id} hoàn tiền ${refunded} (${fullRefund ? 'toàn phần' : 'một phần'})`)
-  notifyAdmin(`↩️ Polar: order ${order.id} đã HOÀN ${refunded} (${fullRefund ? 'toàn phần' : 'một phần'}).\nEmail: ${order?.customer?.email || ''}\nKiểm tra và thu hồi Premium tay nếu cần.`)
+  // Not a Kim cương order of ours: the admin looks at it
+  const refunded = usd(order.refunded_amount, order.currency)
+  logger.warn(`[Polar] Order ${order.id} hoàn tiền ${refunded}, không khớp đơn Kim cương nào`)
+  notifyAdmin(`↩️ Polar: order ${order.id} đã HOÀN ${refunded}, không khớp đơn Kim cương nào.\nEmail: ${order?.customer?.email || ''}`)
 }
 
 export function handlePolar(router: Router, context: any) {
   const { logger, database, getSchema } = context
 
-  router.post('/polar/checkout', async (req: any, res: any) => {
+  // Kim cương pack by card: the same Polar hosted checkout, the order row is a coin order (product_type 'coins')
+  router.post('/polar/coins/checkout', async (req: any, res: any) => {
     const userId = req.accountability?.user
     if (!userId)
-      return res.status(401).json({ success: false, error: 'Unauthorized' })
-
-    const { plan_id, billing_cycle, promotion_code } = req.body || {}
-    const cycle = Number(billing_cycle)
-    const productId = Number.isFinite(cycle) ? polarProductForCycle(cycle) : null
-    if (!productId)
-      return res.status(400).json({ success: false, error: 'This plan is not available for card payment yet.' })
-
+      return res.status(401).json({ success: false, code: 'UNAUTHORIZED' })
+    if (!gemsOn('purchase', req.accountability))
+      return res.status(403).json({ success: false, code: 'PURCHASE_OFF' })
     try {
-      const buyer = await database('directus_users')
-        .select('email', 'subscription_type', 'is_premium', 'premium_until')
-        .where('id', userId)
-        .first()
-      if (buyer?.subscription_type === 'lifetime')
-        return res.status(409).json({ success: false, error: 'You already have lifetime Premium.' })
+      const pack = await database('xu_packs').where({ code: String(req.body?.pack_code || ''), active: true }).first()
+      if (!pack)
+        return res.status(404).json({ success: false, code: 'NO_PACK' })
+      if (!pack.polar_product_id)
+        return res.status(400).json({ success: false, code: 'NO_CARD' })
+      const wait = await orderWait(database, userId)
+      if (wait)
+        return res.status(429).json({ success: false, code: 'TOO_MANY_ORDERS', wait_min: wait })
 
-      // Còn hạn Premium mà mua thêm gói tháng/năm là tạo subscription thứ hai, khách bị trừ
-      // tiền hai lần. Chỉ cho phép nâng lên lifetime.
-      const activeUntil = buyer?.premium_until ? new Date(buyer.premium_until).getTime() : 0
-      if (buyer?.is_premium && activeUntil > Date.now() && cycle !== LIFETIME)
-        return res.status(409).json({ success: false, error: 'You already have an active Premium plan.' })
-
-      const plan = await database('plans')
-        .where('status', 'published')
-        .whereIn('code', [String(plan_id || 'premium'), 'premium'])
-        .first('id', 'code')
-
-      // Code box (coupon or a friend's invite code, see resolveCode): on a card it needs
-      // its twin discount on Polar, else it only works with bank transfer
-      let discountId: string | undefined
-      let promotionId: string | null = null
-      let discountSource: string | null = null
-      let referrerId: string | null = null
-      let discountCode: string | null = null
-      if (typeof promotion_code === 'string' && promotion_code.trim()) {
-        const check = await resolveCode(database, promotion_code, userId, cycle)
-        if (!check.ok && check.reason === 'wrong-cycle')
-          return res.status(400).json({ success: false, code: 'PROMOTION_WRONG_CYCLE', billing_cycles: check.billingCycles, error: 'This code is not valid for this plan.' })
-        if (!check.ok)
-          return res.status(400).json({ success: false, code: 'PROMOTION_INVALID', error: 'This code is not valid.' })
-        if (!check.polarDiscountId)
-          return res.status(400).json({ success: false, code: 'PROMOTION_BANK_ONLY', error: 'This code only works with bank transfer.' })
-        discountId = check.polarDiscountId
-        promotionId = check.promo?.id || null
-        discountSource = check.kind
-        referrerId = check.referrerId
-        discountCode = promotion_code.trim().toLowerCase()
-      }
-
+      const buyer = await database('directus_users').where('id', userId).first('email')
       const site = polarSiteUrl()
       const checkout = await polarRequest('/v1/checkouts/', {
         method: 'POST',
         body: {
-          products: [productId],
+          products: [pack.polar_product_id],
           external_customer_id: userId,
           customer_email: buyer?.email || undefined,
           success_url: `${site}/checkout/success?checkout_id={CHECKOUT_ID}`,
           return_url: `${site}/pricing`,
-          metadata: { user_id: userId, plan_code: plan?.code || 'premium', billing_cycle: String(cycle) },
-          ...(discountId ? { discount_id: discountId } : {}),
+          metadata: { user_id: userId, pack_code: pack.code, kind: 'coins' },
         },
       })
-
       const schema = await getSchema()
       await adminItems(context, schema, 'purchase_histories').createOne({
         user: userId,
-        plan_id: plan?.id || null,
-        billing_cycle: cycle,
         amount: checkout.total_amount ?? checkout.amount,
         price_original: checkout.amount,
         currency: String(checkout.currency || 'usd').toLowerCase(),
@@ -222,19 +217,16 @@ export function handlePolar(router: Router, context: any) {
         payment_method: 'polar',
         transfer_code: checkout.id,
         expire_time: checkout.expires_at || null,
-        promotion_id: promotionId,
-        discount_source: discountSource,
-        referrer_id: referrerId,
-        discount_code: discountCode,
-        type: plan?.code || 'premium',
-        auto_renew: cycle !== LIFETIME,
+        type: 'gems',
+        product_type: 'coins',
+        pack_code: pack.code,
+        coins: packCoins(pack),
       })
-
       return res.status(200).json({ success: true, url: checkout.url, checkout_id: checkout.id })
     }
     catch (error: any) {
-      logger.error(`[Polar] Tạo checkout thất bại: ${String(error?.message || error)}`)
-      return res.status(502).json({ success: false, error: 'Card payment is temporarily unavailable, please try again later.' })
+      logger.error(`[Polar] Tạo checkout Kim cương thất bại: ${String(error?.message || error)}`)
+      return res.status(502).json({ success: false, code: 'CARD_UNAVAILABLE' })
     }
   })
 
@@ -244,11 +236,11 @@ export function handlePolar(router: Router, context: any) {
       return res.status(401).json({ success: false, error: 'Unauthorized' })
 
     const row = await database('purchase_histories')
-      .where({ transfer_code: String(req.params.id), user: userId, payment_method: 'polar' })
-      .first('status', 'billing_cycle')
+      .where({ transfer_code: String(req.params.id), user: userId, payment_method: 'polar', product_type: 'coins' })
+      .first('status', 'coins', 'pack_code')
     if (!row)
       return res.status(404).json({ success: false, error: 'Order not found' })
-    return res.status(200).json({ success: true, status: row.status, billing_cycle: row.billing_cycle })
+    return res.status(200).json({ success: true, status: row.status, coins: row.coins ?? null })
   })
 
   router.post('/polar-webhook', async (req: any, res: any) => {
@@ -271,7 +263,6 @@ export function handlePolar(router: Router, context: any) {
         await recordPolarRefund(event.data || {}, context)
       }
       else {
-        // subscription.canceled / revoked: không cần làm gì — Premium tự hết theo premium_until
         logger.info(`[Polar] Bỏ qua event ${event.type}`)
       }
       return res.status(200).json({ success: true })
