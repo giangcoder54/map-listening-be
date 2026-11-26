@@ -3,12 +3,14 @@
  *
  *   GET    /admin/extensive                 lessons (status, level, topic, q, page) with how learners did
  *   GET    /admin/extensive/coverage        published / draft lessons by topic x Level
- *   GET    /admin/extensive/candidates      library videos that would make a lesson (level, topic, page)
+ *   GET    /admin/extensive/candidates      library videos that would make a lesson (level, topic, q, page)
  *   GET    /admin/extensive/:id             one lesson with answers, the transcript of its range, stats per question
  *   POST   /admin/extensive                 { source_video_id } a draft (one part, the whole video)
  *   PUT    /admin/extensive/:id             the whole lesson: fields, parts and their questions, the closing one, summary,
  *                                           explore lines, vocabulary, notes and the Vietnamese subtitle of each line
- *   DELETE /admin/extensive/:id             admins only
+ *   GET    /admin/extensive/:id/translations?lang=   every learner text with its base (Vietnamese) text and `lang`'s
+ *   PUT    /admin/extensive/:id/translations  { lang, items: { key: text } } empty text = back to the base
+ *   DELETE /admin/extensive/:id             admins only; a lesson learners have done is hidden instead
  *
  * Lessons are written by Claude (docs/giao-trinh/tools/el_write.py) and reviewed here. Publishing
  * checks every part has a question, every question 3 options and an answer, and a closing question.
@@ -18,6 +20,7 @@ import { EFFECTIVE } from '../lib/videoTags';
 import { BASE_LANG, linesIn, thumbOf } from '../lib/extensive';
 import { UUID_RE } from '../lib/lessons';
 import { isStaff } from '../lib/staff';
+import { otherLangs, readTr, writeTr, type TrRow } from '../lib/adminTr';
 
 const STATUSES = ['draft', 'published', 'hidden'];
 const KINDS = ['gist', 'detail', 'why', 'attitude'];
@@ -85,6 +88,8 @@ export function registerAdminExtensiveRoutes(router: any, context: any) {
 		const level = Number(req.query?.level) || 0;
 		if (level) { where.push(`${EFFECTIVE.level} = ?`); params.push(level); }
 		if (req.query?.topic) { where.push(`${EFFECTIVE.topic} = ?`); params.push(String(req.query.topic)); }
+		const search = String(req.query?.q || '').trim();
+		if (search) { where.push('(sv.title ILIKE ? OR sv.channel_name ILIKE ?)'); params.push(`%${search}%`, `%${search}%`); }
 		const { rows } = await database.raw(`
 			SELECT sv.id, sv.title, sv.channel_name, sv.youtube_video_id, sv.thumbnail_url, sv.transcript_kind, t.duration_s, t.wpm,
 				${EFFECTIVE.topic} AS topic, ${EFFECTIVE.level} AS level, count(*) OVER()::int AS full_count
@@ -298,10 +303,58 @@ export function registerAdminExtensiveRoutes(router: any, context: any) {
 		return res.json({ success: true, data: { id, published: true } });
 	}));
 
+	/** Every learner text of a lesson, keys as extensiveRoutes reads them, its base text beside it */
+	const trRows = async (id: string) => {
+		const l = await database('el_lessons').where('id', id).first();
+		if (!l) return null;
+		const [questions, notes, vocab] = await Promise.all([
+			database('el_questions as q').leftJoin('el_segments as s', 's.id', 'q.segment_id').select('q.*', 's.n as part').where('q.lesson_id', id).orderByRaw('s.n NULLS LAST, q.n'),
+			database('el_notes').where('lesson_id', id).orderBy('n'),
+			database('el_vocab').where('lesson_id', id).orderBy('n'),
+		]);
+		const rows: TrRow[] = [
+			{ key: 'title', label: 'Tên bài', base: l.title || '' },
+			{ key: 'intro', label: 'Giới thiệu', base: l.intro || '' },
+			{ key: 'listen_for', label: 'Nghe để tìm', base: l.listen_for || '' },
+			{ key: 'summary', label: 'Tóm tắt', base: l.summary || '' },
+			...(l.explore || []).map((t: string, i: number) => ({ key: `explore:${i}`, label: `Tìm hiểu thêm ${i + 1}`, base: t || '' })),
+		];
+		for (const q of questions) {
+			const where = q.part ? `Đoạn ${q.part} · câu hỏi ${q.n}` : 'Câu hỏi cuối';
+			rows.push({ key: `q:${q.id}:prompt`, label: where, base: q.prompt || '' });
+			(q.options || []).forEach((o: string, i: number) => rows.push({ key: `q:${q.id}:o${i}`, label: `${where} · đáp án ${i + 1}`, base: o || '' }));
+		}
+		for (const v of vocab) rows.push({ key: `vocab:${v.n}`, label: `Từ vựng “${v.term}”`, base: v.meaning || '' });
+		for (const n of notes) {
+			rows.push({ key: `note:${n.n}`, label: `Ghi chú “${n.term}”`, base: n.explain || '' });
+			rows.push({ key: `note_extra:${n.n}`, label: `Ghi chú “${n.term}” · thêm`, base: n.extra || '' });
+		}
+		return rows.filter((r) => r.base.trim());
+	};
+	router.get('/admin/extensive/:id/translations', staff(async (req, res) => {
+		const id = String(req.params.id);
+		if (!UUID_RE.test(id)) return bad(res, 'Bad id');
+		const langs = await otherLangs(database, BASE_LANG);
+		const lang = langs.includes(String(req.query?.lang)) ? String(req.query.lang) : langs[0];
+		const rows = await trRows(id);
+		if (!rows) return res.status(404).json({ success: false, message: 'Not found' });
+		return res.json({ success: true, data: { langs, lang, rows: lang ? await readTr(database, 'el_translations', id, lang, rows) : [] } });
+	}));
+	router.put('/admin/extensive/:id/translations', staff(async (req, res) => {
+		const id = String(req.params.id);
+		const lang = String(req.body?.lang || '');
+		if (!UUID_RE.test(id) || !(await otherLangs(database, BASE_LANG)).includes(lang)) return bad(res, 'Bad request');
+		const rows = await trRows(id);
+		if (!rows) return res.status(404).json({ success: false, message: 'Not found' });
+		await writeTr(database, 'el_translations', id, lang, req.body?.items, rows);
+		return res.json({ success: true });
+	}));
+
 	router.delete('/admin/extensive/:id', staff(async (req, res) => {
 		if (!req.accountability?.admin) return res.status(403).json({ success: false, message: 'Admins only' });
 		const id = String(req.params.id);
 		if (!UUID_RE.test(id)) return bad(res, 'Bad id');
+		if (await database('el_attempts').where('lesson_id', id).first('id')) return res.status(409).json({ success: false, message: 'Đã có người học làm bài này: dùng trạng thái Ẩn thay vì xoá' });
 		await database('el_lessons').where('id', id).delete();
 		return res.json({ success: true, data: null });
 	}));

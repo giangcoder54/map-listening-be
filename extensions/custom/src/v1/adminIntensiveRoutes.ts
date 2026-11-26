@@ -8,7 +8,11 @@
  *   GET    /admin/intensive/:id/stats        finishing, where learners stop, the ladder, practice, feedback, thumbs on diagnoses, key words missed again
  *   PUT    /admin/intensive/:id/gist         { prompt, options[3], answer, explain?, sentences[] } the gist question and the sentences (n) that hold its answer
  *   PUT    /admin/intensive/:id/sentences/:sid   { text?, start_ms?, end_ms?, traps?, key_words? } fix one sentence (traps = the words to watch: [{ text, kind, real?, note?, skill? }])
- *   DELETE /admin/intensive/:id          admins only
+ *   PUT    /admin/intensive/:id/info     { title, intro?, explore?, focus?, topic?, note?, is_premium? (admins) } the passage's own text
+ *   POST   /admin/intensive/:id/sentences    { after, text, start_ms, end_ms, part? } a sentence after sentence `after` (0 = first)
+ *   GET    /admin/intensive/:id/translations?lang=   every learner text of the passage with its base text and `lang`'s
+ *   PUT    /admin/intensive/:id/translations  { lang, items: { key: text } } empty text = back to the base
+ *   DELETE /admin/intensive/:id          admins only; a passage learners have done is hidden instead
  *   GET    /admin/intensive/chunks       the shared chunks (il_chunks: "sort of" → "sorta"), traps in every passage
  *   POST   /admin/intensive/chunks       { text, kind?, real?, note?, skill?, active? } add one
  *   PUT    /admin/intensive/chunks/:id   same fields, any of them
@@ -21,6 +25,7 @@ import { IL_PART, sameAs, sentencesOf, withParts } from '../lib/ilParts';
 import { thumbOf } from '../lib/extensive';
 import { UUID_RE } from '../lib/lessons';
 import { isStaff } from '../lib/staff';
+import { otherLangs, readTr, writeTr, type TrRow } from '../lib/adminTr';
 
 const STATUSES = ['draft', 'published', 'hidden'];
 const KINDS = ['linking', 'confusable', 'imagine'];
@@ -191,10 +196,7 @@ export function registerAdminIntensiveRoutes(router: any, context: any) {
 		const l = await database('il_lessons').where('id', id).first('status');
 		const s = await database('il_sentences').where({ id: sid, lesson_id: id }).first('n');
 		if (!l || !s) return res.status(404).json({ success: false, message: 'Not found' });
-		const used = (await database('il_attempts').where('lesson_id', id).first('id'))
-			|| (await database('il_vocab').where('lesson_id', id).first('id'))
-			|| (await database('il_translations').where('lesson_id', id).where('key', 'like', 's%').first('key'));
-		if (l.status === 'published' || used) return res.status(409).json({ success: false, message: 'Chỉ xóa được câu khi bài chưa xuất bản và chưa có lượt học, từ vựng hay bản dịch' });
+		if (await renumberBlocked(id, l.status)) return res.status(409).json({ success: false, message: 'Chỉ xóa được câu khi bài chưa xuất bản và chưa có lượt học, từ vựng hay bản dịch' });
 		await database.transaction(async (trx: any) => {
 			await trx('il_sentences').where('id', sid).delete();
 			for (const r of await trx('il_sentences').where('lesson_id', id).where('n', '>', s.n).orderBy('n').select('id', 'n')) await trx('il_sentences').where('id', r.id).update({ n: r.n - 1 });
@@ -307,6 +309,96 @@ export function registerAdminIntensiveRoutes(router: any, context: any) {
 	}));
 
 	/** Fix one sentence: its text and/or its time range in ms (the team listens with the player and corrects it) */
+	/** Sentences are numbered (n) and translations, vocabulary and attempts point at those numbers: they move only while nothing does */
+	const renumberBlocked = async (id: string, status: string) => status === 'published'
+		|| !!(await database('il_attempts').where('lesson_id', id).first('id'))
+		|| !!(await database('il_vocab').where('lesson_id', id).first('id'))
+		|| !!(await database('il_translations').where('lesson_id', id).where('key', 'like', 's%').first('key'));
+
+	router.put('/admin/intensive/:id/info', staff(async (req, res) => {
+		const id = String(req.params.id);
+		if (!UUID_RE.test(id)) return res.status(400).json({ success: false, message: 'Bad id' });
+		const l = await database('il_lessons').where('id', id).first();
+		if (!l) return res.status(404).json({ success: false, message: 'Not found' });
+		const b = req.body || {};
+		const title = String(b.title ?? l.title).replace(/\s+/g, ' ').trim();
+		if (!title) return res.status(422).json({ success: false, message: 'Cần tên bài' });
+		const focus = b.focus === undefined ? l.focus : b.focus || null;
+		if (focus && !['linking', 'confusable', 'imagine', 'speed', 'mixed'].includes(focus)) return res.status(422).json({ success: false, message: 'Kiểu luyện không hợp lệ' });
+		if (b.is_premium !== undefined && !!b.is_premium !== !!l.is_premium && !req.accountability?.admin) return res.status(403).json({ success: false, message: 'Chỉ admin đổi được Premium' });
+		const text = (v: any, old: any, n: number) => (v === undefined ? old : String(v || '').trim().slice(0, n) || null);
+		await database('il_lessons').where('id', id).update({
+			title: title.slice(0, 200), intro: text(b.intro, l.intro, 1000), explore: text(b.explore, l.explore, 6000), focus,
+			topic: text(b.topic, l.topic, 60), note: text(b.note, l.note, 1000), is_premium: b.is_premium === undefined ? l.is_premium : !!b.is_premium,
+			date_updated: database.fn.now(),
+		});
+		return res.json({ success: true });
+	}));
+
+	router.post('/admin/intensive/:id/sentences', staff(async (req, res) => {
+		const id = String(req.params.id);
+		if (!UUID_RE.test(id)) return res.status(400).json({ success: false, message: 'Bad id' });
+		const l = await database('il_lessons').where('id', id).first('status');
+		if (!l) return res.status(404).json({ success: false, message: 'Not found' });
+		if (await renumberBlocked(id, l.status)) return res.status(409).json({ success: false, message: 'Chỉ thêm được câu khi bài chưa xuất bản và chưa có lượt học, từ vựng hay bản dịch' });
+		const b = req.body || {};
+		const text = String(b.text || '').replace(/\s+/g, ' ').trim();
+		const start = Math.round(Number(b.start_ms));
+		const end = Math.round(Number(b.end_ms));
+		if (!tokens(text).length) return res.status(422).json({ success: false, message: 'Câu cần có chữ' });
+		if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end - start < 600) return res.status(422).json({ success: false, message: 'Câu dài tối thiểu 0,6 giây' });
+		const after = Math.max(0, Math.floor(Number(b.after) || 0));
+		const prev = after ? await database('il_sentences').where({ lesson_id: id, n: after }).first('part') : null;
+		const part = Number.isInteger(Number(b.part)) && Number(b.part) >= 1 ? Number(b.part) : prev?.part || 1;
+		await database.transaction(async (trx: any) => {
+			// From the end, so no two rows share a number on the way
+			for (const r of await trx('il_sentences').where('lesson_id', id).where('n', '>', after).orderBy('n', 'desc').select('id', 'n')) await trx('il_sentences').where('id', r.id).update({ n: r.n + 1 });
+			await trx('il_sentences').insert({ lesson_id: id, n: after + 1, text, start_ms: start, end_ms: end, part, traps: '[]', key_words: [] });
+			await trx.raw('UPDATE il_lessons SET gist_sentences = ARRAY(SELECT CASE WHEN x > ? THEN x + 1 ELSE x END FROM unnest(gist_sentences) x)::smallint[], date_updated = now() WHERE id = ?', [after, id]);
+		});
+		return res.json({ success: true, data: null });
+	}));
+
+	/** Every learner text of a passage (keys as intensiveRoutes reads them), its base text beside it; vocabulary is in its own block */
+	const trRows = async (id: string) => {
+		const l = await database('il_lessons').where('id', id).first();
+		if (!l) return null;
+		const rows: TrRow[] = [
+			{ key: 'title', label: 'Tên bài', base: l.title || '' },
+			{ key: 'intro', label: 'Giới thiệu', base: l.intro || '' },
+			{ key: 'explore', label: 'Tìm hiểu thêm', base: l.explore || '' },
+			{ key: 'gist_prompt', label: 'Câu hỏi ý chính', base: l.gist_prompt || '' },
+			...(Array.isArray(l.gist_options) ? l.gist_options : []).map((o: string, i: number) => ({ key: `gist_o${i}`, label: `Ý chính · đáp án ${i + 1}`, base: o || '' })),
+			{ key: 'gist_explain', label: 'Ý chính · giải thích', base: l.gist_explain || '' },
+		];
+		for (const s of await database('il_sentences').where('lesson_id', id).orderBy('n')) {
+			rows.push({ key: `s${s.n}:sub`, label: `Câu ${s.n} · phụ đề`, base: s.sub || '' });
+			(Array.isArray(s.traps) ? s.traps : []).forEach((t: any, j: number) => {
+				if (t.note) rows.push({ key: `s${s.n}:t${j}:note`, label: `Câu ${s.n} · bẫy “${t.text}” · giải thích`, base: t.note });
+				if (t.real) rows.push({ key: `s${s.n}:t${j}:real`, label: `Câu ${s.n} · bẫy “${t.text}” · nghe như`, base: t.real });
+			});
+		}
+		return rows.filter((r) => r.base.trim());
+	};
+	router.get('/admin/intensive/:id/translations', staff(async (req, res) => {
+		const id = String(req.params.id);
+		if (!UUID_RE.test(id)) return res.status(400).json({ success: false, message: 'Bad id' });
+		const langs = await otherLangs(database, 'vi-VN');
+		const lang = langs.includes(String(req.query?.lang)) ? String(req.query.lang) : langs[0];
+		const rows = await trRows(id);
+		if (!rows) return res.status(404).json({ success: false, message: 'Not found' });
+		return res.json({ success: true, data: { langs, lang, rows: lang ? await readTr(database, 'il_translations', id, lang, rows) : [] } });
+	}));
+	router.put('/admin/intensive/:id/translations', staff(async (req, res) => {
+		const id = String(req.params.id);
+		const lang = String(req.body?.lang || '');
+		if (!UUID_RE.test(id) || !(await otherLangs(database, 'vi-VN')).includes(lang)) return res.status(400).json({ success: false, message: 'Bad request' });
+		const rows = await trRows(id);
+		if (!rows) return res.status(404).json({ success: false, message: 'Not found' });
+		await writeTr(database, 'il_translations', id, lang, req.body?.items, rows);
+		return res.json({ success: true });
+	}));
+
 	router.put('/admin/intensive/:id/sentences/:sid', staff(async (req, res) => {
 		const id = String(req.params.id);
 		const sid = String(req.params.sid);
@@ -324,7 +416,8 @@ export function registerAdminIntensiveRoutes(router: any, context: any) {
 			if (!Number.isFinite(v) || v < 0) return res.status(422).json({ success: false, message: 'Thời gian không hợp lệ' });
 			patch[k] = v;
 		}
-		if (!Object.keys(body).some((k) => ['text', 'start_ms', 'end_ms', 'traps', 'key_words', 'part'].includes(k))) return res.status(400).json({ success: false, message: 'Nothing to change' });
+		if (body.sub !== undefined) patch.sub = String(body.sub || '').replace(/\s+/g, ' ').trim().slice(0, 600) || null;
+		if (!Object.keys(body).some((k) => ['text', 'start_ms', 'end_ms', 'traps', 'key_words', 'part', 'sub'].includes(k))) return res.status(400).json({ success: false, message: 'Nothing to change' });
 		const s = await database('il_sentences').where({ id: sid, lesson_id: id }).first();
 		if (!s) return res.status(404).json({ success: false, message: 'Not found' });
 		if (body.part !== undefined) {
@@ -369,6 +462,7 @@ export function registerAdminIntensiveRoutes(router: any, context: any) {
 		if (!req.accountability?.admin) return res.status(403).json({ success: false, message: 'Admins only' });
 		const id = String(req.params.id);
 		if (!UUID_RE.test(id)) return res.status(400).json({ success: false, message: 'Bad id' });
+		if (await database('il_attempts').where('lesson_id', id).first('id')) return res.status(409).json({ success: false, message: 'Đã có người học làm bài này: dùng trạng thái Ẩn thay vì xoá' });
 		await database('il_lessons').where('id', id).delete();
 		return res.json({ success: true, data: null });
 	}));
