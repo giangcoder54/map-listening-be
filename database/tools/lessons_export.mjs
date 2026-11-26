@@ -4,6 +4,7 @@
 //   node database/tools/lessons_export.mjs <lesson id> [<id> ...]    just these
 //
 // Only adds: a lesson the server already has (same id) is left exactly as it is, so running it twice is safe.
+// A video the server already made a lesson of (same feature, e.g. one made in its admin) is skipped too, so no doubles.
 // A video the server already holds (same YouTube id) is reused, whatever its id there.
 // Needs the local map-listening-db container.
 import { execFileSync } from 'node:child_process'
@@ -40,7 +41,9 @@ const insert = (table, list) => {
 const out = ['-- Made by database/tools/lessons_export.mjs. Only adds rows; safe to run twice.', '\\set ON_ERROR_STOP on', "set client_encoding = 'UTF8';", 'begin;']
 let total = 0
 for (const { table, children } of FEATURES) {
-	for (const lesson of rows(table, where)) {
+	const chosen = rows(table, where)
+	const ids = chosen.map(l => quote(l.id)).join(', ')
+	for (const lesson of chosen) {
 		const [video] = rows('source_videos', `id = ${quote(lesson.source_video_id)}`)
 		const tags = rows('video_tags', `source_video_id = ${quote(video.id)}`)
 		const kids = children.map(t => [t, rows(t, `lesson_id = ${quote(lesson.id)}`)])
@@ -53,6 +56,10 @@ declare v uuid := (select id from source_videos where youtube_video_id = ${yt} l
 begin
   if exists (select 1 from ${table} where id = ${quote(lesson.id)}) then
     raise notice 'already there: ${lesson.id}';
+    return;
+  end if;
+  if exists (select 1 from ${table} where source_video_id = v and id not in (${ids})) then
+    raise notice 'skipped, the server has its own lesson of this video: %', ${quote(lesson.title)};
     return;
   end if;
   ${tags.length ? `insert into video_tags select (jsonb_populate_record(null::video_tags, ${literal(tags[0])}::jsonb || jsonb_build_object('source_video_id', v))).* on conflict do nothing;` : ''}
