@@ -39,7 +39,7 @@ export default defineHook((registerEvents, context) => {
 	// Luyện cùng: rooms push their state over Directus's WebSocket (the browser sends { type: 'coop.sub', room })
 	startCoopTicker(context.database, context.logger);
 	action('websocket.message', ({ message, client }: any) => {
-		if (message?.type === 'coop.sub' && /^[0-9a-f-]{36}$/i.test(String(message.room || ''))) coopSubscribe(context.database, client, String(message.room), Number(message.since) || 0).catch(() => null);
+		if (message?.type === 'coop.sub' && /^[0-9a-f-]{36}$/i.test(String(message.room || ''))) coopSubscribe(context.database, client, String(message.room), Number(message.since) || 0, message.lang).catch(() => null);
 		else if (message?.type === 'coop.unsub') coopDrop(client);
 	});
 	action('websocket.close', ({ client }: any) => coopDrop(client));

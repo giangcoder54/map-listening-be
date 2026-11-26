@@ -3,14 +3,14 @@
  * The browser talks to LiveKit directly; this server only hands out a short token for the room's two players.
  * An access token is a signed JWT (HS256), so no SDK is needed. Off while LIVEKIT_URL / LIVEKIT_API_KEY / LIVEKIT_API_SECRET are not set.
  * Not in a duel: the players must not talk about the answer.
- * 15 minutes of voice per room, counted from the first time either player joins the call (coop_rooms.voice_started_at);
+ * 25 minutes of voice per room, counted from the first time either player joins the call (coop_rooms.voice_started_at);
  * the token expires then, so no one can join again after it. The browser ends the call itself at that moment.
  */
 import { createHmac } from 'node:crypto';
 import { CoopError } from './coop';
 
 /** Voice time of one room, in seconds */
-export const VOICE_SECONDS = 15 * 60;
+export const VOICE_SECONDS = 25 * 60;
 
 const b64 = (v: unknown) => Buffer.from(JSON.stringify(v)).toString('base64url');
 
@@ -25,7 +25,7 @@ export function voiceToken(identity: string, name: string, room: string, ttlSeco
 }
 
 /**
- * A player of a practice room asks about voice. `start` (pressing the mic) starts the room's 15 minutes and gives a token
+ * A player of a practice room asks about voice. `start` (pressing the mic) starts the room's 25 minutes and gives a token
  * for that room only; without it the answer only says whether voice is on and how many seconds are left (no token).
  */
 export async function joinVoice(db: any, userId: string, roomId: string, start = false) {

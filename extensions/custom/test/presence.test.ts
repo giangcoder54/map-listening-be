@@ -157,7 +157,7 @@ describe('rooms that are still waiting', () => {
 		await sweepPresence(trx, DAY);
 		assert.equal(await status(id), 'cancelled');
 		assert.equal(await purse(user), 500); assert.equal(await purse(other), 500);
-		assert.ok(await trx('match_bans').where('user_id', other).first(), 'the silent one is banned from the queue for a short time');
+		assert.ok(await trx('match_bans').where('user_id', other).first(), 'the silent one has a missed match counted');
 	});
 });
 

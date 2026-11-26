@@ -360,7 +360,7 @@ describe('Luyen cung (two learners, at the same time)', () => {
 	test('all questions done: the fee is spent (no refund, no reward), next is safe to press twice, stars are counted', async () => {
 		const id = await ready();
 		const total = (await getState(trx, user, id)).total;
-		assert.equal(total, COIN.coop.practiceQuestions);
+		assert.ok(total >= COIN.coop.practiceQuestions, 'a whole passage');
 		for (let i = 0; i < total; i++) {
 			const text = await sentence(id, i);
 			await answerCoop(trx, user, id, { idx: i, text }); await answerCoop(trx, other, id, { idx: i, text });
@@ -473,7 +473,13 @@ describe('Dau v2: shared listen, queue, talk and lock', () => {
 		await due(id); assert.equal(await advanceDue(trx, id, DAY), true);
 		assert.equal((await getState(trx, user, id)).status, 'cancelled');
 		assert.equal(await purse(user), 100); assert.equal(await purse(other), 100);
-		await assert.rejects(joinQueue(trx, other, 20, 'duel', DAY), (e: any) => e.code === 'BANNED', 'whoever was not ready waits a moment');
+		// 4 missed in a row cost nothing, the 5th keeps whoever was not ready out of the queue
+		for (let n = 2; n <= 5; n++) {
+			await joinQueue(trx, other, 20, 'duel', DAY); await joinQueue(trx, user, 20, 'duel', DAY);
+			const next = ((await matchStatus(trx, user)) as any).room_id as string;
+			await readyCoop(trx, user, next); await due(next); await advanceDue(trx, next, DAY);
+		}
+		await assert.rejects(joinQueue(trx, other, 20, 'duel', DAY), (e: any) => e.code === 'BANNED', 'the 5th miss in a row');
 		await joinQueue(trx, user, 20, 'duel', DAY); assert.equal(await sweepQueue(trx, DAY), 0);
 	});
 	test('practice: different texts go to talk, both can type again, both locked and both right = a team star; a miss is counted', async () => {
@@ -534,7 +540,7 @@ describe('Dau v2: shared listen, queue, talk and lock', () => {
 		const id = ((await matchStatus(trx, user)) as any).room_id as string;
 		let s = await getState(trx, user, id); assert.equal(s.mode, 'practice'); assert.equal(s.auto, true);
 		await readyCoop(trx, user, id); await readyCoop(trx, other, id);
-		s = await getState(trx, user, id); assert.equal(s.phase, 'answer'); assert.equal(s.total, COIN.coop.practiceQuestions);
+		s = await getState(trx, user, id); assert.equal(s.phase, 'answer'); assert.ok(s.total >= COIN.coop.practiceQuestions);
 		assert.equal(await purse(user), 100 - COIN.coop.deposit);
 	});
 	test('the last opponent is the last choice: another waiting player is matched first, the same one when nobody else waits', async () => {
@@ -563,7 +569,7 @@ describe('Dau v2: shared listen, queue, talk and lock', () => {
 });
 
 describe('Luyen cung: the lesson and what it costs', () => {
-	const unlocked = async (id: string, lesson: string) => !!(await trx('listening_unlocks').where({ user_id: id, lesson_id: lesson }).first('lesson_id'));
+	const unlocked = async (id: string, lesson: string) => !!(await trx('content_unlocks').where({ user_id: id, kind: 'il', lesson_id: lesson }).first('lesson_id'));
 	const lessonOf = async (room: string) => (await trx('coop_rooms').where('id', room).first('lesson_id')).lesson_id as string | null;
 	test('both lack the lesson: each pays the fee and the lesson price when the room starts, and both keep the lesson', async () => {
 		await fund(user, 1000); await fund(other, 1000);
@@ -571,18 +577,18 @@ describe('Luyen cung: the lesson and what it costs', () => {
 		assert.equal(await purse(user), 1000 - COIN.coop.deposit, 'only the fee before the room starts');
 		await startCoop(trx, user, id);
 		const lesson = await lessonOf(id);
-		assert.ok(lesson, 'a paid lesson of the Listening Lab is picked');
+		assert.ok(lesson, 'an Intensive lesson is picked');
 		const s = await getState(trx, user, id);
-		assert.ok(s.lesson.price >= 100, 'a paid lesson: the price is shown'); assert.equal(s.total, COIN.coop.practiceQuestions);
+		assert.ok(s.lesson.price >= 100, 'a paid lesson: the price is shown'); assert.equal(s.total, Number((await trx('il_sentences').where('lesson_id', lesson).count('* as n').first()).n), 'every sentence of it');
 		assert.equal(await purse(user), 1000 - COIN.coop.deposit - s.lesson.price); assert.equal(await purse(other), 1000 - COIN.coop.deposit - s.lesson.price);
 		assert.ok(await unlocked(user, lesson!) && await unlocked(other, lesson!), 'both have the lesson now');
 		assert.equal(await purse(user), await ledger(user));
 	});
 	test('one already has the lesson: only the other pays for it', async () => {
 		await fund(user, 1000); await fund(other, 1000);
-		const ids = (await trx('listening_lessons').where('status', 'published').whereIn('kind', ['pattern', 'trap']).pluck('id')) as string[];
+		const ids = (await trx('il_lessons').where('status', 'published').pluck('id')) as string[];
 		// everything is bought by `user` except nothing: so any lesson picked is owned by user and paid for by other only
-		for (const l of ids) await trx('listening_unlocks').insert({ user_id: user, lesson_id: l, source: 'gift' }).onConflict(['user_id', 'lesson_id']).ignore();
+		for (const l of ids) await trx('content_unlocks').insert({ user_id: user, kind: 'il', lesson_id: l, source: 'gift' }).onConflict(['user_id', 'kind', 'lesson_id']).ignore();
 		const id = await createCoop(trx, user); await joinCoop(trx, other, id); await startCoop(trx, user, id);
 		const s = await getState(trx, other, id); const mine = await getState(trx, user, id);
 		assert.equal(mine.lesson.price, 0, 'the one who has it pays nothing for it');

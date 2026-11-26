@@ -10,13 +10,14 @@
  * (lib/rooms.ts split), the time breaks a tie, leaving mid-duel forfeits. Rooms are made by the queue (lib/match.ts, `auto`:
  * both press "ready" within COIN.coop.readySeconds, or the room is closed and the fees go back) or by a friend's link.
  *
- * Mode "practice" (Luyện cùng): a deposit (COIN.coop.deposit) from each player, no clock. Each picks alone ("answer"); same
- * pick = straight to "reveal"; different = "discuss" (chat, each may change the pick, then lock it); when both are locked the
- * answer shows. Both right at the end of the talk = a team star. When all questions are done every player gets the deposit
- * back and COIN.coop.reward (at most COIN.coop.perDay rooms a day); leaving midway loses the deposit, the other is refunded.
+ * Mode "practice" (Luyện cùng): a fee (COIN.coop.deposit) from each player, no clock; the room is one whole Intensive
+ * passage (pickLesson), bought by whoever lacks it. Each types the sentence alone; the same text or both right = straight to
+ * "reveal"; otherwise "discuss": chat, each may type again, then lock; when both are locked the answer shows. Both right =
+ * a team star. The fee is spent; only the one who stays when the other leaves (or a room that is closed) gets it back.
  * A room idle for IDLE_MIN minutes is closed.
  */
-import { COIN, CoinError, earnCoins, lockPurse, spend } from './coins';
+import { COIN, CoinError, earnCoins, lockPurse, spend, unlockContent } from './coins';
+import { BASE_LANG } from './extensive';
 import { vnDay } from './days';
 import { levelOf } from './xp';
 import { diffWords, isRight, tokens } from './intensive';
@@ -26,6 +27,8 @@ import { isEstablished } from './trust';
 export const SIZE = 2;
 const IDLE_MIN = 30;
 const MAX_MSG = 300;
+// this many missed matches in a row keep a learner out of the queue for BAN_MIN minutes
+const MISS_LIMIT = 5;
 const BAN_MIN = 2;
 
 export class CoopError extends Error {
@@ -95,51 +98,49 @@ async function seenRefs(db: any, userIds: string[]): Promise<string[]> {
 	return (seen.rows || []).map((r: any) => r.id).filter(Boolean);
 }
 
-/** A Luyện cùng room: one lesson of the Listening Lab, what each player pays for it (0 if they have it), and its sentences to type */
+/** A Luyện cùng room: one Intensive passage, what each player pays for it (0 if it is free or theirs), and its sentences to type */
 export type LessonPick = { id: string | null; prices: Record<string, number>; questions: DictQ[] };
 
 /**
- * The lesson for two players. A lesson costs a player its unlock price unless they bought it; the pick
- * prefers one both lack (both buy it), then one that one of them lacks, then one both have; never one a player cannot
- * pay for. Not a lesson whose sentences they typed in the last 30 days. With no such lesson: short random sentences, nobody pays.
+ * The passage for two players: every sentence of one Intensive lesson, in the video's order. A paid lesson costs a player
+ * its unlock price unless they bought it; the pick prefers one both lack (both buy it), then one that one of them lacks,
+ * then a free or owned one; never one a player cannot pay for. Not one a player has already done (in Intensive, or in a
+ * room these last 30 days) while there is another. With no lesson at all: short random sentences, nobody pays.
  */
 export async function pickLesson(db: any, userIds: string[]): Promise<LessonPick> {
-	const n = COIN.coop.practiceQuestions;
 	const own = new Map<string, Set<string>>(userIds.map((u) => [u, new Set<string>()]));
-	for (const r of await db('listening_unlocks').whereIn('user_id', userIds).select('user_id', 'lesson_id')) own.get(r.user_id)!.add(r.lesson_id);
+	for (const r of await db('content_unlocks').whereIn('user_id', userIds).where('kind', 'il').select('user_id', 'lesson_id')) own.get(r.user_id)!.add(r.lesson_id);
 	const purse = new Map<string, number>();
 	for (const r of await db('user_xp').whereIn('user_id', userIds).select('user_id', 'coins')) purse.set(r.user_id, Number(r.coins) || 0);
-	const exclude = new Set(await seenRefs(db, userIds));
-	const rows = await db('listening_lessons as l').join('listening_clips as c', 'c.lesson_id', 'l.id').join('source_videos as sv', 'sv.id', 'c.source_video_id')
-		.leftJoin('listening_skills as k', 'k.id', 'l.skill_id').leftJoin('listening_groups as g', 'g.id', 'k.group_id')
-		.where('l.status', 'published').whereIn('l.kind', ['pattern', 'trap']).where('c.status', 'published')
-		.whereNotNull('c.transcript').whereNotNull('c.start_time').whereNotNull('c.end_time').whereNotNull('sv.youtube_video_id')
-		.whereRaw('char_length(c.transcript) between 15 and 140').whereRaw('(c.end_time - c.start_time) between 1.5 and 12')
-		.select('l.id as lesson', 'l.kind', db.raw('(coalesce(l.is_premium, false) or coalesce(k.is_premium, false) or coalesce(g.is_premium, false)) as paid'),
-			'c.id as clip', 'c.transcript', 'c.start_time', 'c.end_time', 'c.sort', 'sv.youtube_video_id');
-	const by = new Map<string, { kind: string; paid: boolean; clips: any[] }>();
+	const seen = new Set(await seenRefs(db, userIds));
+	const done = new Set<string>(await db('il_attempts').whereIn('user_id', userIds).pluck('lesson_id'));
+	const rows = await db('il_lessons as l').join('il_sentences as s', 's.lesson_id', 'l.id').join('source_videos as sv', 'sv.id', 'l.source_video_id')
+		.where('l.status', 'published').whereNotNull('sv.youtube_video_id')
+		// a whole video done in parts is not drawn from
+		.whereRaw('not exists (select 1 from il_sentences p where p.lesson_id = l.id and p.part > 1)')
+		.select('l.id as lesson', 'l.is_premium', 's.id', 's.text', 's.start_ms', 's.end_ms', 'sv.youtube_video_id').orderBy('s.n');
+	const by = new Map<string, any[]>();
 	for (const r of rows) {
-		if (exclude.has(r.clip)) continue;
-		const l = by.get(r.lesson) || { kind: r.kind, paid: !!r.paid, clips: [] as any[] };
-		l.clips.push(r); by.set(r.lesson, l);
+		if (!by.has(r.lesson)) by.set(r.lesson, []);
+		by.get(r.lesson)!.push(r);
 	}
-	const options: { id: string; prices: Record<string, number>; tier: number; clips: any[] }[] = [];
-	for (const [id, l] of by) {
-		if (l.clips.length < Math.min(5, n)) continue;
-		const cost = l.paid ? COIN.unlock[l.kind] ?? COIN.unlock.pattern! : 0;
+	const price = COIN.unlockContent.il ?? 100;
+	const options: { id: string; prices: Record<string, number>; tier: number; fresh: boolean; sentences: any[] }[] = [];
+	for (const [id, sentences] of by) {
 		const prices: Record<string, number> = {};
-		for (const u of userIds) prices[u] = own.get(u)!.has(id) ? 0 : cost;
+		for (const u of userIds) prices[u] = sentences[0].is_premium && !own.get(u)!.has(id) ? price : 0;
 		if (userIds.some((u) => prices[u]! > (purse.get(u) ?? 0))) continue;
-		options.push({ id, prices, tier: userIds.filter((u) => prices[u]! > 0).length, clips: l.clips });
+		options.push({ id, prices, tier: userIds.filter((u) => prices[u]! > 0).length, fresh: !done.has(id) && !sentences.some((s) => seen.has(s.id)), sentences });
 	}
 	if (options.length) {
-		const best = Math.max(...options.map((o) => o.tier));
-		const top = options.filter((o) => o.tier === best);
+		const fresh = options.filter((o) => o.fresh);
+		const pool = fresh.length ? fresh : options;
+		const best = Math.max(...pool.map((o) => o.tier));
+		const top = pool.filter((o) => o.tier === best);
 		const o = top[Math.floor(Math.random() * top.length)]!;
-		const clips = o.clips.sort((a, b) => (Number(a.sort) || 0) - (Number(b.sort) || 0)).slice(0, n);
-		return { id: o.id, prices: o.prices, questions: clips.map((c) => ({ kind: 'dict' as const, source: 'clip' as const, ref_id: c.clip, text: String(c.transcript).trim(), video_id: c.youtube_video_id, start: Number(c.start_time), end: Number(c.end_time) })) };
+		return { id: o.id, prices: o.prices, questions: o.sentences.map((s) => ({ kind: 'dict' as const, source: 'il' as const, ref_id: s.id, text: String(s.text).trim(), video_id: s.youtube_video_id, start: Number(s.start_ms) / 1000, end: Number(s.end_ms) / 1000 })) };
 	}
-	return { id: null, prices: Object.fromEntries(userIds.map((u) => [u, 0])), questions: await buildDictation(db, userIds, n) };
+	return { id: null, prices: Object.fromEntries(userIds.map((u) => [u, 0])), questions: await buildDictation(db, userIds) };
 }
 
 /** Friend room, both in: pick the lesson and what each pays (the pay itself is taken when the room starts) */
@@ -150,18 +151,18 @@ async function assignLesson(trx: any, room: any) {
 	for (const u of ids) await trx('coop_members').where({ room_id: room.id, user_id: u }).update({ lesson_price: pick.prices[u] ?? 0 });
 }
 
-/** The room starts: whoever lacks the lesson pays for it and keeps it (the unlock of the lesson, as when bought one by one) */
+/** The room starts: whoever lacks the lesson pays for it and keeps it (the unlock of Intensive, as when bought there) */
 async function chargeLesson(trx: any, room: any, today: string) {
 	const lesson = room.lesson_id;
 	if (!lesson) return;
 	for (const m of await trx('coop_members').where('room_id', room.id).select('user_id', 'lesson_price')) {
-		const price = Number(m.lesson_price) || 0;
-		if (price <= 0 || (await trx('listening_unlocks').where({ user_id: m.user_id, lesson_id: lesson }).first('lesson_id'))) continue;
-		await lockPurse(trx, m.user_id);
-		try {
-			const paid = await spend(trx, m.user_id, price, 'unlock', `unlock:${lesson}`, lesson, today);
-			await trx('listening_unlocks').insert({ user_id: m.user_id, lesson_id: lesson, source: 'coins', coin_event_id: paid.eventId });
-		} catch (e) { if (e instanceof CoinError && e.code === 'NOT_ENOUGH') throw new CoopError('NOT_ENOUGH'); throw e; }
+		if ((Number(m.lesson_price) || 0) <= 0) continue;
+		try { await unlockContent(trx, m.user_id, 'il', lesson, today); }
+		catch (e) {
+			if (e instanceof CoinError && e.code === 'ALREADY') continue;
+			if (e instanceof CoinError && e.code === 'NOT_ENOUGH') throw new CoopError('NOT_ENOUGH');
+			throw e;
+		}
 	}
 }
 
@@ -240,8 +241,11 @@ export async function refund(trx: any, room: any, userIds: string[], today: stri
 	for (const u of userIds) await earnCoins(trx, u, { reason: 'refund', amount: room.fee, dedupe: `coop_refund:${room.id}:${u}${once ? '' : `:${Date.now()}`}`, meta: { room_id: room.id } }, today);
 }
 
-export async function banFor(trx: any, userId: string) {
-	await trx('match_bans').insert({ user_id: userId, until: new Date(Date.now() + BAN_MIN * 60_000) }).onConflict('user_id').merge();
+/** One more queue match not entered; the MISS_LIMIT-th in a row bans from the queue and the count starts again */
+export async function missMatch(trx: any, userId: string) {
+	const [row] = await trx('match_bans').insert({ user_id: userId, until: new Date(), misses: 1 })
+		.onConflict('user_id').merge({ misses: trx.raw('match_bans.misses + 1') }).returning('misses');
+	if (row.misses >= MISS_LIMIT) await trx('match_bans').where('user_id', userId).update({ until: new Date(Date.now() + BAN_MIN * 60_000), misses: 0 });
 }
 
 export async function createCoop(db: any, userId: string, o: { mode?: Mode; fee?: number; today?: string } = {}) {
@@ -328,6 +332,8 @@ export async function readyCoop(db: any, userId: string, roomId: string) {
 		if (room.status !== 'waiting' || !room.auto) return { started: room.status === 'playing' };
 		if (room.deadline_at && Date.now() > new Date(room.deadline_at).getTime()) return { started: false };
 		await trx('coop_members').where({ room_id: roomId, user_id: userId }).update({ ready: true });
+		// entering a match ends the run of missed ones
+		await trx('match_bans').where('user_id', userId).update({ misses: 0 });
 		const left = Number((await trx('coop_members').where({ room_id: roomId, ready: false }).count('* as n').first())?.n) || 0;
 		const n = Number((await trx('coop_members').where('room_id', roomId).count('* as n').first())?.n) || 0;
 		if (left === 0 && n >= SIZE) { await begin(trx, room); return { started: true }; }
@@ -487,10 +493,10 @@ export async function advanceDue(db: any, roomId: string, today = vnDay()) {
 		const room = await trx('coop_rooms').where('id', roomId).forUpdate().first();
 		if (!room || !room.deadline_at || Date.now() < new Date(room.deadline_at).getTime()) return false;
 		if (room.status === 'waiting' && room.auto) {
-			// nobody started it in time: the fees go back, and whoever did not press "ready" cannot search for a moment
+			// nobody started it in time: the fees go back, and whoever did not press "ready" missed one (missMatch)
 			const members = await trx('coop_members').where('room_id', roomId).select('user_id', 'ready');
 			await refund(trx, room, members.map((m: any) => m.user_id), today);
-			for (const m of members) if (!m.ready) await banFor(trx, m.user_id);
+			for (const m of members) if (!m.ready) await missMatch(trx, m.user_id);
 			await trx('coop_rooms').where('id', roomId).update({ status: 'cancelled', done_at: trx.fn.now(), deadline_at: null });
 			return true;
 		}
@@ -553,7 +559,7 @@ export async function leaveCoop(db: any, userId: string, roomId: string, today =
 			} else {
 				await refund(trx, room, await trx('coop_members').where('room_id', roomId).pluck('user_id'), today);
 				await trx('coop_rooms').where('id', roomId).update({ status: 'cancelled', done_at: trx.fn.now(), deadline_at: null });
-				if (room.auto) await banFor(trx, userId);
+				if (room.auto) await missMatch(trx, userId);
 			}
 		} else if (room.status === 'playing') {
 			// leaving a duel forfeits it; leaving a practice loses the deposit and the one who stays gets theirs back
@@ -600,7 +606,7 @@ const nameOf = (u: any) => [u.first_name, String(u.last_name || '').slice(0, 1)]
  * before that the other player only shows as "answered" (a duel) or with the first pick (practice "discuss").
  * `since` is the last chat id the browser has.
  */
-export async function getState(db: any, userId: string, roomId: string, since = 0) {
+export async function getState(db: any, userId: string, roomId: string, since = 0, lang = BASE_LANG) {
 	await advanceDue(db, roomId);
 	const room = await db('coop_rooms').where('id', roomId).first();
 	if (!room) throw new CoopError('NO_ROOM');
@@ -620,8 +626,9 @@ export async function getState(db: any, userId: string, roomId: string, since = 
 	if (!me) return out;
 	if (room.mode !== 'duel' && room.lesson_id) {
 		// Luyện cùng: the lesson and what this player pays for it (the fee for being together is in `fee`)
-		const l = await db('listening_lessons').where('id', room.lesson_id).first('text', 'kind');
-		out.lesson = { title: l?.text || '', price: Number(me.lesson_price) || 0 };
+		const l = await db('il_lessons').where('id', room.lesson_id).first('title');
+		const tr = await db('il_translations').where({ lesson_id: room.lesson_id, lang, key: 'title' }).first('text');
+		out.lesson = { title: tr?.text || l?.title || '', price: Number(me.lesson_price) || 0 };
 	}
 	if (room.status === 'playing' || room.status === 'done') {
 		const i = room.status === 'done' ? qs.length - 1 : room.idx;

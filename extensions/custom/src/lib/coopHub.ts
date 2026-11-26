@@ -13,8 +13,9 @@
  */
 import { randomUUID } from 'node:crypto';
 import { advanceDue, getState, sweepPresence } from './coop';
+import { langOf } from './extensive';
 
-type Sub = { client: any; user: string; since: number };
+type Sub = { client: any; user: string; since: number; lang: string };
 type Hub = { rooms: Map<string, Set<Sub>>; timers: Map<string, ReturnType<typeof setTimeout>>; started: boolean; id: string; safety: ReturnType<typeof setInterval> | null; presence?: ReturnType<typeof setInterval> | null };
 const g = globalThis as any;
 const hub: Hub = (g.__coopHub ||= { rooms: new Map(), timers: new Map(), started: false, id: randomUUID(), safety: null });
@@ -37,7 +38,7 @@ function schedule(db: any, roomId: string, inMs: number | null) {
 
 async function push(db: any, roomId: string, sub: Sub) {
 	try {
-		const data = await getState(db, sub.user, roomId, sub.since);
+		const data = await getState(db, sub.user, roomId, sub.since, sub.lang);
 		const last = data.messages?.length ? data.messages[data.messages.length - 1].id : 0;
 		if (last > sub.since) sub.since = last;
 		send(sub.client, { type: 'coop.state', data });
@@ -51,11 +52,11 @@ async function pushLocal(db: any, roomId: string) {
 	await Promise.all([...subs].map((s) => push(db, roomId, s)));
 }
 
-export async function subscribe(db: any, client: any, roomId: string, since: number) {
+export async function subscribe(db: any, client: any, roomId: string, since: number, lang?: unknown) {
 	const user = client.accountability?.user as string | undefined;
 	if (!user) return send(client, { type: 'coop.error', code: 'UNAUTHORIZED' });
 	drop(client);
-	const sub: Sub = { client, user, since: Number(since) || 0 };
+	const sub: Sub = { client, user, since: Number(since) || 0, lang: langOf(lang) };
 	if (!hub.rooms.has(roomId)) hub.rooms.set(roomId, new Set());
 	hub.rooms.get(roomId)!.add(sub);
 	await push(db, roomId, sub);

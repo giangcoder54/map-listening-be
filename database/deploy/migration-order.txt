@@ -8,3 +8,5 @@
 2027-01-03_chest_odds_platinum.sql
 2027-01-04_intensive_parts.sql
 2027-01-05_coop_voice_limit.sql
+2027-01-05_match_misses.sql
+2027-01-06_coop_intensive.sql

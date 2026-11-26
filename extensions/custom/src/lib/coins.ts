@@ -66,8 +66,8 @@ const DEFAULTS = {
 	help: { reward: 8, perDay: 20 },
 	/** Rooms: the default fee, the share the house keeps (never paid out), questions in a round */
 	room: { fee: 20, rakePct: 10, questions: 5 },
-	/** coop: deposit = Luyện cùng's deposit (given back when the room is finished, with the reward); duelSeconds = time to type the hidden phrase after the clip; duelLead = ms from "ready" to the clip playing on both screens */
-	coop: { questions: 5, practiceQuestions: 3, reward: 10, perDay: 3, duelSeconds: 12, duelReveal: 5, deposit: 50, duelLead: 4000, readySeconds: 12 },
+	/** coop: deposit = Luyện cùng's fee; practiceQuestions = sentences of a Luyện cùng room with no lesson to give; duelSeconds = time to type the hidden phrase after the clip; duelLead = ms from "ready" to the clip playing on both screens */
+	coop: { questions: 5, practiceQuestions: 10, reward: 10, perDay: 3, duelSeconds: 12, duelReveal: 5, deposit: 50, duelLead: 4000, readySeconds: 12 },
 };
 type CoinNumbers = typeof DEFAULTS;
 

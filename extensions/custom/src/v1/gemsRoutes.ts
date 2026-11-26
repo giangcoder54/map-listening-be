@@ -320,7 +320,7 @@ export function registerGemsRoutes(router: any, context: any) {
 	router.get('/match', learner('rooms', async (_req, res, userId) => res.json({ success: true, data: await matchStatus(database, userId) })));
 	router.delete('/match', learner('rooms', async (_req, res, userId) => res.json({ success: true, data: await cancelQueue(database, userId) })));
 	router.post('/coop', learner('rooms', async (req, res, userId) => res.json({ success: true, data: { id: await createCoop(database, userId, { mode: req.body?.mode === 'duel' ? 'duel' : 'practice', fee: Number(req.body?.fee) }) } })));
-	router.get('/coop/:id', learner('rooms', async (req, res, userId) => res.json({ success: true, data: await getState(database, userId, String(req.params.id), Number(req.query.since) || 0) })));
+	router.get('/coop/:id', learner('rooms', async (req, res, userId) => res.json({ success: true, data: await getState(database, userId, String(req.params.id), Number(req.query.since) || 0, langOf(req.query.lang)) })));
 	// every change tells the others in the room over the WebSocket
 	const act = (path: string, run: (req: any, userId: string, id: string) => Promise<any>) => router.post(`/coop/:id/${path}`, learner('rooms', async (req, res, userId) => {
 		const id = String(req.params.id);
