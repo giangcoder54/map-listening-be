@@ -19,7 +19,7 @@ import { ChestError, oddsOf, openChest, type Drop } from '../lib/chests';
 import { ORDER_MINUTES, listPacks, orderWait, packCoins } from '../lib/gemOrders';
 import { HelpError, hintsFor, leaveHint, useHint } from '../lib/help';
 import { notify as coopNotify } from '../lib/coopHub';
-import { CoopError, answerCoop, chatCoop, createCoop, getState, joinCoop, leaveCoop, listCoop, lockCoop, nextCoop, pingCoop, playCoop, readyCoop, startCoop } from '../lib/coop';
+import { CoopError, answerCoop, chatCoop, createCoop, findCoop, getState, joinCoop, leaveCoop, listCoop, lockCoop, nextCoop, pingCoop, playCoop, readyCoop, startCoop } from '../lib/coop';
 import { cancelQueue, joinQueue, matchStatus, sweepQueue } from '../lib/match';
 import { countryOf, getCountry, guessCountry } from '../lib/country';
 import { joinVoice } from '../lib/voice';
@@ -320,6 +320,7 @@ export function registerGemsRoutes(router: any, context: any) {
 	router.get('/match', learner('rooms', async (_req, res, userId) => res.json({ success: true, data: await matchStatus(database, userId) })));
 	router.delete('/match', learner('rooms', async (_req, res, userId) => res.json({ success: true, data: await cancelQueue(database, userId) })));
 	router.post('/coop', learner('rooms', async (req, res, userId) => res.json({ success: true, data: { id: await createCoop(database, userId, { mode: req.body?.mode === 'duel' ? 'duel' : 'practice', fee: Number(req.body?.fee) }) } })));
+	router.get('/coop/code/:code', learner('rooms', async (req, res) => res.json({ success: true, data: await findCoop(database, String(req.params.code).toLowerCase()) })));
 	router.get('/coop/:id', learner('rooms', async (req, res, userId) => res.json({ success: true, data: await getState(database, userId, String(req.params.id), Number(req.query.since) || 0, langOf(req.query.lang)) })));
 	// every change tells the others in the room over the WebSocket
 	const act = (path: string, run: (req: any, userId: string, id: string) => Promise<any>) => router.post(`/coop/:id/${path}`, learner('rooms', async (req, res, userId) => {

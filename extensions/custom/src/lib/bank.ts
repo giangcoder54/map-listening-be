@@ -12,7 +12,8 @@
  * bank clips, and the bank must not give its answers away (CLIP_FILTER).
  */
 import { MIXED_UP, mixUps } from './mixups';
-import { supports, type Format, type PoolClip } from './runs';
+import { answerOf } from './lessons';
+import { maskForAsk, supports, type Format, type PoolClip } from './runs';
 
 export const BANK = {
 	/** Xu to open a Premium video (all its sentences), when the row sets no price */
@@ -42,6 +43,17 @@ export type BankItem = {
 };
 
 /**
+ * The question can show its sentence with the blank in it. One whose words cannot be found in the
+ * transcript (a [bracket] cutting a word, "[title]s") would be asked with no text at all: left out.
+ */
+function askable(r: any) {
+	if (!r.transcript) return true;
+	const answer = answerOf(r, r.lesson_text, 'one_answer');
+	const focus = String(r.focus_text || '').trim() || null;
+	return ['type', 'choice'].every((f) => maskForAsk({ answer, focus, transcript: r.transcript }, f).transcript);
+}
+
+/**
  * Every sentence of the published videos, in the team's order of videos then the order they are said;
  * `n` is its place in that order ("Câu 12"). `clipId`: just that one.
  */
@@ -49,7 +61,7 @@ export async function loadBankItems(db: any, where: { clipId?: string } = {}): P
 	const { rows } = await db.raw(`
 		SELECT c.id, c.lesson_id, l.kind AS lesson_kind, c.difficulty, s.slug AS skill_slug, s.name AS skill_name,
 			p.id AS practice_id, p.short_id AS video_short_id, p.title AS video_title, p.is_premium, p.price_xu,
-			sv.youtube_video_id, sv.thumbnail_url
+			sv.youtube_video_id, sv.thumbnail_url, c.answer, c.focus_text, c.transcript, l.text AS lesson_text
 		FROM practice_videos p
 		JOIN source_videos sv ON sv.id = p.source_video_id
 		JOIN listening_clips c ON c.source_video_id = sv.id
@@ -58,7 +70,7 @@ export async function loadBankItems(db: any, where: { clipId?: string } = {}): P
 		WHERE p.status = 'published' AND ${CLIP_FILTER}
 			AND NOT EXISTS (SELECT 1 FROM practice_hidden_clips h WHERE h.clip_id = c.id)
 		ORDER BY p.sort, p.id, c.start_time, c.id`);
-	const all: BankItem[] = rows.map((r: any, i: number) => ({ ...r, n: i + 1, difficulty: Math.min(3, Math.max(1, Number(r.difficulty) || 2)) as 1 | 2 | 3 }));
+	const all: BankItem[] = rows.filter(askable).map(({ answer, focus_text, transcript, lesson_text, ...r }: any, i: number) => ({ ...r, n: i + 1, difficulty: Math.min(3, Math.max(1, Number(r.difficulty) || 2)) as 1 | 2 | 3 }));
 	return where.clipId ? all.filter((it) => it.id === where.clipId) : all;
 }
 

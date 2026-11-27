@@ -601,6 +601,14 @@ export async function sweepPresence(db: any, today = vnDay()) {
 
 const nameOf = (u: any) => [u.first_name, String(u.last_name || '').slice(0, 1)].filter(Boolean).join(' ') || 'Learner';
 
+/** The friend's room behind a short invite link: the first 8 characters of its id, only while the room is open */
+export async function findCoop(db: any, code: string) {
+	if (!/^[0-9a-f]{8}$/.test(code)) throw new CoopError('NO_ROOM');
+	const r = await db('coop_rooms').whereIn('status', ['waiting', 'playing']).where('auto', false).whereRaw('id::text like ?', [`${code}%`]).orderBy('created_at', 'desc').first('id');
+	if (!r) throw new CoopError('NO_ROOM');
+	return { id: r.id as string };
+}
+
 /**
  * What a player's browser needs now. The right answer and the full sentence stay on the server until "reveal";
  * before that the other player only shows as "answered" (a duel) or with the first pick (practice "discuss").
@@ -610,7 +618,7 @@ export async function getState(db: any, userId: string, roomId: string, since = 
 	await advanceDue(db, roomId);
 	const room = await db('coop_rooms').where('id', roomId).first();
 	if (!room) throw new CoopError('NO_ROOM');
-	const members = await db('coop_members as m').join('directus_users as u', 'u.id', 'm.user_id').where('m.room_id', roomId).select('m.user_id', 'm.ready', 'm.lesson_price', 'u.first_name', 'u.last_name', 'u.country').orderBy('m.joined_at');
+	const members = await db('coop_members as m').join('directus_users as u', 'u.id', 'm.user_id').where('m.room_id', roomId).select('m.user_id', 'm.ready', 'm.lesson_price', 'u.first_name', 'u.last_name', 'u.country', 'u.avatar', 'u.avatar_url').orderBy('m.joined_at');
 	const levels = new Map<string, number>();
 	for (const m of members) levels.set(m.user_id, await levelOfUser(db, m.user_id));
 	const me = members.find((m: any) => m.user_id === userId);
@@ -621,7 +629,7 @@ export async function getState(db: any, userId: string, roomId: string, since = 
 		mode: room.mode, fee: room.fee, auto: room.auto, seconds: COIN.coop.duelSeconds, rake_pct: COIN.room.rakePct, stars: room.stars,
 		ends_in: room.mode === 'duel' ? timed : room.status === 'waiting' && room.auto && room.deadline_at ? Math.max(0, new Date(room.deadline_at).getTime() - Date.now()) : null,
 		play_in: room.mode === 'duel' && room.status === 'playing' && room.phase === 'listen' ? Math.max(0, new Date(room.phase_at).getTime() + COIN.coop.duelLead - Date.now()) : null,
-		reward: COIN.coop.reward, players: members.map((m: any) => ({ you: m.user_id === userId, host: m.user_id === room.host_id, name: nameOf(m), country: m.country ? String(m.country).trim() : null, ready: !!m.ready, level: levels.get(m.user_id) || 1 })),
+		reward: COIN.coop.reward, players: members.map((m: any) => ({ you: m.user_id === userId, host: m.user_id === room.host_id, name: nameOf(m), avatar: m.avatar || null, avatar_url: m.avatar_url || null, country: m.country ? String(m.country).trim() : null, ready: !!m.ready, level: levels.get(m.user_id) || 1 })),
 	};
 	if (!me) return out;
 	if (room.mode !== 'duel' && room.lesson_id) {

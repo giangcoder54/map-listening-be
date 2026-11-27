@@ -337,18 +337,20 @@ export function registerIntensiveRoutes(router: any, context: any) {
 		return diffWords(s.text, typed).words.find((x) => (x.status === 'wrong' || x.status === 'missing') && keys.has(keyOf(x.w)) && !FUNCTION_WORDS.has(keyOf(x.w)) && !done.includes(keyOf(x.w)))?.w ?? null;
 	};
 	type Cloze = { video_id: string; start: number; end: number; before: string; after: string };
+	/** The part of a word the line index can look up: its longest run of letters ("don't" -> "don"); the lines found are then
+	 *  checked against the whole word */
+	const indexWord = (word: string) => (word.toLowerCase().match(/[a-z]+/g) || []).sort((x, y) => y.length - x.length)[0] || '';
 	/** A line of another video with the word in the middle (never the first or last word, so a cut cannot clip it), shown
 	 *  as before / after the blank, said slowly. `avoid`: lines already tried ("video:start"). */
 	const clozeClip = async (word: string, notVideo: string, avoid: string[] = []): Promise<Cloze | null> => {
 		const w = word.toLowerCase().replace(/[^a-z']/g, '').replace(/'/g, "['’]");
-		if (!w) return null;
+		const q = indexWord(word);
+		if (!w || !q) return null;
+		// transcript_lines (migration 2026-11-27): the published hand-made lines, kept by trigger; the GIN index finds the word
 		const { rows } = await database.raw(`
-			SELECT sv.youtube_video_id AS video_id, (c->>'start')::int AS start, (c->>'end')::int AS "end", c->>'text' AS text
-			FROM source_videos sv, jsonb_array_elements(sv.transcript) c
-			WHERE sv.status = 'published' AND sv.transcript_kind = 'manual' AND sv.youtube_video_id <> ?
-				AND sv.transcript::text ~* ? AND c->>'text' ~* ?
-				AND (c->>'end')::int - (c->>'start')::int BETWEEN 1200 AND 7000
-			ORDER BY random() LIMIT 60`, [notVideo, `\\m${w}\\M`, `\\m${w}\\M`]);
+			SELECT video_id, start_ms AS start, end_ms AS "end", text FROM transcript_lines
+			WHERE tsv @@ to_tsquery('simple', ?) AND text ~* ? AND video_id <> ? AND end_ms - start_ms BETWEEN 1200 AND 7000
+			ORDER BY random() LIMIT 60`, [q, `\\m${w}\\M`, notVideo]);
 		const target = keyOf(word);
 		for (const r of rows) {
 			const text = String(r.text || '').replace(/\s+/g, ' ').trim();
@@ -547,8 +549,13 @@ export function registerIntensiveRoutes(router: any, context: any) {
 		const typed = clean(req.body?.typed);
 		const listens = Math.max(1, Math.min(9, Math.round(Number(req.body?.listens) || 1)));
 		const d = diffWords(s.text, typed);
-		const traps = trapsOf(s, await trOf(s.lesson_id, langOf(req)));
-		const labels = round === 1 ? labelMisses(s.text, withChunks(traps, await chunksOf()), d.words, [], null, typed) : [];
+		// All words right: nothing left to hold back, so the whole check goes out at once (no second request)
+		const allRight = d.total > 0 && d.right === d.total;
+		const scoreOnly = round === 1 && req.body?.reveal === false && !allRight;
+		// A retry that only gets its score is neither saved nor shown labels: they are not worked out
+		const bare = scoreOnly && !!req.body?.retry;
+		const traps = bare ? [] : trapsOf(s, await trOf(s.lesson_id, langOf(req)));
+		const labels = round === 1 && !bare ? labelMisses(s.text, withChunks(traps, await chunksOf()), d.words, [], null, typed) : [];
 		const slowTyped = clean(req.body?.slow_typed);
 		const a = await ownAttempt(req, s.lesson_id);
 		if (a && !a.finished_at) await touchStudy(database, a.user_id);
@@ -562,13 +569,18 @@ export function registerIntensiveRoutes(router: any, context: any) {
 		}
 		// reveal: false holds the sentence back (the learner is about to try again blind at 0.75x): only the score goes out
 		// (with marks on what was typed: which words are wrong and where words are missing, never which words they should be)
-		if (round === 1 && req.body?.reveal === false) return res.json({ success: true, data: { right: d.right, total: d.total, ok: isRight(d), marks: d.marks, tail_gap: d.tailGap, hint: hintOf(s.text, d.words) } });
+		if (scoreOnly) return res.json({ success: true, data: { right: d.right, total: d.total, ok: isRight(d), marks: d.marks, tail_gap: d.tailGap, hint: hintOf(s.text, d.words) } });
 		const slow = slowTyped ? diffWords(s.text, slowTyped) : null;
+		// with_slow { unknown?, heard?, slow_from? }: the final labels (POST /intensive/slow) in the same request, when words were missed
+		const w = req.body?.with_slow;
+		const slowResult = round === 1 && w && typeof w === 'object' && d.right < d.total
+			? await slowOf(req, s, { ...w, typed: req.body?.typed, slow_typed: req.body?.slow_typed }, false) : undefined;
 		return res.json({ success: true, data: {
 			right: d.right, total: d.total, ok: isRight(d), words: d.words, marks: d.marks, tail_gap: d.tailGap, text: s.text, labels,
 			sub: await subOfSentence(s.id, s.lesson_id, langOf(req)),
 			traps: round === 1 ? traps : [],
 			slow: slow ? { right: slow.right, total: slow.total, words: slow.words, marks: slow.marks, tail_gap: slow.tailGap } : null,
+			...(slowResult ? { slow_result: slowResult } : {}),
 		} });
 	}));
 
@@ -588,24 +600,29 @@ export function registerIntensiveRoutes(router: any, context: any) {
 	router.post('/intensive/slow', wrap('slow', async (req, res) => {
 		const s = await sentenceOf(String(req.body?.sentence_id || ''), req);
 		if (!s) return res.status(404).json({ success: false, message: 'Not found' });
-		const typed = clean(req.body?.typed);
-		const slowTyped = clean(req.body?.slow_typed);
+		return res.json({ success: true, data: await slowOf(req, s, req.body || {}) });
+	}));
+	/** The final labels of a sentence (POST /intensive/slow, or /intensive/check with `with_slow`). `touch`: count study time
+	 *  (the check that carries it has already counted it) */
+	async function slowOf(req: any, s: any, b: any, touch = true) {
+		const typed = clean(b?.typed);
+		const slowTyped = clean(b?.slow_typed);
 		const first = diffWords(s.text, typed);
 		// Words the learner said are new, plus rare words they did not mark as anything else (they may not mark at all)
 		const words40 = (v: unknown): string[] => (Array.isArray(v) ? v.slice(0, 40).map((w: unknown) => clean(w, 40)).filter(Boolean) : []);
 		const bareOf = (w: string) => w.toLowerCase().replace(/['’]/g, '');
-		const known = new Set(words40(req.body?.known).map(bareOf));
-		const unknown: string[] = [...new Set([...words40(req.body?.unknown), ...likelyUnknown(first.words).filter((w) => !known.has(bareOf(w)))])];
+		const known = new Set(words40(b?.known).map(bareOf));
+		const unknown: string[] = [...new Set([...words40(b?.unknown), ...likelyUnknown(first.words).filter((w) => !known.has(bareOf(w)))])];
 		const slow = slowTyped ? diffWords(s.text, slowTyped) : null;
 		// "speed" needs a real slow listen: `slow_from` is the try after which the sentence was first played at 0.75x. Without
 		// it the retry says nothing about speed; a word already right in that try was heard before the slow play
-		const slowFrom = typeof req.body?.slow_from === 'string' ? clean(req.body.slow_from) : null;
+		const slowFrom = typeof b?.slow_from === 'string' ? clean(b.slow_from) : null;
 		const heardSlow = slowFrom === null ? null : slow?.words ?? null;
-		const hinted: number[] = (Array.isArray(req.body?.hinted) ? req.body.hinted : []).map(Number).filter((n: number) => Number.isInteger(n) && n >= 0).slice(0, 80);
+		const hinted: number[] = (Array.isArray(b?.hinted) ? b.hinted : []).map(Number).filter((n: number) => Number.isInteger(n) && n >= 0).slice(0, 80);
 		if (slowFrom !== null) diffWords(s.text, slowFrom).words.forEach((w, i) => { if (w.status === 'ok' || w.status === 'typo') hinted.push(i); });
 		// The learner's answers to "misheard or misspelt?": { word: 'spelling' | 'misheard' }
 		const heard: Record<string, Heard> = {};
-		for (const [w, h] of Object.entries(req.body?.heard && typeof req.body.heard === 'object' ? req.body.heard : {}).slice(0, 40)) {
+		for (const [w, h] of Object.entries(b?.heard && typeof b.heard === 'object' ? b.heard : {}).slice(0, 40)) {
 			if (h === 'spelling' || h === 'misheard') heard[clean(w, 40).toLowerCase().replace(/['’]/g, '')] = h;
 		}
 		const traps = trapsOf(s, await trOf(s.lesson_id, langOf(req)));
@@ -620,7 +637,7 @@ export function registerIntensiveRoutes(router: any, context: any) {
 		// Words typed right that the learner marks as not really heard (a lucky guess): kept as misses of their own kind,
 		// so they reach the result and Review; the score is not changed. kind: new | blur | other
 		const GUESS: Record<string, Label> = { new: 'vocab', blur: 'sound', other: 'confusable' };
-		for (const g of (Array.isArray(req.body?.guessed) ? req.body.guessed : []).slice(0, 40)) {
+		for (const g of (Array.isArray(b?.guessed) ? b.guessed : []).slice(0, 40)) {
 			const w = first.words[Number(g?.i)];
 			const label = GUESS[String(g?.kind)];
 			if (w && label && (w.status === 'ok' || w.status === 'typo') && !raw.some((m) => m.guessAt === Number(g.i))) raw.push({ word: w.w, label, guessAt: Number(g.i) });
@@ -629,10 +646,10 @@ export function registerIntensiveRoutes(router: any, context: any) {
 		const label = sentenceLabel(misses);
 		const userId = userOf(req);
 		const a = await ownAttempt(req, s.lesson_id);
-		if (a && !a.finished_at) await touchStudy(database, a.user_id);
+		if (touch && a && !a.finished_at) await touchStudy(database, a.user_id);
 		if (a && !a.finished_at) {
 			// The learner's own marks (phrases and why), so a result opened again shows what they said
-			const marks = (Array.isArray(req.body?.marks) ? req.body.marks : []).slice(0, 40)
+			const marks = (Array.isArray(b?.marks) ? b.marks : []).slice(0, 40)
 				.map((m: any) => ({ idx: (Array.isArray(m?.idx) ? m.idx : []).map(Number).filter((n: number) => Number.isInteger(n) && n >= 0 && n < first.words.length).slice(0, 12), kind: String(m?.kind) }))
 				.filter((m: any) => m.idx.length && ['new', 'blur', 'other', 'spell'].includes(m.kind));
 			await database('il_results').where({ attempt_id: a.id, sentence_id: s.id, round: 1 })
@@ -644,8 +661,8 @@ export function registerIntensiveRoutes(router: any, context: any) {
 			.filter((m) => !['linking', 'speed', 'weak', 'spelling'].includes(m.label))
 			.map((m) => m.word)
 			.filter((w) => !FUNCTION_WORDS.has(w.replace(/'/g, '')) && rankOf(w) > 2000))];
-		return res.json({ success: true, data: { misses, label, unknown, ask, confirm, slow_right: slow?.right ?? null, slow_total: slow?.total ?? null } });
-	}));
+		return { misses, label, unknown, ask, confirm, slow_right: slow?.right ?? null, slow_total: slow?.total ?? null };
+	}
 
 	/** A word heard in other videos of the library (other speakers): up to 5 subtitle lines, one per channel */
 	router.get('/intensive/word-clips', wrap('word-clips', async (req, res) => {
@@ -655,14 +672,12 @@ export function registerIntensiveRoutes(router: any, context: any) {
 		const re = `\\m${word.replace(/'/g, "['’]")}\\M`;
 		const { rows } = await database.raw(`
 			SELECT * FROM (
-				SELECT DISTINCT ON (sv.channel_name) sv.youtube_video_id AS video_id, sv.channel_name AS channel,
-					(c->>'start')::int AS start, (c->>'end')::int AS "end", c->>'text' AS text
-				FROM source_videos sv, jsonb_array_elements(sv.transcript) c
-				WHERE sv.status = 'published' AND sv.transcript_kind = 'manual' AND sv.youtube_video_id <> ?
-					AND sv.transcript::text ~* ? AND c->>'text' ~* ?
-					AND (c->>'end')::int - (c->>'start')::int BETWEEN 800 AND 9000
-				ORDER BY sv.channel_name, length(c->>'text')
-			) x ORDER BY random() LIMIT 5`, [not, re, re]);
+				SELECT DISTINCT ON (sv.channel_name) tl.video_id, sv.channel_name AS channel, tl.start_ms AS start, tl.end_ms AS "end", tl.text
+				FROM transcript_lines tl JOIN source_videos sv ON sv.youtube_video_id = tl.video_id
+				WHERE tl.tsv @@ to_tsquery('simple', ?) AND tl.text ~* ? AND tl.video_id <> ?
+					AND tl.end_ms - tl.start_ms BETWEEN 800 AND 9000
+				ORDER BY sv.channel_name, length(tl.text)
+			) x ORDER BY random() LIMIT 5`, [indexWord(word), re, not]);
 		return res.json({ success: true, data: { word, items: rows } });
 	}));
 

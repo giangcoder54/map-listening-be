@@ -3,7 +3,7 @@
  *
  *   GET /admin/dashboard   ?days=7|30|90 (default 30) &month=YYYY-MM (default this month)
  *                          -> daily series for the period and the one before it, sales of
- *                             both, the month's goals with progress, sign-up funnel,
+ *                             both, the month's goals with progress,
  *                             every lesson used in the period, most used / hardest first
  *                             (the page paginates them)
  *   PUT /admin/goals       { month, targets: { <metric>: number | null } }  null = no goal
@@ -12,31 +12,27 @@
  *   GET /admin/my-progress ?month=  the caller's lessons vs the team goal; admins and
  *                          content editors (admins also get every author's numbers)
  *
- * Definitions:
- *   active learner  an account with at least one answer (listening_attempts) that day
- *   WAU / MAU       active learners in the 7 / 30 days up to that day
- *   lesson start    first time a learner (account or anonymous) opens a lesson
- *   accuracy        share of first tries (attempt_number = 1) that were right
+ * Definitions (the three modes count alike: Connected Speech incl. the practice bank,
+ * Intensive Listening, Extensive Listening; see ANSWERS / FINISHES / STARTS below):
+ *   answer           a clip answered, an Intensive sentence typed, an Extensive question answered
+ *   active learner   an account with at least one answer that day
+ *   WAU / MAU        active learners in the 7 / 30 days up to that day
+ *   lesson start     first time a learner opens a lesson (Intensive / Extensive: accounts only)
+ *   completion       a lesson finished (Intensive / Extensive: the first finish of each lesson)
+ *   accuracy         share right on the first try (Intensive: words of round 1; Extensive: questions)
+ *   lessons published  Connected Speech only (the other two keep no publish date)
  *
- * North Star: weekly learners = accounts that reached the result card of at least one lesson
- * that week (listening_progress completed, updated that week, or a `result` event).
+ * North Star: weekly learners = accounts that finished at least one lesson of any mode that week.
  *
  * Team and test accounts (directus_users.is_internal, 2026-10-21_analytics.sql) are left out
  * of every number.
  *
- * Visitor journey, steps and coming back (2026-10-21_analytics.sql): `journey`, `landing` and
- * the event columns of `steps` come from learning_events (guests included). Only rows from real
- * people count (`human`, 2026-10-26_analytics_humans.sql: bots dropped, nothing sent before a
- * scroll, tap or key), so they start on the day that was deployed: `events_since`. The answer
- * columns of `steps` and `retention` also use listening_attempts, so they have the past too.
+ * Visitor journey, home page and coming back (2026-10-21_analytics.sql): `journey` and
+ * `landing` come from learning_events (guests included). Only rows from real people count
+ * (`human`, 2026-10-26_analytics_humans.sql: bots dropped, nothing sent before a scroll, tap
+ * or key), so they start on the day that was deployed: `events_since`. Intensive / Extensive
+ * send no events: the journey adds them from their saved goes, so for signed-in accounts only.
  *
- * Practice settings (2026-10-26_practice_modes.sql): `practice` = per step, who reached it and
- * who pressed "Skip this step"; per setting, the accounts that played that way (their answers),
- * the people who picked it in the period (events) and the accounts that have it saved now.
- *
- * Sign-up dates: accounts made before 2026-10-09 got a date estimated from their first
- * activity (database/migrations/2026-10-15_admin_dashboard.sql). `estimated_signups` counts
- * the ones with no trace at all, which still carry the deploy time.
  */
 import { staffRole } from '../lib/staff';
 
@@ -47,6 +43,28 @@ type GoalMetric = (typeof GOAL_METRICS)[number];
 const MONTH_RE = /^\d{4}-(0[1-9]|1[0-2])$/;
 /** SQL: the row's user (column `col`, may be NULL for a guest) is not a team or test account */
 const real = (col: string) => `NOT EXISTS (SELECT 1 FROM directus_users iu WHERE iu.id = ${col} AND iu.is_internal)`;
+
+/** Every answer of the three modes: (user_id, at). Extensive keeps no time per answer: its go's. */
+const ANSWERS = `
+	SELECT user_id, date_created AS at FROM listening_attempts
+	UNION ALL
+	SELECT a.user_id, r.date_created FROM il_results r JOIN il_attempts a ON a.id = r.attempt_id
+	UNION ALL
+	SELECT user_id, coalesce(finished_at, date_created) FROM el_attempts, jsonb_object_keys(el_attempts.answers)`;
+/** Lessons finished: (user_id, lesson_id, at). Intensive / Extensive: the first finish only */
+const FINISHES = `
+	SELECT user_id, lesson_id, completed_at AS at FROM listening_progress WHERE status = 'completed' AND completed_at IS NOT NULL
+	UNION ALL
+	SELECT user_id, lesson_id, min(finished_at) FROM il_attempts WHERE finished_at IS NOT NULL GROUP BY 1, 2
+	UNION ALL
+	SELECT user_id, lesson_id, min(finished_at) FROM el_attempts WHERE finished_at IS NOT NULL GROUP BY 1, 2`;
+/** Lessons started: (user_id, lesson_id, at), once per learner and lesson */
+const STARTS = `
+	SELECT user_id, lesson_id, date_created AS at FROM listening_lesson_learners
+	UNION ALL
+	SELECT user_id, lesson_id, min(date_created) FROM il_attempts GROUP BY 1, 2
+	UNION ALL
+	SELECT user_id, lesson_id, min(date_created) FROM el_attempts GROUP BY 1, 2`;
 
 /** 'YYYY-MM-DD' of `date` in Vietnam */
 const vnDay = (date: Date) => new Intl.DateTimeFormat('en-CA', { timeZone: TZ }).format(date);
@@ -81,16 +99,19 @@ export function registerAdminDashboardRoutes(router: any, context: any) {
 				(d::timestamp AT TIME ZONE '${TZ}') AS t0,
 				((d + interval '1 day')::timestamp AT TIME ZONE '${TZ}') AS t1
 			FROM generate_series(?::date, ?::date, interval '1 day') AS d
-		)
+		),
+		answers AS (${ANSWERS}),
+		starts AS (${STARTS}),
+		finishes AS (${FINISHES})
 		SELECT to_char(day, 'YYYY-MM-DD') AS day,
 			(SELECT count(*) FROM directus_users WHERE status = 'active' AND NOT is_internal AND gl_created_at >= t0 AND gl_created_at < t1)::int AS new_users,
 			(SELECT count(*) FROM directus_users WHERE status = 'active' AND NOT is_internal AND gl_created_at < t1)::int AS total_users,
-			(SELECT count(DISTINCT user_id) FROM listening_attempts WHERE date_created >= t0 AND date_created < t1 AND ${real('user_id')})::int AS dau,
-			(SELECT count(DISTINCT user_id) FROM listening_attempts WHERE date_created >= t1 - interval '7 days' AND date_created < t1 AND ${real('user_id')})::int AS wau,
-			(SELECT count(DISTINCT user_id) FROM listening_attempts WHERE date_created >= t1 - interval '30 days' AND date_created < t1 AND ${real('user_id')})::int AS mau,
-			(SELECT count(*) FROM listening_attempts WHERE date_created >= t0 AND date_created < t1 AND ${real('user_id')})::int AS attempts,
-			(SELECT count(*) FROM listening_lesson_learners WHERE date_created >= t0 AND date_created < t1 AND ${real('user_id')})::int AS lesson_starts,
-			(SELECT count(*) FROM listening_progress WHERE status = 'completed' AND completed_at >= t0 AND completed_at < t1 AND ${real('user_id')})::int AS completions,
+			(SELECT count(DISTINCT user_id) FROM answers WHERE at >= t0 AND at < t1 AND ${real('user_id')})::int AS dau,
+			(SELECT count(DISTINCT user_id) FROM answers WHERE at >= t1 - interval '7 days' AND at < t1 AND ${real('user_id')})::int AS wau,
+			(SELECT count(DISTINCT user_id) FROM answers WHERE at >= t1 - interval '30 days' AND at < t1 AND ${real('user_id')})::int AS mau,
+			(SELECT count(*) FROM answers WHERE at >= t0 AND at < t1 AND ${real('user_id')})::int AS attempts,
+			(SELECT count(*) FROM starts WHERE at >= t0 AND at < t1 AND ${real('user_id')})::int AS lesson_starts,
+			(SELECT count(*) FROM finishes WHERE at >= t0 AND at < t1 AND ${real('user_id')})::int AS completions,
 			(SELECT count(*) FROM listening_lessons WHERE status = 'published' AND coalesce(kind, 'pattern') <> 'bank' AND published_at >= t0 AND published_at < t1)::int AS lessons_published
 		FROM days ORDER BY day
 	`, [from, to])).rows;
@@ -133,14 +154,27 @@ export function registerAdminDashboardRoutes(router: any, context: any) {
 	/** Visited -> opened a lesson -> pressed Start -> finished one; with an account; came back */
 	const visitorJourney = async (from: string, to: string) => (await database.raw(`
 		WITH ${PEOPLE_CTE},
+		/* Intensive / Extensive goes in the period: a go is opened and started; finished when closed in it */
+		other AS (
+			SELECT 'u:' || g.user_id::text AS person, bool_or((g.finished_at AT TIME ZONE '${TZ}')::date BETWEEN ?::date AND ?::date) AS finished
+			FROM (
+				SELECT user_id, date_created, finished_at FROM il_attempts
+				UNION ALL
+				SELECT user_id, date_created, finished_at FROM el_attempts
+			) g
+			WHERE (g.date_created AT TIME ZONE '${TZ}')::date BETWEEN ?::date AND ?::date
+				OR (g.finished_at AT TIME ZONE '${TZ}')::date BETWEEN ?::date AND ?::date
+			GROUP BY 1
+		),
 		per AS (
-			SELECT person,
-				bool_or(event = 'lesson_open') AS opened,
-				bool_or(event = 'lesson_start') AS started,
-				bool_or(event = 'result') AS finished,
+			SELECT p.person,
+				bool_or(event = 'lesson_open' OR o.person IS NOT NULL) AS opened,
+				bool_or(event = 'lesson_start' OR o.person IS NOT NULL) AS started,
+				bool_or(event = 'result' OR coalesce(o.finished, false)) AS finished,
 				bool_or(uid IS NOT NULL) AS account,
 				count(DISTINCT day) AS days
-			FROM p GROUP BY person
+			FROM p LEFT JOIN other o ON o.person = p.person
+			GROUP BY p.person
 		)
 		SELECT count(*)::int AS visitors,
 			count(*) FILTER (WHERE opened)::int AS opened,
@@ -150,7 +184,7 @@ export function registerAdminDashboardRoutes(router: any, context: any) {
 			count(*) FILTER (WHERE account)::int AS with_account,
 			count(*) FILTER (WHERE days >= 2)::int AS came_back
 		FROM per
-	`, [from, to])).rows[0];
+	`, [from, to, from, to, from, to, from, to])).rows[0];
 
 	/**
 	 * Home page: people whose day started there (their `visit` was to /, /vi...) or who used its
@@ -186,110 +220,6 @@ export function registerAdminDashboardRoutes(router: any, context: any) {
 	`, [from, to])).rows[0];
 
 	/**
-	 * Where a lesson is left, step by step, among lessons that have that step:
-	 *   started / reached    people who pressed Start / got to the step (events: guests too, since deploy)
-	 *   sessions / answered  accounts that answered in the lesson / answered in the step
-	 */
-	const lessonSteps = async (from: string, to: string) => {
-		const ev = (await database.raw(`
-			WITH ${PEOPLE_CTE},
-			started AS (SELECT DISTINCT person, lesson_id FROM p WHERE event = 'lesson_start'),
-			ls AS (SELECT DISTINCT lesson_id, step FROM listening_clips WHERE status = 'published' AND step IS NOT NULL)
-			SELECT ls.step, count(*)::int AS eligible,
-				count(*) FILTER (WHERE EXISTS (
-					SELECT 1 FROM p WHERE p.person = s.person AND p.lesson_id = s.lesson_id AND p.event = 'step' AND p.step = ls.step
-				))::int AS reached
-			FROM started s JOIN ls ON ls.lesson_id = s.lesson_id
-			GROUP BY ls.step
-			UNION ALL
-			SELECT 'result', count(*)::int,
-				count(*) FILTER (WHERE EXISTS (
-					SELECT 1 FROM p WHERE p.person = s.person AND p.lesson_id = s.lesson_id AND p.event = 'result'
-				))::int
-			FROM started s
-		`, [from, to])).rows;
-		const ans = (await database.raw(`
-			WITH r AS (
-				SELECT (?::date::timestamp AT TIME ZONE '${TZ}') AS t0, ((?::date + 1)::timestamp AT TIME ZONE '${TZ}') AS t1
-			),
-			a AS (
-				SELECT DISTINCT user_id, lesson_id, step FROM listening_attempts, r
-				WHERE lesson_id IS NOT NULL AND date_created >= r.t0 AND date_created < r.t1 AND ${real('user_id')}
-			),
-			sessions AS (SELECT DISTINCT user_id, lesson_id FROM a),
-			ls AS (SELECT DISTINCT lesson_id, step FROM listening_clips WHERE status = 'published' AND step IS NOT NULL)
-			SELECT ls.step, count(*)::int AS eligible,
-				count(*) FILTER (WHERE EXISTS (SELECT 1 FROM a WHERE a.user_id = s.user_id AND a.lesson_id = s.lesson_id AND a.step = ls.step))::int AS answered
-			FROM sessions s JOIN ls ON ls.lesson_id = s.lesson_id
-			GROUP BY ls.step
-			UNION ALL
-			SELECT 'result', count(*)::int,
-				count(*) FILTER (WHERE EXISTS (
-					SELECT 1 FROM listening_progress pr WHERE pr.user_id = s.user_id AND pr.lesson_id = s.lesson_id AND pr.status = 'completed'
-				))::int
-			FROM sessions s
-		`, [from, to])).rows;
-		return ['type', 'voice', 'challenge', 'more', 'result'].map((step) => {
-			const e = ev.find((r: any) => r.step === step);
-			const a = ans.find((r: any) => r.step === step);
-			return { step, started: e?.eligible || 0, reached: e?.reached || 0, sessions: a?.eligible || 0, answered: a?.answered || 0 };
-		});
-	};
-
-	/** Steps 2-4: reached / skipped (people), the settings picked in the period, the ones saved now */
-	const practice = async (from: string, to: string) => {
-		const ev = (await database.raw(`
-			WITH ${PEOPLE_CTE}
-			SELECT event, step, count(DISTINCT person)::int AS people FROM p
-			WHERE (event = 'step' AND step IN ('voice', 'challenge', 'more')) OR event IN ('skip', 'setting')
-			GROUP BY event, step
-		`, [from, to])).rows;
-		const saved = (await database.raw(`
-			SELECT 'voice_' || coalesce(practice_prefs->>'voice', 'type') AS k, count(*)::int AS n FROM directus_users
-			WHERE practice_prefs IS NOT NULL AND status = 'active' AND NOT is_internal GROUP BY 1
-			UNION ALL
-			SELECT 'challenge_' || coalesce(practice_prefs->>'challenge', 'medium'), count(*)::int FROM directus_users
-			WHERE practice_prefs IS NOT NULL AND status = 'active' AND NOT is_internal GROUP BY 1
-		`)).rows;
-		// What accounts actually played (listening_attempts.mode), defaults included: each account
-		// once per step, by the last mode it used in the period. Step 3 from whole-sentence clips
-		// only (a "faster" clip is the same at medium and hard). Counted from the first attempt
-		// made with these settings, so the weeks before them (all "type it" / "hard") stay out.
-		const used = (await database.raw(`
-			WITH r AS (
-				SELECT greatest(
-					(?::date::timestamp AT TIME ZONE '${TZ}'),
-					(SELECT min(date_created) FROM listening_attempts WHERE mode IN ('listen', 'sentence_medium', 'sentence_easy', 'speed_easy'))
-				) AS t0, ((?::date + 1)::timestamp AT TIME ZONE '${TZ}') AS t1
-			),
-			last AS (
-				SELECT DISTINCT ON (user_id, step) user_id, step, mode FROM listening_attempts, r
-				WHERE step IN ('voice', 'challenge') AND date_created >= r.t0 AND date_created < r.t1 AND ${real('user_id')}
-					AND (step = 'voice' OR mode IN ('sentence', 'sentence_medium', 'sentence_easy'))
-				ORDER BY user_id, step, date_created DESC
-			)
-			SELECT CASE
-					WHEN step = 'voice' THEN CASE WHEN mode = 'listen' THEN 'voice_listen' ELSE 'voice_type' END
-					WHEN mode = 'sentence_easy' THEN 'challenge_easy'
-					WHEN mode = 'sentence_medium' THEN 'challenge_medium'
-					ELSE 'challenge_hard'
-				END AS k, count(*)::int AS n
-			FROM last GROUP BY 1
-		`, [from, to])).rows;
-		const n = (event: string, step: string) => ev.find((r: any) => r.event === event && r.step === step)?.people || 0;
-		const settings = ['voice_type', 'voice_listen', 'challenge_easy', 'challenge_medium', 'challenge_hard'];
-		return {
-			steps: ['voice', 'challenge', 'more'].map((step) => ({ step, reached: n('step', step), skipped: n('skip', step) })),
-			settings: settings.map((key) => ({
-				key,
-				used: used.find((r: any) => r.k === key)?.n || 0,
-				picked: n('setting', key),
-				saved: saved.find((r: any) => r.k === key)?.n || 0,
-			})),
-		};
-	};
-
-	/**
 	 * Coming back, by sign-up week (last 8 weeks): accounts active (an answer or any event) on
 	 * the day after sign-up, in days 1-7 and in days 8-30. `*_due` = accounts old enough for it.
 	 */
@@ -301,7 +231,7 @@ export function registerAdminDashboardRoutes(router: any, context: any) {
 				AND gl_created_at >= (date_trunc('week', ?::date) - interval '7 weeks')::timestamp AT TIME ZONE '${TZ}'
 		),
 		learned AS (
-			SELECT DISTINCT user_id, (date_created AT TIME ZONE '${TZ}')::date AS d FROM listening_attempts WHERE user_id IN (SELECT id FROM u)
+			SELECT DISTINCT user_id, (at AT TIME ZONE '${TZ}')::date AS d FROM (${ANSWERS}) x WHERE user_id IN (SELECT id FROM u)
 		),
 		act AS (
 			SELECT user_id, d FROM learned
@@ -341,6 +271,10 @@ export function registerAdminDashboardRoutes(router: any, context: any) {
 			SELECT user_id, (completed_at AT TIME ZONE '${TZ}')::date FROM listening_progress WHERE completed_at IS NOT NULL AND user_id IS NOT NULL
 			UNION
 			SELECT user_id, day FROM learning_events WHERE event = 'result' AND user_id IS NOT NULL
+			UNION
+			SELECT user_id, (finished_at AT TIME ZONE '${TZ}')::date FROM il_attempts WHERE finished_at IS NOT NULL
+			UNION
+			SELECT user_id, (finished_at AT TIME ZONE '${TZ}')::date FROM el_attempts WHERE finished_at IS NOT NULL
 		)
 		SELECT to_char(w.week, 'YYYY-MM-DD') AS week,
 			(SELECT count(DISTINCT done.user_id) FROM done WHERE done.d >= w.week AND done.d < w.week + 7 AND ${real('done.user_id')})::int AS learners
@@ -393,45 +327,50 @@ export function registerAdminDashboardRoutes(router: any, context: any) {
 			forecast: metric === 'learning_dau' || !elapsed ? actual[metric] : Math.round((actual[metric] / elapsed) * monthDays),
 		}));
 
-		// ── Funnel: accounts that signed up in the period ──
-		const funnel = (await database.raw(`
-			WITH u AS (
-				SELECT id FROM directus_users
-				WHERE status = 'active' AND NOT is_internal AND gl_created_at >= (?::date::timestamp AT TIME ZONE '${TZ}')
-			)
-			SELECT
-				(SELECT count(*) FROM u)::int AS signups,
-				(SELECT count(*) FROM u WHERE EXISTS (SELECT 1 FROM listening_attempts a WHERE a.user_id = u.id))::int AS answered,
-				(SELECT count(*) FROM u WHERE EXISTS (SELECT 1 FROM listening_progress p WHERE p.user_id = u.id AND p.status = 'completed'))::int AS completed,
-				(SELECT count(*) FROM u WHERE EXISTS (SELECT 1 FROM purchase_histories p WHERE p."user" = u.id AND p.status = 'published' AND p.amount > 0))::int AS paid
-		`, [from])).rows[0];
-
-		// ── Lessons in the period ──
+		// ── Lessons in the period, the three modes ──
 		const lessons = (await database.raw(`
 			WITH r AS (
 				SELECT (?::date::timestamp AT TIME ZONE '${TZ}') AS t0, ((?::date + 1)::timestamp AT TIME ZONE '${TZ}') AS t1
 			),
+			/* one row per answer; score: 0-1 on a first try, null on a later one */
+			ans AS (
+				SELECT lesson_id, user_id, date_created AS at,
+					CASE WHEN attempt_number = 1 THEN CASE WHEN is_correct THEN 1.0 ELSE 0.0 END END AS score
+				FROM listening_attempts WHERE lesson_id IS NOT NULL AND answer IS DISTINCT FROM '[HEARD]'
+				UNION ALL
+				SELECT a.lesson_id, a.user_id, x.date_created,
+					CASE WHEN x.round = 1 THEN x.words_right::numeric / nullif(x.words_total, 0) END
+				FROM il_results x JOIN il_attempts a ON a.id = x.attempt_id
+				UNION ALL
+				SELECT e.lesson_id, e.user_id, coalesce(e.finished_at, e.date_created), CASE WHEN (q.value->>'right')::boolean THEN 1.0 ELSE 0.0 END
+				FROM el_attempts e, jsonb_each(e.answers) q
+			),
 			a AS (
 				SELECT lesson_id, count(*)::int AS attempts, count(DISTINCT user_id)::int AS learners,
-					avg(CASE WHEN is_correct THEN 1 ELSE 0 END) FILTER (WHERE attempt_number = 1) AS accuracy,
-					count(*) FILTER (WHERE attempt_number = 1)::int AS first_tries
-				FROM listening_attempts, r WHERE lesson_id IS NOT NULL AND date_created >= r.t0 AND date_created < r.t1 AND ${real('user_id')}
-					AND answer IS DISTINCT FROM '[HEARD]'
+					avg(score) AS accuracy, count(score)::int AS first_tries
+				FROM ans, r WHERE at >= r.t0 AND at < r.t1 AND ${real('user_id')}
 				GROUP BY 1
 			),
 			s AS (
 				SELECT lesson_id, count(*)::int AS starts
-				FROM listening_lesson_learners, r WHERE date_created >= r.t0 AND date_created < r.t1 AND ${real('user_id')} GROUP BY 1
+				FROM (${STARTS}) x, r WHERE at >= r.t0 AND at < r.t1 AND ${real('user_id')} GROUP BY 1
 			),
 			c AS (
 				SELECT lesson_id, count(*)::int AS completions
-				FROM listening_progress, r WHERE status = 'completed' AND completed_at >= r.t0 AND completed_at < r.t1 AND ${real('user_id')} GROUP BY 1
+				FROM (${FINISHES}) x, r WHERE at >= r.t0 AND at < r.t1 AND ${real('user_id')} GROUP BY 1
+			),
+			l AS (
+				SELECT l.id, l.short_id, l.text, l.status, 'cs' AS mode, sk.name AS skill
+				FROM listening_lessons l LEFT JOIN listening_skills sk ON sk.id = l.skill_id
+				UNION ALL
+				SELECT id, short_id, title, status, 'il', NULL FROM il_lessons
+				UNION ALL
+				SELECT id, short_id, title, status, 'el', NULL FROM el_lessons
 			)
-			SELECT l.id, l.short_id, l.text, l.status, sk.name AS skill,
+			SELECT l.id, l.short_id, l.text, l.status, l.mode, l.skill,
 				coalesce(s.starts, 0) AS starts, coalesce(a.learners, 0) AS learners, coalesce(a.attempts, 0) AS attempts,
 				coalesce(c.completions, 0) AS completions, coalesce(a.first_tries, 0) AS first_tries, a.accuracy
-			FROM listening_lessons l
-			LEFT JOIN listening_skills sk ON sk.id = l.skill_id
+			FROM l
 			LEFT JOIN a ON a.lesson_id = l.id
 			LEFT JOIN s ON s.lesson_id = l.id
 			LEFT JOIN c ON c.lesson_id = l.id
@@ -444,13 +383,8 @@ export function registerAdminDashboardRoutes(router: any, context: any) {
 			.filter((l: any) => l.first_tries >= 5 && l.accuracy != null)
 			.sort((x: any, y: any) => x.accuracy - y.accuracy);
 
-		const estimated = (await database.raw(`
-			SELECT coalesce(sum(n), 0)::int AS n FROM (
-				SELECT count(*) AS n FROM directus_users GROUP BY gl_created_at HAVING count(*) >= 3
-			) x
-		`)).rows[0].n;
-		const [journey, landing, steps, retention, eventsSince, northStar, releases, practiceStats] = await Promise.all([
-			visitorJourney(from, today), landingFunnel(from, today), lessonSteps(from, today), comingBack(today),
+		const [journey, landing, retention, eventsSince, northStar, releases] = await Promise.all([
+			visitorJourney(from, today), landingFunnel(from, today), comingBack(today),
 			database('learning_events').where('human', true).min('day as d').first().then((r: any) => (r?.d ? vnDay(new Date(r.d)) : null)),
 			weeklyLearners(today),
 			// Every change since the start of the 12 weeks of the North Star chart
@@ -460,7 +394,6 @@ export function registerAdminDashboardRoutes(router: any, context: any) {
 				WHERE r.day >= least(?::date, date_trunc('week', ?::date)::date - 77)
 				ORDER BY r.day DESC, r.id DESC
 			`, [prevFrom, today]).then((r: any) => r.rows),
-			practice(from, today),
 		]);
 
 		return res.json({
@@ -476,15 +409,11 @@ export function registerAdminDashboardRoutes(router: any, context: any) {
 				sales: now,
 				previous_sales: before,
 				month: { month, days: monthDays, elapsed, goals },
-				funnel,
 				popular_lessons: popular,
 				hardest_lessons: hardest,
-				estimated_signups: estimated,
 				events_since: eventsSince,
 				journey,
 				landing,
-				steps,
-				practice: practiceStats,
 				retention,
 				north_star: northStar,
 				releases,
